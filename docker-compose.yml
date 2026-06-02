@@ -67,7 +67,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ["python", "scripts/collector_postgres.py"]
+    command: ["python", "-m", "scripts.collector_postgres"]
     profiles:
       - tools
 
