@@ -10,21 +10,21 @@ def request_json(path):
     url = f"{API_BASE_URL}{path}"
 
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(url, timeout=10) as response:
             status_code = response.status
             data = json.loads(response.read().decode("utf-8"))
-
             return status_code, data
 
     except urllib.error.HTTPError as error:
-        return error.code, {
-            "error": error.reason
-        }
+        try:
+            data = json.loads(error.read().decode("utf-8"))
+        except Exception:
+            data = {"error": error.reason}
+
+        return error.code, data
 
     except Exception as error:
-        return None, {
-            "error": str(error)
-        }
+        return None, {"error": str(error)}
 
 
 def check_endpoint(name, path, expected_status=200):
@@ -32,28 +32,55 @@ def check_endpoint(name, path, expected_status=200):
 
     if status_code == expected_status:
         print(f"✅ {name} passed")
-        return True
+        return True, data
 
     print(f"❌ {name} failed")
     print(f"   Path: {path}")
     print(f"   Expected status: {expected_status}")
     print(f"   Actual status: {status_code}")
     print(f"   Response: {data}")
-    return False
+    return False, data
 
 
 def run_smoke_tests():
     print("Running JobPulse smoke tests...")
     print("-" * 50)
 
-    checks = [
-        check_endpoint("Health check", "/health"),
-        check_endpoint("Stats endpoint", "/jobs/stats"),
-        check_endpoint("Search endpoint", "/jobs/search?source=linkedin"),
-        check_endpoint("Job details endpoint", "/jobs/1"),
-    ]
+    health_ok, _ = check_endpoint("Health check", "/health")
+    stats_ok, _ = check_endpoint("Stats endpoint", "/jobs/stats")
+
+    search_ok, search_data = check_endpoint(
+        "Search endpoint",
+        "/jobs/search?source=linkedin&page=1&limit=10"
+    )
+
+    job_details_ok = False
+
+    results = search_data.get("results", []) if isinstance(search_data, dict) else []
+
+    if results:
+        first_job_id = results[0].get("id")
+
+        if first_job_id:
+            job_details_ok, _ = check_endpoint(
+                "Job details endpoint",
+                f"/jobs/{first_job_id}"
+            )
+        else:
+            print("❌ Job details endpoint failed")
+            print("   Search result did not include a job id.")
+    else:
+        print("❌ Job details endpoint failed")
+        print("   No jobs found in search results. Collector may not have inserted data.")
 
     print("-" * 50)
+
+    checks = [
+        health_ok,
+        stats_ok,
+        search_ok,
+        job_details_ok
+    ]
 
     passed = sum(checks)
     total = len(checks)
@@ -62,8 +89,10 @@ def run_smoke_tests():
 
     if passed == total:
         print("🎉 All smoke tests passed.")
-    else:
-        print("⚠️ Some smoke tests failed.")
+        return
+
+    print("⚠️ Some smoke tests failed.")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
