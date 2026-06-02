@@ -124,6 +124,10 @@ POSTGRES_PORT=5432
 
 The `.env` file is ignored by Git and should not be committed.
 
+You can copy `.env.example` to `.env` and update the values:
+
+```powershell
+copy .env.example .env
 ---
 
 ## Run the Project
