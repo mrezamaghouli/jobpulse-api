@@ -380,8 +380,10 @@
     </div>
   </div>
 
+  <script src="config.js"></script>
+
   <script>
-    const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:8000`;
+    const API_BASE_URL = window.JOBPULSE_CONFIG.API_BASE_URL;
 
     let currentPage = 1;
     let totalPages = 0;
