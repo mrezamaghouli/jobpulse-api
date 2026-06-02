@@ -2,7 +2,7 @@
 
 JobPulse is a LinkedIn-style job search dashboard built with **FastAPI**, **PostgreSQL**, **Docker Compose**, and vanilla **HTML/CSS/JavaScript**.
 
-The project includes a REST API, PostgreSQL database, LinkedIn-style job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, and a frontend dashboard for browsing job listings.
+The project includes a REST API, PostgreSQL database, LinkedIn-style job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, and a frontend dashboard for browsing job listings.
 
 > Note: This project currently uses LinkedIn-style sample data. It does **not** scrape LinkedIn directly. A production version should use an authorized data source, official integration, or a compliant third-party job data provider.
 
@@ -22,6 +22,7 @@ The project includes a REST API, PostgreSQL database, LinkedIn-style job collect
 * Job statistics endpoint
 * Job details endpoint
 * Health check endpoint
+* Smoke test script
 * Frontend dashboard
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
@@ -91,20 +92,22 @@ linkedin-api/
 │   ├── import_sqlite_to_postgres.py
 │   ├── init_db_sqlite.py
 │   ├── jobs_repository_sqlite.py
+│   ├── main_old.py
 │   └── show_db_jobs_sqlite.py
 │
 ├── sample_data/
 │   └── new_jobs.json
 │
 ├── scripts/
-│   └── collector_postgres.py
+│   ├── collector_postgres.py
+│   └── smoke_test.py
 │
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .dockerignore
 ├── .gitignore
-├── .env
+├── .env.example
 └── README.md
 ```
 
@@ -112,7 +115,15 @@ linkedin-api/
 
 ## Environment Variables
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root.
+
+You can copy `.env.example` to `.env`:
+
+```powershell
+copy .env.example .env
+```
+
+Example `.env` values:
 
 ```env
 POSTGRES_DB=jobpulse
@@ -124,10 +135,6 @@ POSTGRES_PORT=5432
 
 The `.env` file is ignored by Git and should not be committed.
 
-You can copy `.env.example` to `.env` and update the values:
-
-```powershell
-copy .env.example .env
 ---
 
 ## Run the Project
@@ -318,6 +325,39 @@ The collector:
 
 ---
 
+## Smoke Test
+
+After starting the services, run:
+
+```powershell
+python scripts/smoke_test.py
+```
+
+The smoke test checks:
+
+* `/health`
+* `/jobs/stats`
+* `/jobs/search`
+* `/jobs/{job_id}`
+
+Expected output:
+
+```text
+Running JobPulse smoke tests...
+--------------------------------------------------
+✅ Health check passed
+✅ Stats endpoint passed
+✅ Search endpoint passed
+✅ Job details endpoint passed
+--------------------------------------------------
+Passed: 4/4
+🎉 All smoke tests passed.
+```
+
+If the job details test fails, make sure the database contains a job with the ID used in `scripts/smoke_test.py`.
+
+---
+
 ## Database Initialization
 
 The PostgreSQL database is initialized using:
@@ -439,10 +479,28 @@ View logs:
 docker compose logs -f
 ```
 
+View API logs:
+
+```powershell
+docker compose logs -f api
+```
+
+View PostgreSQL logs:
+
+```powershell
+docker compose logs -f db
+```
+
 Run collector:
 
 ```powershell
 docker compose run --rm collector
+```
+
+Run smoke test:
+
+```powershell
+python scripts/smoke_test.py
 ```
 
 Rebuild everything:
@@ -450,6 +508,34 @@ Rebuild everything:
 ```powershell
 docker compose down
 docker compose up -d --build
+```
+
+---
+
+## Git Workflow
+
+Check project status:
+
+```powershell
+git status
+```
+
+Stage changes:
+
+```powershell
+git add .
+```
+
+Commit changes:
+
+```powershell
+git commit -m "Update project"
+```
+
+Push to GitHub:
+
+```powershell
+git push
 ```
 
 ---
@@ -490,7 +576,7 @@ A production version should use one of the following:
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, job collector pipeline, search filters, sorting, pagination, job statistics, health checks, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
