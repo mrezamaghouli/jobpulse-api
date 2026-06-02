@@ -1,0 +1,21 @@
+[
+  {
+    "linkedin_job_id": "li-3001",
+    "title": "Data Product Analyst",
+    "company": "InsightFlow GmbH",
+    "company_linkedin_url": "https://www.linkedin.com/company/insightflow-example",
+    "location": "Hamburg, Germany",
+    "remote": true,
+    "job_type": "Full-time",
+    "seniority": "Mid",
+    "salary_min": 58000,
+    "salary_max": 82000,
+    "currency": "EUR",
+    "source": "LinkedIn",
+    "job_url": "https://www.linkedin.com/jobs/view/li-3001",
+    "poster_name": "Mia Schneider",
+    "poster_title": "Talent Acquisition Manager",
+    "poster_profile_url": "https://www.linkedin.com/in/mia-example",
+    "date_posted": "2026-06-02"
+  }
+]
