@@ -1,14 +1,10 @@
 import os
-from pathlib import Path
 from datetime import date
 
 import psycopg2
 
-from scripts.providers.json_provider import JsonJobProvider
+from scripts.providers.provider_factory import get_job_provider
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-NEW_JOBS_FILE = BASE_DIR / "sample_data" / "new_jobs.json"
 
 POSTGRES_CONFIG = {
     "host": os.getenv("POSTGRES_HOST", "localhost"),
@@ -125,7 +121,7 @@ def insert_job(cursor, job):
 
 
 def collect_jobs_to_postgres():
-    provider = JsonJobProvider(NEW_JOBS_FILE)
+    provider = get_job_provider()
     raw_jobs = provider.fetch_jobs()
 
     if not raw_jobs:
