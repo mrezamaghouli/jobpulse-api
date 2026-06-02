@@ -2,7 +2,7 @@
 
 JobPulse is a LinkedIn-style job search dashboard built with **FastAPI**, **PostgreSQL**, **Docker Compose**, and vanilla **HTML/CSS/JavaScript**.
 
-The project includes a REST API, PostgreSQL database, LinkedIn-style job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, and a frontend dashboard for browsing job listings.
+The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, and a frontend dashboard for browsing job listings.
 
 > Note: This project currently uses LinkedIn-style sample data. It does **not** scrape LinkedIn directly. A production version should use an authorized data source, official integration, or a compliant third-party job data provider.
 
@@ -14,6 +14,7 @@ The project includes a REST API, PostgreSQL database, LinkedIn-style job collect
 * PostgreSQL database
 * Docker Compose setup
 * Nginx-based frontend container
+* Provider-based job collector architecture
 * LinkedIn-style job data model
 * PostgreSQL collector service
 * Job search by title, location, remote status, seniority, job type, and salary
@@ -26,6 +27,7 @@ The project includes a REST API, PostgreSQL database, LinkedIn-style job collect
 * Frontend dashboard
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
+* Dynamic frontend API URL based on browser hostname
 
 ---
 
@@ -52,15 +54,18 @@ flowchart TD
     A[Frontend Dashboard<br/>HTML CSS JavaScript] --> B[FastAPI REST API]
     B --> C[PostgreSQL Database]
 
-    D[LinkedIn-style new_jobs.json] --> E[Collector Service]
-    E --> C
+    D[LinkedIn-style new_jobs.json] --> E[JsonJobProvider]
+    E --> F[Collector Service]
+    F --> C
 
-    F[Adminer Database UI] --> C
+    G[Future Authorized LinkedIn Provider] -.-> F
 
-    B --> G[/health endpoint]
-    B --> H[/jobs/search endpoint]
-    B --> I[/jobs/stats endpoint]
-    B --> J[/jobs/{id} endpoint]
+    H[Adminer Database UI] --> C
+
+    B --> I[/health endpoint]
+    B --> J[/jobs/search endpoint]
+    B --> K[/jobs/stats endpoint]
+    B --> L[/jobs/{id} endpoint]
 ```
 
 ---
@@ -99,8 +104,14 @@ linkedin-api/
 │   └── new_jobs.json
 │
 ├── scripts/
+│   ├── __init__.py
 │   ├── collector_postgres.py
-│   └── smoke_test.py
+│   ├── smoke_test.py
+│   └── providers/
+│       ├── __init__.py
+│       ├── base_provider.py
+│       ├── json_provider.py
+│       └── linkedin_provider_placeholder.py
 │
 ├── Dockerfile
 ├── docker-compose.yml
@@ -275,6 +286,36 @@ http://127.0.0.1:8000/jobs/1
 
 ---
 
+## Provider Layer
+
+The collector uses a provider-based architecture.
+
+Current provider:
+
+```text
+JsonJobProvider
+```
+
+Current data source:
+
+```text
+sample_data/new_jobs.json
+```
+
+Provider files:
+
+```text
+scripts/providers/base_provider.py
+scripts/providers/json_provider.py
+scripts/providers/linkedin_provider_placeholder.py
+```
+
+The `LinkedInProviderPlaceholder` exists only as a placeholder for a future authorized LinkedIn data source.
+
+The project does not scrape LinkedIn directly.
+
+---
+
 ## Run the Collector
 
 Add new LinkedIn-style jobs to:
@@ -317,7 +358,8 @@ docker compose run --rm collector
 
 The collector:
 
-* reads `sample_data/new_jobs.json`
+* uses the provider layer to fetch job records
+* reads `sample_data/new_jobs.json` through `JsonJobProvider`
 * validates LinkedIn-style job records
 * skips non-LinkedIn jobs
 * prevents duplicates using `job_url`
@@ -453,6 +495,29 @@ http://127.0.0.1:5500
 
 ---
 
+## Frontend API Configuration
+
+The frontend dynamically builds the API URL using the current browser hostname:
+
+```js
+const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:8000`;
+```
+
+For local Docker Compose usage:
+
+* Frontend runs on port `5500`
+* API runs on port `8000`
+
+Example:
+
+```text
+http://127.0.0.1:5500 → http://127.0.0.1:8000
+```
+
+This avoids hardcoding `127.0.0.1` directly inside the frontend code and makes the project easier to adapt for deployment.
+
+---
+
 ## Docker Commands
 
 Start all services:
@@ -570,13 +635,14 @@ A production version should use one of the following:
 * Add automated tests
 * Add CI/CD with GitHub Actions
 * Add production logging and monitoring
+* Replace JSON provider with an authorized job data provider
 
 ---
 
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
