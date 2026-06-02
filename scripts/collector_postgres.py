@@ -1,13 +1,13 @@
 import os
-import json
 from pathlib import Path
 from datetime import date
 
 import psycopg2
 
+from scripts.providers.json_provider import JsonJobProvider
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 NEW_JOBS_FILE = BASE_DIR / "sample_data" / "new_jobs.json"
 
 POSTGRES_CONFIG = {
@@ -19,14 +19,6 @@ POSTGRES_CONFIG = {
 }
 
 ALLOWED_SOURCE = "LinkedIn"
-
-
-def load_json(file_path):
-    if not file_path.exists():
-        return []
-
-    with open(file_path, "r", encoding="utf-8") as file:
-        return json.load(file)
 
 
 def parse_remote(value):
@@ -133,10 +125,11 @@ def insert_job(cursor, job):
 
 
 def collect_jobs_to_postgres():
-    raw_jobs = load_json(NEW_JOBS_FILE)
+    provider = JsonJobProvider(NEW_JOBS_FILE)
+    raw_jobs = provider.fetch_jobs()
 
     if not raw_jobs:
-        print("No jobs found in new_jobs.json")
+        print("No jobs found from provider.")
         return
 
     connection = psycopg2.connect(**POSTGRES_CONFIG)
@@ -171,6 +164,7 @@ def collect_jobs_to_postgres():
     connection.close()
 
     print("LinkedIn PostgreSQL collector finished successfully.")
+    print(f"Provider: {provider.__class__.__name__}")
     print(f"Added LinkedIn jobs: {added_count}")
     print(f"Skipped duplicate jobs: {skipped_duplicate_count}")
     print(f"Skipped non-LinkedIn jobs: {skipped_non_linkedin_count}")
