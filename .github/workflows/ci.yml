@@ -9,38 +9,70 @@ on:
     branches:
       - main
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   docker-smoke-test:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Show repository files
+        run: |
+          pwd
+          ls -la
+          echo "Frontend:"
+          ls -la frontend
+          echo "Scripts:"
+          ls -la scripts
+          echo "Providers:"
+          ls -la scripts/providers || true
 
       - name: Create environment file
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          echo ".env created from .env.example"
 
-      - name: Build and start services
-        run: docker compose up -d --build
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Build services
+        run: docker compose build
+
+      - name: Start services
+        run: docker compose up -d
+
+      - name: Show service status after startup
+        run: docker compose ps
 
       - name: Wait for API health check
         run: |
-          for i in {1..30}; do
+          for i in {1..40}; do
             if curl -f http://127.0.0.1:8000/health; then
               echo "API is healthy"
               exit 0
             fi
 
-            echo "Waiting for API..."
+            echo "Waiting for API... attempt $i"
+            docker compose ps
             sleep 3
           done
 
           echo "API did not become healthy in time"
-          docker compose logs
+          docker compose logs api
+          docker compose logs db
           exit 1
 
       - name: Run collector
         run: docker compose run --rm collector
+
+      - name: Show API search result
+        run: curl -f "http://127.0.0.1:8000/jobs/search?source=linkedin"
 
       - name: Run smoke tests
         run: python scripts/smoke_test.py
