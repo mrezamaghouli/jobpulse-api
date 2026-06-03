@@ -36,6 +36,12 @@ jobs:
           cp .env.example .env
           echo ".env created from .env.example"
 
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest
+
       - name: Show Docker versions
         run: |
           docker --version
