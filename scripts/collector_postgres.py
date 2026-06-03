@@ -1,9 +1,8 @@
-import os
 from datetime import date
-from app.config import get_postgres_config
 
 import psycopg2
 
+from app.config import get_postgres_config
 from scripts.providers.provider_factory import get_job_provider
 
 
@@ -121,7 +120,7 @@ def collect_jobs_to_postgres():
         print("No jobs found from provider.")
         return
 
-   connection = psycopg2.connect(**get_postgres_config())
+    connection = psycopg2.connect(**get_postgres_config())
     cursor = connection.cursor()
 
     added_count = 0
