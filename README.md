@@ -2,7 +2,7 @@
 
 JobPulse is a LinkedIn-style job search dashboard built with **FastAPI**, **PostgreSQL**, **Docker Compose**, and vanilla **HTML/CSS/JavaScript**.
 
-The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, and a frontend dashboard for browsing job listings.
+The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, optional API key authentication, and a frontend dashboard for browsing job listings.
 
 > Note: This project currently uses LinkedIn-style sample data. It does **not** scrape LinkedIn directly. A production version should use an authorized data source, official integration, or a compliant third-party job data provider.
 
@@ -24,6 +24,7 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * Job details endpoint
 * Health check endpoint
 * Smoke test script
+* Optional API key authentication
 * Frontend dashboard
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
@@ -78,6 +79,7 @@ flowchart TD
 ```text
 linkedin-api/
 ├── app/
+│   ├── config.py
 │   ├── main.py
 │   ├── models.py
 │   ├── postgres_database.py
@@ -156,6 +158,7 @@ POSTGRES_PORT=5432
 JOB_PROVIDER=json
 PORT=8000
 CORS_ALLOWED_ORIGINS=http://127.0.0.1:5500,http://localhost:5500
+API_KEY=
 ```
 
 The `.env` file is ignored by Git and should not be committed.
@@ -413,6 +416,8 @@ Expected output:
 
 ```text
 Running JobPulse smoke tests...
+API base URL: http://127.0.0.1:8000
+API key: disabled
 --------------------------------------------------
 ✅ Health check passed
 ✅ Stats endpoint passed
@@ -421,6 +426,21 @@ Running JobPulse smoke tests...
 --------------------------------------------------
 Passed: 4/4
 🎉 All smoke tests passed.
+```
+
+If API key authentication is enabled, pass the API key as an environment variable before running the smoke test.
+
+PowerShell example:
+
+```powershell
+$env:API_KEY="your_secret_key"
+python scripts/smoke_test.py
+```
+
+To remove it from the current PowerShell session:
+
+```powershell
+Remove-Item Env:\API_KEY
 ```
 
 If the job details test fails, make sure the database contains job records.
@@ -587,6 +607,57 @@ CORS_ALLOWED_ORIGINS=https://your-frontend-domain.com
 
 ---
 
+## Optional API Key Authentication
+
+The API supports optional API key authentication.
+
+By default, local development runs without an API key:
+
+```env
+API_KEY=
+```
+
+When `API_KEY` is empty, all API endpoints are accessible normally.
+
+To enable API key protection, set:
+
+```env
+API_KEY=your_secret_key
+```
+
+When enabled, protected endpoints require the following request header:
+
+```text
+X-API-Key: your_secret_key
+```
+
+Public endpoints remain accessible without an API key:
+
+```text
+GET /
+GET /health
+GET /docs
+GET /openapi.json
+GET /redoc
+```
+
+Protected endpoints include:
+
+```text
+GET /jobs
+GET /jobs/search
+GET /jobs/stats
+GET /jobs/{job_id}
+```
+
+Example request with API key:
+
+```powershell
+curl.exe -H "X-API-Key: your_secret_key" "http://127.0.0.1:8000/jobs/search?source=linkedin"
+```
+
+---
+
 ## Docker Commands
 
 Start all services:
@@ -748,7 +819,7 @@ GCP_DEPLOYMENT_PLAN.md
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, optional API key authentication, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
