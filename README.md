@@ -28,6 +28,7 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
 * Frontend runtime config through `frontend/config.js`
+* Configurable CORS origins through environment variables
 * GitHub Actions CI workflow
 
 ---
@@ -154,6 +155,7 @@ POSTGRES_HOST=db
 POSTGRES_PORT=5432
 JOB_PROVIDER=json
 PORT=8000
+CORS_ALLOWED_ORIGINS=http://127.0.0.1:5500,http://localhost:5500
 ```
 
 The `.env` file is ignored by Git and should not be committed.
@@ -508,6 +510,7 @@ The frontend dashboard supports:
 * pagination
 * job cards
 * job detail view
+* system health status
 * links to job URL
 * links to poster profile
 * links to company LinkedIn page
@@ -554,6 +557,33 @@ http://127.0.0.1:5500 → http://127.0.0.1:8000
 ```
 
 For production deployment, update `frontend/config.js` to point to the deployed API URL.
+
+---
+
+## CORS Configuration
+
+The API reads allowed frontend origins from the environment variable:
+
+```env
+CORS_ALLOWED_ORIGINS=http://127.0.0.1:5500,http://localhost:5500
+```
+
+Multiple origins can be separated by commas.
+
+For local Docker Compose usage, the default allowed origins are:
+
+```text
+http://127.0.0.1:5500
+http://localhost:5500
+```
+
+For production deployment, this value should be updated to the deployed frontend domain.
+
+Example:
+
+```env
+CORS_ALLOWED_ORIGINS=https://your-frontend-domain.com
+```
 
 ---
 
