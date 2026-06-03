@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.postgres_database import check_postgres_connection
@@ -10,14 +11,25 @@ from app.repositories.jobs_postgres_repository import (
     get_job_by_id_from_db
 )
 
+
+def get_cors_allowed_origins():
+    origins = os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500"
+    )
+
+    return [
+        origin.strip()
+        for origin in origins.split(",")
+        if origin.strip()
+    ]
+
+
 app = FastAPI(title="JobPulse API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5500",
-        "http://localhost:5500"
-    ],
+    allow_origins=get_cors_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
