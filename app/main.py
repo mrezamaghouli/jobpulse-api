@@ -1,17 +1,20 @@
-import os
 import time
 import logging
+
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from app.postgres_database import check_postgres_connection
-from app.config import get_cors_allowed_origins
+from fastapi.responses import JSONResponse
+
+from app.config import get_cors_allowed_origins, get_api_key
 from app.models import Job, JobSearchResponse
+from app.postgres_database import check_postgres_connection
 from app.repositories.jobs_postgres_repository import (
     get_all_jobs_from_db,
     search_jobs_from_db,
     get_jobs_stats_from_db,
     get_job_by_id_from_db
 )
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,7 +23,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("jobpulse-api")
 
+
 app = FastAPI(title="JobPulse API")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +34,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
@@ -46,6 +53,38 @@ async def log_requests(request: Request, call_next):
     )
 
     return response
+
+
+@app.middleware("http")
+async def api_key_auth(request: Request, call_next):
+    configured_api_key = get_api_key()
+
+    public_paths = [
+        "/",
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc"
+    ]
+
+    if not configured_api_key:
+        return await call_next(request)
+
+    if request.url.path in public_paths:
+        return await call_next(request)
+
+    request_api_key = request.headers.get("X-API-Key")
+
+    if request_api_key != configured_api_key:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": "Invalid or missing API key"
+            }
+        )
+
+    return await call_next(request)
+
 
 @app.get("/")
 def home():
@@ -75,6 +114,7 @@ def health_check():
         "database_type": "PostgreSQL",
         "details": database_status.get("error")
     }
+
 
 @app.get("/jobs", response_model=list[Job])
 def get_all_jobs():

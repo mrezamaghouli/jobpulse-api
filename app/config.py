@@ -34,3 +34,7 @@ def get_job_provider_name():
 
 def get_app_port():
     return get_env_value("PORT", "8000")
+
+
+def get_api_key():
+    return get_env_value("API_KEY", "").strip()
