@@ -1,16 +1,23 @@
 import json
+import os
 import urllib.request
 import urllib.error
 
 
-API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+API_KEY = os.getenv("API_KEY", "").strip()
 
 
 def request_json(path):
     url = f"{API_BASE_URL}{path}"
 
+    request = urllib.request.Request(url)
+
+    if API_KEY:
+        request.add_header("X-API-Key", API_KEY)
+
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=10) as response:
             status_code = response.status
             data = json.loads(response.read().decode("utf-8"))
             return status_code, data
@@ -44,6 +51,13 @@ def check_endpoint(name, path, expected_status=200):
 
 def run_smoke_tests():
     print("Running JobPulse smoke tests...")
+    print(f"API base URL: {API_BASE_URL}")
+
+    if API_KEY:
+        print("API key: enabled")
+    else:
+        print("API key: disabled")
+
     print("-" * 50)
 
     health_ok, _ = check_endpoint("Health check", "/health")
