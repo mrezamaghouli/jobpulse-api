@@ -5,7 +5,13 @@ from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.config import get_cors_allowed_origins, get_api_key
+from app.config import (
+    get_cors_allowed_origins,
+    get_api_key,
+    get_rate_limit_enabled,
+    get_rate_limit_max_requests,
+    get_rate_limit_window_seconds
+)
 from app.models import Job, JobSearchResponse
 from app.postgres_database import check_postgres_connection
 from app.repositories.jobs_postgres_repository import (
@@ -22,7 +28,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("jobpulse-api")
-
+rate_limit_store = {}
 
 app = FastAPI(title="JobPulse API")
 
@@ -82,6 +88,61 @@ async def api_key_auth(request: Request, call_next):
                 "detail": "Invalid or missing API key"
             }
         )
+
+    return await call_next(request)
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if not get_rate_limit_enabled():
+        return await call_next(request)
+
+    public_paths = [
+        "/",
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc"
+    ]
+
+    if request.url.path in public_paths:
+        return await call_next(request)
+
+    client_host = request.client.host if request.client else "unknown"
+    current_time = time.time()
+
+    window_seconds = get_rate_limit_window_seconds()
+    max_requests = get_rate_limit_max_requests()
+
+    client_record = rate_limit_store.get(client_host)
+
+    if not client_record:
+        rate_limit_store[client_host] = {
+            "window_start": current_time,
+            "request_count": 1
+        }
+
+        return await call_next(request)
+
+    window_start = client_record["window_start"]
+    request_count = client_record["request_count"]
+
+    if current_time - window_start > window_seconds:
+        rate_limit_store[client_host] = {
+            "window_start": current_time,
+            "request_count": 1
+        }
+
+        return await call_next(request)
+
+    if request_count >= max_requests:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Rate limit exceeded"
+            }
+        )
+
+    client_record["request_count"] += 1
 
     return await call_next(request)
 

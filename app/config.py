@@ -38,3 +38,15 @@ def get_app_port():
 
 def get_api_key():
     return get_env_value("API_KEY", "").strip()
+
+def get_rate_limit_enabled():
+    value = get_env_value("RATE_LIMIT_ENABLED", "false").lower().strip()
+    return value in ["true", "1", "yes", "on"]
+
+
+def get_rate_limit_max_requests():
+    return int(get_env_value("RATE_LIMIT_MAX_REQUESTS", "60"))
+
+
+def get_rate_limit_window_seconds():
+    return int(get_env_value("RATE_LIMIT_WINDOW_SECONDS", "60"))
