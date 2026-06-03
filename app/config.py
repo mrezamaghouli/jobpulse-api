@@ -1,0 +1,36 @@
+import os
+
+
+def get_env_value(key: str, default: str) -> str:
+    return os.getenv(key, default)
+
+
+def get_postgres_config():
+    return {
+        "host": get_env_value("POSTGRES_HOST", "localhost"),
+        "port": get_env_value("POSTGRES_PORT", "5432"),
+        "database": get_env_value("POSTGRES_DB", "jobpulse"),
+        "user": get_env_value("POSTGRES_USER", "jobpulse_user"),
+        "password": get_env_value("POSTGRES_PASSWORD", "jobpulse_password"),
+    }
+
+
+def get_cors_allowed_origins():
+    origins = get_env_value(
+        "CORS_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500"
+    )
+
+    return [
+        origin.strip()
+        for origin in origins.split(",")
+        if origin.strip()
+    ]
+
+
+def get_job_provider_name():
+    return get_env_value("JOB_PROVIDER", "json").lower().strip()
+
+
+def get_app_port():
+    return get_env_value("PORT", "8000")

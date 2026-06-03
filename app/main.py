@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.postgres_database import check_postgres_connection
-
+from app.config import get_cors_allowed_origins
 from app.models import Job, JobSearchResponse
 from app.repositories.jobs_postgres_repository import (
     get_all_jobs_from_db,
@@ -12,19 +12,6 @@ from app.repositories.jobs_postgres_repository import (
     get_jobs_stats_from_db,
     get_job_by_id_from_db
 )
-
-
-def get_cors_allowed_origins():
-    origins = os.getenv(
-        "CORS_ALLOWED_ORIGINS",
-        "http://127.0.0.1:5500,http://localhost:5500"
-    )
-
-    return [
-        origin.strip()
-        for origin in origins.split(",")
-        if origin.strip()
-    ]
 
 logging.basicConfig(
     level=logging.INFO,

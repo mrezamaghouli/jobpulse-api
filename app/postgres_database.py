@@ -1,16 +1,14 @@
-import os
-
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+from app.config import get_postgres_config
+
 
 def get_postgres_connection():
+    postgres_config = get_postgres_config()
+
     connection = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=os.getenv("POSTGRES_PORT", "5432"),
-        database=os.getenv("POSTGRES_DB", "jobpulse"),
-        user=os.getenv("POSTGRES_USER", "jobpulse_user"),
-        password=os.getenv("POSTGRES_PASSWORD", "jobpulse_password"),
+        **postgres_config,
         cursor_factory=RealDictCursor
     )
 

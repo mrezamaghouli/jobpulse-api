@@ -1,18 +1,11 @@
 import os
 from datetime import date
+from app.config import get_postgres_config
 
 import psycopg2
 
 from scripts.providers.provider_factory import get_job_provider
 
-
-POSTGRES_CONFIG = {
-    "host": os.getenv("POSTGRES_HOST", "localhost"),
-    "port": os.getenv("POSTGRES_PORT", "5432"),
-    "database": os.getenv("POSTGRES_DB", "jobpulse"),
-    "user": os.getenv("POSTGRES_USER", "jobpulse_user"),
-    "password": os.getenv("POSTGRES_PASSWORD", "jobpulse_password"),
-}
 
 ALLOWED_SOURCE = "LinkedIn"
 
@@ -128,7 +121,7 @@ def collect_jobs_to_postgres():
         print("No jobs found from provider.")
         return
 
-    connection = psycopg2.connect(**POSTGRES_CONFIG)
+   connection = psycopg2.connect(**get_postgres_config())
     cursor = connection.cursor()
 
     added_count = 0
