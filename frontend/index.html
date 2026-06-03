@@ -35,7 +35,7 @@
 
     .stats {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 16px;
       margin-bottom: 24px;
     }
@@ -268,6 +268,13 @@
       background: white;
       color: #18181b;
     }
+    .status-ok-text {
+      color: #15803d;
+    }
+
+    .status-error-text {
+      color: #b91c1c;
+    }
 
     @media (max-width: 900px) {
       .stats {
@@ -292,13 +299,7 @@
 </head>
 
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>JobPulse Dashboard</h1>
-      <p>LinkedIn-only job search dashboard powered by FastAPI and SQLite</p>
-    </div>
-
-    <div class="stats">
+  <div class="stats">
       <div class="stat-card">
         <span>Total Jobs</span>
         <strong id="totalJobs">-</strong>
@@ -313,7 +314,12 @@
         <span>On-site Jobs</span>
         <strong id="onsiteJobs">-</strong>
       </div>
-    </div>
+
+      <div class="stat-card">
+        <span>System Status</span>
+        <strong id="systemStatus">-</strong>
+      </div>
+</div>
 
     <div class="search-box">
       <div class="form-grid">
@@ -406,6 +412,36 @@
         console.error("Stats error:", error);
       }
     }
+
+
+    async function loadHealthStatus() {
+        const statusElement = document.getElementById("systemStatus");
+
+        try {
+          const response = await fetch(`${API_BASE_URL}/health`);
+
+          if (!response.ok) {
+            throw new Error(`API error: ${response.status}`);
+          }
+
+          const health = await response.json();
+
+          if (health.status === "ok" && health.database === "connected") {
+            statusElement.textContent = "Healthy";
+            statusElement.className = "status-ok-text";
+            return;
+          }
+
+          statusElement.textContent = "Issue";
+          statusElement.className = "status-error-text";
+        } catch (error) {
+          console.error("Health status error:", error);
+
+          statusElement.textContent = "Offline";
+          statusElement.className = "status-error-text";
+        }
+    }
+
 
     async function searchJobs(page = 1) {
       currentPage = page;
@@ -696,6 +732,7 @@
     }
 
     loadStats();
+    loadHealthStatus();
     searchJobs(1);
   </script>
 </body>
