@@ -27,7 +27,8 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * Frontend dashboard
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
-* Dynamic frontend API URL based on browser hostname
+* Frontend runtime config through `frontend/config.js`
+* GitHub Actions CI workflow
 
 ---
 
@@ -44,6 +45,7 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * CSS
 * JavaScript
 * Adminer
+* GitHub Actions
 
 ---
 
@@ -87,6 +89,7 @@ linkedin-api/
 │
 ├── frontend/
 │   ├── Dockerfile
+│   ├── config.js
 │   └── index.html
 │
 ├── legacy/
@@ -111,7 +114,12 @@ linkedin-api/
 │       ├── __init__.py
 │       ├── base_provider.py
 │       ├── json_provider.py
-│       └── linkedin_provider_placeholder.py
+│       ├── linkedin_provider_placeholder.py
+│       └── provider_factory.py
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 │
 ├── Dockerfile
 ├── docker-compose.yml
@@ -119,6 +127,8 @@ linkedin-api/
 ├── .dockerignore
 ├── .gitignore
 ├── .env.example
+├── GCP_DEPLOYMENT_PLAN.md
+├── PROJECT_NOTES.md
 └── README.md
 ```
 
@@ -142,6 +152,8 @@ POSTGRES_USER=jobpulse_user
 POSTGRES_PASSWORD=jobpulse_password
 POSTGRES_HOST=db
 POSTGRES_PORT=5432
+JOB_PROVIDER=json
+PORT=8000
 ```
 
 The `.env` file is ignored by Git and should not be committed.
@@ -197,6 +209,12 @@ Frontend Dashboard:
 
 ```text
 http://127.0.0.1:5500
+```
+
+Frontend Runtime Config:
+
+```text
+http://127.0.0.1:5500/config.js
 ```
 
 Adminer:
@@ -308,6 +326,13 @@ Provider files:
 scripts/providers/base_provider.py
 scripts/providers/json_provider.py
 scripts/providers/linkedin_provider_placeholder.py
+scripts/providers/provider_factory.py
+```
+
+The provider is selected through the environment variable:
+
+```env
+JOB_PROVIDER=json
 ```
 
 The `LinkedInProviderPlaceholder` exists only as a placeholder for a future authorized LinkedIn data source.
@@ -396,7 +421,7 @@ Passed: 4/4
 🎉 All smoke tests passed.
 ```
 
-If the job details test fails, make sure the database contains a job with the ID used in `scripts/smoke_test.py`.
+If the job details test fails, make sure the database contains job records.
 
 ---
 
@@ -497,10 +522,24 @@ http://127.0.0.1:5500
 
 ## Frontend API Configuration
 
-The frontend dynamically builds the API URL using the current browser hostname:
+The frontend reads the API URL from:
+
+```text
+frontend/config.js
+```
+
+Example local config:
 
 ```js
-const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:8000`;
+window.JOBPULSE_CONFIG = {
+  API_BASE_URL: "http://127.0.0.1:8000"
+};
+```
+
+Then `index.html` uses:
+
+```js
+const API_BASE_URL = window.JOBPULSE_CONFIG.API_BASE_URL;
 ```
 
 For local Docker Compose usage:
@@ -514,7 +553,7 @@ Example:
 http://127.0.0.1:5500 → http://127.0.0.1:8000
 ```
 
-This avoids hardcoding `127.0.0.1` directly inside the frontend code and makes the project easier to adapt for deployment.
+For production deployment, update `frontend/config.js` to point to the deployed API URL.
 
 ---
 
@@ -577,6 +616,29 @@ docker compose up -d --build
 
 ---
 
+## GitHub Actions CI
+
+The project includes a GitHub Actions workflow:
+
+```text
+.github/workflows/ci.yml
+```
+
+The CI pipeline:
+
+1. checks out the repository
+2. creates `.env` from `.env.example`
+3. builds Docker services
+4. starts the system
+5. waits for the API health check
+6. runs the collector
+7. runs the smoke test
+8. shuts down the services
+
+This helps verify that the project can build and run successfully after each push to `main`.
+
+---
+
 ## Git Workflow
 
 Check project status:
@@ -632,17 +694,31 @@ A production version should use one of the following:
 * Add company filtering
 * Add country/city normalization
 * Add job expiration and `is_active` status
-* Add automated tests
-* Add CI/CD with GitHub Actions
+* Add automated tests with pytest
 * Add production logging and monitoring
 * Replace JSON provider with an authorized job data provider
+
+---
+
+## Related Documentation
+
+Additional project documentation:
+
+```text
+PROJECT_NOTES.md
+GCP_DEPLOYMENT_PLAN.md
+```
+
+`PROJECT_NOTES.md` explains architecture decisions.
+
+`GCP_DEPLOYMENT_PLAN.md` describes a possible future deployment plan for Google Cloud Platform.
 
 ---
 
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
