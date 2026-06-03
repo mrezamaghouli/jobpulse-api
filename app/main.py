@@ -1,5 +1,7 @@
 import os
-from fastapi import FastAPI, Query, HTTPException
+import time
+import logging
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.postgres_database import check_postgres_connection
 
@@ -24,6 +26,12 @@ def get_cors_allowed_origins():
         if origin.strip()
     ]
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("jobpulse-api")
 
 app = FastAPI(title="JobPulse API")
 
@@ -34,7 +42,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
 
+    response = await call_next(request)
+
+    duration_ms = round((time.time() - start_time) * 1000, 2)
+
+    logger.info(
+        "%s %s %s %sms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms
+    )
+
+    return response
 
 @app.get("/")
 def home():
