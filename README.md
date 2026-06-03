@@ -2,7 +2,7 @@
 
 JobPulse is a LinkedIn-style job search dashboard built with **FastAPI**, **PostgreSQL**, **Docker Compose**, and vanilla **HTML/CSS/JavaScript**.
 
-The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, optional API key authentication, and a frontend dashboard for browsing job listings.
+The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, optional API key authentication, optional rate limiting, and a frontend dashboard for browsing job listings.
 
 > Note: This project currently uses LinkedIn-style sample data. It does **not** scrape LinkedIn directly. A production version should use an authorized data source, official integration, or a compliant third-party job data provider.
 
@@ -25,6 +25,7 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * Health check endpoint
 * Smoke test script
 * Optional API key authentication
+* Optional in-memory rate limiting
 * Frontend dashboard
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
@@ -159,6 +160,9 @@ JOB_PROVIDER=json
 PORT=8000
 CORS_ALLOWED_ORIGINS=http://127.0.0.1:5500,http://localhost:5500
 API_KEY=
+RATE_LIMIT_ENABLED=false
+RATE_LIMIT_MAX_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
 ```
 
 The `.env` file is ignored by Git and should not be committed.
@@ -658,6 +662,63 @@ curl.exe -H "X-API-Key: your_secret_key" "http://127.0.0.1:8000/jobs/search?sour
 
 ---
 
+## Optional Rate Limiting
+
+The API supports optional in-memory rate limiting.
+
+By default, rate limiting is disabled:
+
+```env
+RATE_LIMIT_ENABLED=false
+```
+
+To enable it:
+
+```env
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_MAX_REQUESTS=60
+RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+This means each client can make up to 60 requests per 60 seconds.
+
+If the limit is exceeded, the API returns:
+
+```json
+{
+  "detail": "Rate limit exceeded"
+}
+```
+
+with HTTP status:
+
+```text
+429 Too Many Requests
+```
+
+Public endpoints are excluded from rate limiting:
+
+```text
+GET /
+GET /health
+GET /docs
+GET /openapi.json
+GET /redoc
+```
+
+Protected/search endpoints can be rate-limited:
+
+```text
+GET /jobs
+GET /jobs/search
+GET /jobs/stats
+GET /jobs/{job_id}
+```
+
+This rate limiter is currently in-memory and suitable for local development or simple single-instance deployments. For production with multiple instances, Redis or another shared store should be used.
+
+---
+
 ## Docker Commands
 
 Start all services:
@@ -791,6 +852,7 @@ A production version should use one of the following:
 * Add Cloud Scheduler for automated collector runs
 * Add authentication or API keys
 * Add Redis caching for faster repeated searches
+* Replace in-memory rate limiting with Redis-backed rate limiting
 * Add full-text search
 * Add company filtering
 * Add country/city normalization
@@ -819,7 +881,7 @@ GCP_DEPLOYMENT_PLAN.md
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, optional API key authentication, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, optional API key authentication, optional rate limiting, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
