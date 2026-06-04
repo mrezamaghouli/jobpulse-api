@@ -7,7 +7,7 @@ import urllib.error
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 API_KEY = os.getenv("API_KEY", "").strip()
 
-
+ 
 def request_json(path):
     url = f"{API_BASE_URL}{path}"
 
@@ -61,6 +61,7 @@ def run_smoke_tests():
     print("-" * 50)
 
     health_ok, _ = check_endpoint("Health check", "/health")
+    meta_ok, _ = check_endpoint("Metadata endpoint", "/meta")
     stats_ok, _ = check_endpoint("Stats endpoint", "/jobs/stats")
 
     search_ok, search_data = check_endpoint(
@@ -91,6 +92,7 @@ def run_smoke_tests():
 
     checks = [
         health_ok,
+        meta_ok,
         stats_ok,
         search_ok,
         job_details_ok
