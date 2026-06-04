@@ -10,8 +10,12 @@ from app.config import (
     get_api_key,
     get_rate_limit_enabled,
     get_rate_limit_max_requests,
-    get_rate_limit_window_seconds
+    get_rate_limit_window_seconds,
+    get_app_name,
+    get_app_version,
+    get_app_environment
 )
+
 from app.models import Job, JobSearchResponse
 from app.postgres_database import check_postgres_connection
 from app.repositories.jobs_postgres_repository import (
@@ -68,6 +72,7 @@ async def api_key_auth(request: Request, call_next):
     public_paths = [
         "/",
         "/health",
+        "/meta",
         "/docs",
         "/openapi.json",
         "/redoc"
@@ -99,6 +104,7 @@ async def rate_limit(request: Request, call_next):
     public_paths = [
         "/",
         "/health",
+        "/meta",
         "/docs",
         "/openapi.json",
         "/redoc"
@@ -155,6 +161,26 @@ def home():
         "database": "PostgreSQL"
     }
 
+@app.get("/meta")
+def get_app_metadata():
+    return {
+        "app_name": get_app_name(),
+        "version": get_app_version(),
+        "environment": get_app_environment(),
+        "database": "PostgreSQL",
+        "features": [
+            "search",
+            "pagination",
+            "sorting",
+            "provider_collector",
+            "health_check",
+            "api_key_auth",
+            "rate_limiting",
+            "request_logging",
+            "smoke_tests",
+            "unit_tests"
+        ]
+    }
 
 @app.get("/health")
 def health_check():

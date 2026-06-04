@@ -50,3 +50,13 @@ def get_rate_limit_max_requests():
 
 def get_rate_limit_window_seconds():
     return int(get_env_value("RATE_LIMIT_WINDOW_SECONDS", "60"))
+def get_app_name():
+    return get_env_value("APP_NAME", "JobPulse API")
+
+
+def get_app_version():
+    return get_env_value("APP_VERSION", "1.0.0")
+
+
+def get_app_environment():
+    return get_env_value("APP_ENV", "development")
