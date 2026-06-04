@@ -2,7 +2,7 @@
 
 JobPulse is a LinkedIn-style job search dashboard built with **FastAPI**, **PostgreSQL**, **Docker Compose**, and vanilla **HTML/CSS/JavaScript**.
 
-The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, optional API key authentication, optional rate limiting, and a frontend dashboard for browsing job listings.
+The project includes a REST API, PostgreSQL database, provider-based job collector, search filters, sorting, pagination, statistics endpoint, health check endpoint, smoke test script, unit tests, optional API key authentication, optional rate limiting, request logging, and a frontend dashboard for browsing job listings.
 
 > Note: This project currently uses LinkedIn-style sample data. It does **not** scrape LinkedIn directly. A production version should use an authorized data source, official integration, or a compliant third-party job data provider.
 
@@ -24,14 +24,19 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * Job details endpoint
 * Health check endpoint
 * Smoke test script
+* Unit tests with pytest
 * Optional API key authentication
 * Optional in-memory rate limiting
+* Request logging middleware
 * Frontend dashboard
+* Frontend system health status
 * Adminer database UI
 * Duplicate prevention using LinkedIn job ID and job URL
+* Centralized application configuration through `app/config.py`
 * Frontend runtime config through `frontend/config.js`
 * Configurable CORS origins through environment variables
 * GitHub Actions CI workflow
+* Local development mode for faster debugging
 
 ---
 
@@ -48,6 +53,7 @@ The project includes a REST API, PostgreSQL database, provider-based job collect
 * CSS
 * JavaScript
 * Adminer
+* pytest
 * GitHub Actions
 
 ---
@@ -121,6 +127,12 @@ linkedin-api/
 │       ├── linkedin_provider_placeholder.py
 │       └── provider_factory.py
 │
+├── tests/
+│   ├── __init__.py
+│   ├── test_config.py
+│   ├── test_json_provider.py
+│   └── test_provider_factory.py
+│
 ├── .github/
 │   └── workflows/
 │       └── ci.yml
@@ -132,6 +144,7 @@ linkedin-api/
 ├── .gitignore
 ├── .env.example
 ├── GCP_DEPLOYMENT_PLAN.md
+├── LOCAL_DEV.md
 ├── PROJECT_NOTES.md
 └── README.md
 ```
@@ -169,7 +182,7 @@ The `.env` file is ignored by Git and should not be committed.
 
 ---
 
-## Run the Project
+## Run the Project with Docker Compose
 
 Start all services:
 
@@ -191,6 +204,29 @@ jobpulse-frontend
 jobpulse-postgres
 jobpulse-adminer
 ```
+
+---
+
+## Local Development Mode
+
+If Docker cannot build the API image because of network or PyPI access issues, the project can also be run in local development mode.
+
+In local development mode:
+
+```text
+PostgreSQL → Docker
+Adminer    → Docker
+FastAPI    → Local Python venv
+Frontend   → Local Python HTTP server
+```
+
+See:
+
+```text
+LOCAL_DEV.md
+```
+
+This mode is useful for faster debugging and for continuing development when Docker image builds are not available.
 
 ---
 
@@ -451,6 +487,35 @@ If the job details test fails, make sure the database contains job records.
 
 ---
 
+## Unit Tests
+
+The project includes unit tests with `pytest`.
+
+Run unit tests:
+
+```powershell
+pytest
+```
+
+Current unit tests cover:
+
+* application config
+* CORS origin parsing
+* API key config
+* rate limit config
+* JSON provider
+* provider factory
+
+Test files:
+
+```text
+tests/test_config.py
+tests/test_json_provider.py
+tests/test_provider_factory.py
+```
+
+---
+
 ## Database Initialization
 
 The PostgreSQL database is initialized using:
@@ -517,6 +582,26 @@ Docker Compose also uses health checks for:
 * FastAPI API
 
 This helps ensure services are actually ready, not just running.
+
+---
+
+## Request Logging
+
+The API includes request logging middleware.
+
+Example log format:
+
+```text
+GET /health 200 8.42ms
+GET /jobs/stats 200 25.71ms
+GET /jobs/search 200 31.09ms
+```
+
+View API logs:
+
+```powershell
+docker compose logs -f api
+```
 
 ---
 
@@ -790,12 +875,14 @@ The CI pipeline:
 
 1. checks out the repository
 2. creates `.env` from `.env.example`
-3. builds Docker services
-4. starts the system
-5. waits for the API health check
-6. runs the collector
-7. runs the smoke test
-8. shuts down the services
+3. installs Python dependencies
+4. runs unit tests
+5. builds Docker services
+6. starts the system
+7. waits for the API health check
+8. runs the collector
+9. runs the smoke test
+10. shuts down the services
 
 This helps verify that the project can build and run successfully after each push to `main`.
 
@@ -870,18 +957,21 @@ Additional project documentation:
 ```text
 PROJECT_NOTES.md
 GCP_DEPLOYMENT_PLAN.md
+LOCAL_DEV.md
 ```
 
 `PROJECT_NOTES.md` explains architecture decisions.
 
 `GCP_DEPLOYMENT_PLAN.md` describes a possible future deployment plan for Google Cloud Platform.
 
+`LOCAL_DEV.md` explains how to run the project locally when Docker image builds are not available.
+
 ---
 
 ## Resume Description
 
 ```text
-Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, optional API key authentication, optional rate limiting, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
+Built a Dockerized LinkedIn-style job search platform using FastAPI, PostgreSQL, Docker Compose, and vanilla JavaScript. The system includes a REST API, PostgreSQL-backed job database, provider-based job collector pipeline, search filters, sorting, pagination, job statistics, health checks, smoke tests, unit tests, optional API key authentication, optional rate limiting, request logging, GitHub Actions CI, and a frontend dashboard for browsing job listings and recruiter profile links.
 ```
 
 ---
