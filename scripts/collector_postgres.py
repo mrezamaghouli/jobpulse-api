@@ -66,50 +66,72 @@ def is_valid_job(job):
 
 
 def insert_job(cursor, job):
-    cursor.execute(
-        """
-        INSERT INTO jobs (
-            linkedin_job_id,
-            title,
-            company,
-            company_linkedin_url,
-            location,
-            remote,
-            job_type,
-            seniority,
-            salary_min,
-            salary_max,
-            currency,
-            source,
-            job_url,
-            poster_name,
-            poster_title,
-            poster_profile_url,
-            date_posted
+        cursor.execute(
+            """
+            INSERT INTO jobs (
+                linkedin_job_id,
+                title,
+                company,
+                company_linkedin_url,
+                location,
+                remote,
+                job_type,
+                seniority,
+                salary_min,
+                salary_max,
+                currency,
+                source,
+                job_url,
+                poster_name,
+                poster_title,
+                poster_profile_url,
+                date_posted,
+                first_seen_at,
+                last_seen_at,
+                is_active
+            )
+            VALUES (
+                %(linkedin_job_id)s,
+                %(title)s,
+                %(company)s,
+                %(company_linkedin_url)s,
+                %(location)s,
+                %(remote)s,
+                %(job_type)s,
+                %(seniority)s,
+                %(salary_min)s,
+                %(salary_max)s,
+                %(currency)s,
+                %(source)s,
+                %(job_url)s,
+                %(poster_name)s,
+                %(poster_title)s,
+                %(poster_profile_url)s,
+                %(date_posted)s,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP,
+                TRUE
+            )
+            ON CONFLICT (job_url) DO UPDATE SET
+                title = EXCLUDED.title,
+                company = EXCLUDED.company,
+                company_linkedin_url = EXCLUDED.company_linkedin_url,
+                location = EXCLUDED.location,
+                remote = EXCLUDED.remote,
+                job_type = EXCLUDED.job_type,
+                seniority = EXCLUDED.seniority,
+                salary_min = EXCLUDED.salary_min,
+                salary_max = EXCLUDED.salary_max,
+                currency = EXCLUDED.currency,
+                poster_name = EXCLUDED.poster_name,
+                poster_title = EXCLUDED.poster_title,
+                poster_profile_url = EXCLUDED.poster_profile_url,
+                date_posted = EXCLUDED.date_posted,
+                last_seen_at = CURRENT_TIMESTAMP,
+                is_active = TRUE;
+            """,
+            job
         )
-        VALUES (
-            %(linkedin_job_id)s,
-            %(title)s,
-            %(company)s,
-            %(company_linkedin_url)s,
-            %(location)s,
-            %(remote)s,
-            %(job_type)s,
-            %(seniority)s,
-            %(salary_min)s,
-            %(salary_max)s,
-            %(currency)s,
-            %(source)s,
-            %(job_url)s,
-            %(poster_name)s,
-            %(poster_title)s,
-            %(poster_profile_url)s,
-            %(date_posted)s
-        )
-        ON CONFLICT (job_url) DO NOTHING;
-        """,
-        job
-    )
 
 
 def collect_jobs_to_postgres():
@@ -140,11 +162,7 @@ def collect_jobs_to_postgres():
             continue
 
         insert_job(cursor, normalized_job)
-
-        if cursor.rowcount == 1:
-            added_count += 1
-        else:
-            skipped_duplicate_count += 1
+        added_count += 1
 
     connection.commit()
 
@@ -153,7 +171,7 @@ def collect_jobs_to_postgres():
 
     print("LinkedIn PostgreSQL collector finished successfully.")
     print(f"Provider: {provider.__class__.__name__}")
-    print(f"Added LinkedIn jobs: {added_count}")
+    print(f"Inserted or updated LinkedIn jobs: {added_count}")
     print(f"Skipped duplicate jobs: {skipped_duplicate_count}")
     print(f"Skipped non-LinkedIn jobs: {skipped_non_linkedin_count}")
     print(f"Skipped invalid jobs: {skipped_invalid_count}")
