@@ -165,62 +165,48 @@ def get_jobs_stats_from_db():
     connection = get_postgres_connection()
     cursor = connection.cursor()
 
-    cursor.execute("SELECT COUNT(*) AS total_jobs FROM jobs")
-    total_jobs = cursor.fetchone()["total_jobs"]
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total_jobs,
 
-    cursor.execute("SELECT COUNT(*) AS remote_jobs FROM jobs WHERE remote = TRUE")
-    remote_jobs = cursor.fetchone()["remote_jobs"]
+            COUNT(*) FILTER (
+                WHERE source = 'LinkedIn'
+            ) AS linkedin_jobs,
 
-    cursor.execute("SELECT COUNT(*) AS onsite_jobs FROM jobs WHERE remote = FALSE")
-    onsite_jobs = cursor.fetchone()["onsite_jobs"]
+            COUNT(*) FILTER (
+                WHERE source = 'LinkedIn' AND is_active = TRUE
+            ) AS active_linkedin_jobs,
 
-    cursor.execute("""
-        SELECT source, COUNT(*) AS count
-        FROM jobs
-        WHERE source IS NOT NULL
-        GROUP BY source
-        ORDER BY count DESC
-    """)
-    sources = {
-        row["source"]: row["count"]
-        for row in cursor.fetchall()
-    }
+            COUNT(*) FILTER (
+                WHERE source = 'LinkedIn' AND is_active = FALSE
+            ) AS inactive_linkedin_jobs,
 
-    cursor.execute("""
-        SELECT seniority, COUNT(*) AS count
-        FROM jobs
-        WHERE seniority IS NOT NULL
-        GROUP BY seniority
-        ORDER BY count DESC
-    """)
-    seniorities = {
-        row["seniority"]: row["count"]
-        for row in cursor.fetchall()
-    }
+            COUNT(*) FILTER (
+                WHERE remote = TRUE
+            ) AS remote_jobs,
 
-    cursor.execute("""
-        SELECT job_type, COUNT(*) AS count
-        FROM jobs
-        WHERE job_type IS NOT NULL
-        GROUP BY job_type
-        ORDER BY count DESC
-    """)
-    job_types = {
-        row["job_type"]: row["count"]
-        for row in cursor.fetchall()
-    }
+            COUNT(DISTINCT company) AS total_companies,
+
+            COUNT(DISTINCT location) AS total_locations,
+
+            MAX(last_seen_at) FILTER (
+                WHERE source = 'LinkedIn'
+            ) AS last_linkedin_job_seen_at,
+
+            MAX(first_seen_at) FILTER (
+                WHERE source = 'LinkedIn'
+            ) AS newest_linkedin_job_first_seen_at
+        FROM jobs;
+        """
+    )
+
+    stats = cursor.fetchone()
 
     cursor.close()
     connection.close()
 
-    return {
-        "total_jobs": total_jobs,
-        "remote_jobs": remote_jobs,
-        "onsite_jobs": onsite_jobs,
-        "sources": sources,
-        "seniorities": seniorities,
-        "job_types": job_types
-    }
+    return stats
 
 
 def get_job_by_id_from_db(job_id: int):
