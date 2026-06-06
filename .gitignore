@@ -11,3 +11,6 @@ storage/
 
 .vscode/
 .DS_Store
+
+.auth/
+sample_output/
