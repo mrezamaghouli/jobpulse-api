@@ -3,7 +3,13 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import psycopg2
+
+from app.config import get_postgres_config
+from scripts.ensure_collector_runs_table import ensure_collector_runs_table
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,6 +29,88 @@ def load_queries():
     return queries
 
 
+def save_collector_run(
+    provider,
+    keywords,
+    location,
+    job_limit,
+    status,
+    started_at,
+    finished_at,
+    error_message=None
+):
+    duration_seconds = round((finished_at - started_at).total_seconds(), 2)
+
+    connection = psycopg2.connect(**get_postgres_config())
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO collector_runs (
+            provider,
+            keywords,
+            location,
+            job_limit,
+            status,
+            started_at,
+            finished_at,
+            duration_seconds,
+            error_message
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """,
+        (
+            provider,
+            keywords,
+            location,
+            job_limit,
+            status,
+            started_at,
+            finished_at,
+            duration_seconds,
+            error_message
+        )
+    )
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+
+
+def deactivate_stale_linkedin_jobs():
+    stale_days = int(os.getenv("LINKEDIN_STALE_DAYS", "7"))
+    cutoff_time = datetime.now() - timedelta(days=stale_days)
+
+    connection = psycopg2.connect(**get_postgres_config())
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        UPDATE jobs
+        SET is_active = FALSE
+        WHERE source = 'LinkedIn'
+          AND is_active = TRUE
+          AND last_seen_at < %s;
+        """,
+        (cutoff_time,)
+    )
+
+    deactivated_count = cursor.rowcount
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+    print("\n" + "=" * 70)
+    print("Stale LinkedIn job cleanup finished.")
+    print(f"Stale after days: {stale_days}")
+    print(f"Deactivated jobs: {deactivated_count}")
+    print("=" * 70)
+
+    return deactivated_count
 def run_collector_for_query(query):
     keywords = query.get("keywords", "").strip()
     location = query.get("location", "").strip()
@@ -33,7 +121,7 @@ def run_collector_for_query(query):
         return False
 
     print("\n" + "=" * 70)
-    print(f"Collecting LinkedIn jobs")
+    print("Collecting LinkedIn jobs")
     print(f"Keywords: {keywords}")
     print(f"Location: {location}")
     print(f"Limit: {limit}")
@@ -47,17 +135,54 @@ def run_collector_for_query(query):
     env["LINKEDIN_LOCATION"] = location
     env["LINKEDIN_LIMIT"] = limit
 
+    started_at = datetime.now()
+
     process = subprocess.run(
         [sys.executable, "-m", "scripts.collector_postgres"],
         cwd=str(BASE_DIR),
         env=env,
-        text=True
+        text=True,
+        capture_output=True
     )
 
-    return process.returncode == 0
+    finished_at = datetime.now()
+
+    print(process.stdout)
+
+    if process.stderr:
+        print(process.stderr)
+
+    if process.returncode == 0:
+        save_collector_run(
+            provider="linkedin_browser",
+            keywords=keywords,
+            location=location,
+            job_limit=int(limit),
+            status="success",
+            started_at=started_at,
+            finished_at=finished_at,
+            error_message=None
+        )
+
+        return True
+
+    save_collector_run(
+        provider="linkedin_browser",
+        keywords=keywords,
+        location=location,
+        job_limit=int(limit),
+        status="failed",
+        started_at=started_at,
+        finished_at=finished_at,
+        error_message=process.stderr or "Collector failed"
+    )
+
+    return False
 
 
 def main():
+    ensure_collector_runs_table()
+
     queries = load_queries()
 
     print(f"Loaded queries: {len(queries)}")
@@ -79,10 +204,13 @@ def main():
             print("Waiting before next query...")
             time.sleep(5)
 
+    deactivated_count = deactivate_stale_linkedin_jobs()
+
     print("\n" + "=" * 70)
     print("Multi-query LinkedIn collection finished.")
     print(f"Successful queries: {success_count}")
     print(f"Failed queries: {failed_count}")
+    print(f"Deactivated stale jobs: {deactivated_count}")
     print("=" * 70)
 
     if failed_count > 0:
