@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -14,7 +15,7 @@
     }
 
     .container {
-      max-width: 1100px;
+      max-width: 1180px;
       margin: 0 auto;
       padding: 32px 20px;
     }
@@ -25,12 +26,13 @@
 
     .header h1 {
       margin: 0 0 8px;
-      font-size: 32px;
+      font-size: 34px;
     }
 
     .header p {
       margin: 0;
       color: #71717a;
+      line-height: 1.6;
     }
 
     .stats {
@@ -40,14 +42,16 @@
       margin-bottom: 24px;
     }
 
-    .stat-card {
+    .stat-card,
+    .status-card {
       background: white;
       padding: 20px;
       border-radius: 16px;
       box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
     }
 
-    .stat-card span {
+    .stat-card span,
+    .stat-label {
       display: block;
       color: #71717a;
       font-size: 14px;
@@ -55,7 +59,20 @@
     }
 
     .stat-card strong {
+      display: block;
       font-size: 28px;
+      line-height: 1.2;
+    }
+
+    .status-card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .status-card p {
+      margin: 4px 0;
+      color: #52525b;
+      line-height: 1.5;
     }
 
     .search-box {
@@ -160,6 +177,7 @@
     .job-meta {
       color: #52525b;
       margin-bottom: 12px;
+      line-height: 1.5;
     }
 
     .tags {
@@ -268,6 +286,7 @@
       background: white;
       color: #18181b;
     }
+
     .status-ok-text {
       color: #15803d;
     }
@@ -296,210 +315,258 @@
       }
     }
   </style>
+
 </head>
 
 <body>
-  <div class="stats">
-      <div class="stat-card">
-        <span>Total Jobs</span>
-        <strong id="totalJobs">-</strong>
-      </div>
+  <div class="container">
+    <div class="header">
+      <h1>JobPulse Dashboard</h1>
+      <p>
+        Search and monitor authorized LinkedIn job listings collected into PostgreSQL.
+      </p>
+    </div>
 
-      <div class="stat-card">
-        <span>Remote Jobs</span>
-        <strong id="remoteJobs">-</strong>
-      </div>
+```
+<div class="stats">
+  <div class="stat-card">
+    <span>Total Jobs</span>
+    <strong id="totalJobs">-</strong>
+  </div>
 
-      <div class="stat-card">
-        <span>On-site Jobs</span>
-        <strong id="onsiteJobs">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>LinkedIn Jobs</span>
+    <strong id="linkedinJobs">-</strong>
+  </div>
 
-      <div class="stat-card">
-        <span>System Status</span>
-        <strong id="systemStatus">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>Active Jobs</span>
+    <strong id="activeLinkedinJobs">-</strong>
+  </div>
 
-      <div class="status-card">
-        <h3>Last LinkedIn Update</h3>
-        <p id="collector-status">Loading...</p>
-        <p id="collector-details"></p>
-      </div>
-      <div class="stat-card">
-        <span class="stat-label">LinkedIn Jobs</span>
-        <strong id="linkedin-jobs">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>Remote Jobs</span>
+    <strong id="remoteJobs">-</strong>
+  </div>
 
-      <div class="stat-card">
-        <span class="stat-label">Active Jobs</span>
-        <strong id="active-linkedin-jobs">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>Companies</span>
+    <strong id="totalCompanies">-</strong>
+  </div>
 
-      <div class="stat-card">
-        <span class="stat-label">Remote Jobs</span>
-        <strong id="remote-jobs">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>Locations</span>
+    <strong id="totalLocations">-</strong>
+  </div>
 
-      <div class="stat-card">
-        <span class="stat-label">Last Job Update</span>
-        <strong id="last-linkedin-job-seen-at">-</strong>
-      </div>
+  <div class="stat-card">
+    <span>Last Job Update</span>
+    <strong id="lastLinkedinJobSeenAt">-</strong>
+  </div>
+
+  <div class="stat-card">
+    <span>System Status</span>
+    <strong id="systemStatus">-</strong>
+  </div>
+
+  <div class="status-card">
+    <h3>System Health</h3>
+    <p id="healthStatus">Checking...</p>
+  </div>
+
+  <div class="status-card">
+    <h3>Last LinkedIn Collector Run</h3>
+    <p id="collectorStatus">Loading...</p>
+    <p id="collectorDetails"></p>
+  </div>
 </div>
 
-    <div class="search-box">
-      <div class="form-grid">
-        <input id="titleInput" type="text" placeholder="Job title, e.g. UX, Data, Frontend" />
-        <input id="locationInput" type="text" placeholder="Location, e.g. Berlin, Germany" />
+<div class="search-box">
+  <div class="form-grid">
+    <input id="titleInput" type="text" placeholder="Job title, e.g. UX, Data, Frontend" />
+    <input id="locationInput" type="text" placeholder="Location, e.g. Berlin, Germany" />
 
-        <select id="seniorityInput">
-          <option value="">Any seniority</option>
-          <option value="Junior">Junior</option>
-          <option value="Mid">Mid</option>
-          <option value="Senior">Senior</option>
-        </select>
+    <select id="seniorityInput">
+      <option value="">Any seniority</option>
+      <option value="Junior">Junior</option>
+      <option value="Mid">Mid</option>
+      <option value="Senior">Senior</option>
+    </select>
 
-        <select id="jobTypeInput">
-          <option value="">Any job type</option>
-          <option value="Full-time">Full-time</option>
-          <option value="Part-time">Part-time</option>
-          <option value="Contract">Contract</option>
-          <option value="Internship">Internship</option>
-        </select>
+    <select id="jobTypeInput">
+      <option value="">Any job type</option>
+      <option value="Full-time">Full-time</option>
+      <option value="Part-time">Part-time</option>
+      <option value="Contract">Contract</option>
+      <option value="Internship">Internship</option>
+    </select>
 
-        <input id="minSalaryInput" type="number" placeholder="Min salary, e.g. 60000" />
+    <input id="minSalaryInput" type="number" placeholder="Min salary, e.g. 60000" />
 
-        <select id="sortByInput">
-          <option value="date_posted">Sort by date</option>
-          <option value="salary_max">Sort by max salary</option>
-          <option value="salary_min">Sort by min salary</option>
-          <option value="title">Sort by title</option>
-          <option value="company">Sort by company</option>
-        </select>
+    <select id="sortByInput">
+      <option value="date_posted">Sort by date</option>
+      <option value="salary_max">Sort by max salary</option>
+      <option value="salary_min">Sort by min salary</option>
+      <option value="title">Sort by title</option>
+      <option value="company">Sort by company</option>
+    </select>
 
-        <select id="sortOrderInput">
-          <option value="desc">Descending</option>
-          <option value="asc">Ascending</option>
-        </select>
+    <select id="sortOrderInput">
+      <option value="desc">Descending</option>
+      <option value="asc">Ascending</option>
+    </select>
 
-        <label>
-          <input id="remoteInput" type="checkbox" />
-          Remote only
-        </label>
-      </div>
+    <label>
+      <input id="remoteInput" type="checkbox" />
+      Remote only
+    </label>
+  </div>
 
-      <br />
+  <br />
 
-      <button onclick="searchJobs(1)">Search Jobs</button>
-      <button onclick="resetFilters()" class="secondary-button">Reset</button>
-    </div>
+  <button onclick="searchJobs(1)">Search Jobs</button>
+  <button onclick="resetFilters()" class="secondary-button">Reset</button>
+</div>
 
-    <div class="results-header">
-      <div id="resultCount">Results: -</div>
-      <div>Source: LinkedIn</div>
-    </div>
+<div class="results-header">
+  <div id="resultCount">Results: -</div>
+  <div>Source: LinkedIn</div>
+</div>
 
-    <div id="statusMessage"></div>
+<div id="statusMessage"></div>
 
-    <div id="jobsContainer" class="jobs"></div>
+<div id="jobsContainer" class="jobs"></div>
 
-    <div id="jobDetailsContainer"></div>
+<div id="jobDetailsContainer"></div>
 
-    <div class="pagination">
-      <button id="prevButton" onclick="goToPreviousPage()">Previous</button>
-      <span id="pageInfo">Page - of -</span>
-      <button id="nextButton" onclick="goToNextPage()">Next</button>
-    </div>
+<div class="pagination">
+  <button id="prevButton" onclick="goToPreviousPage()">Previous</button>
+  <span id="pageInfo">Page - of -</span>
+  <button id="nextButton" onclick="goToNextPage()">Next</button>
+</div>
+```
+
   </div>
 
   <script src="config.js"></script>
 
   <script>
-    const API_BASE_URL = window.JOBPULSE_CONFIG.API_BASE_URL;
+    const API_BASE_URL =
+      window.JOBPULSE_CONFIG?.API_BASE_URL || "http://127.0.0.1:8000";
 
     let currentPage = 1;
     let totalPages = 0;
     const pageLimit = 5;
 
+    function setText(id, value) {
+      const element = document.getElementById(id);
+
+      if (element) {
+        element.textContent = value;
+      }
+    }
+
+    function formatDateTime(value) {
+      if (!value) {
+        return "-";
+      }
+
+      const date = new Date(value);
+
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+
+      return date.toLocaleString();
+    }
+
     async function loadStats() {
       try {
         const response = await fetch(`${API_BASE_URL}/jobs/stats`);
+
+        if (!response.ok) {
+          throw new Error(`Stats API error: ${response.status}`);
+        }
+
         const stats = await response.json();
 
-        const totalJobsElement = document.getElementById("total-jobs");
-        const linkedinJobsElement = document.getElementById("linkedin-jobs");
-        const activeLinkedinJobsElement = document.getElementById("active-linkedin-jobs");
-        const remoteJobsElement = document.getElementById("remote-jobs");
-        const totalCompaniesElement = document.getElementById("total-companies");
-        const totalLocationsElement = document.getElementById("total-locations");
-        const lastLinkedinJobSeenAtElement = document.getElementById("last-linkedin-job-seen-at");
-
-        if (totalJobsElement) {
-          totalJobsElement.textContent = stats.total_jobs ?? 0;
-        }
-
-        if (linkedinJobsElement) {
-          linkedinJobsElement.textContent = stats.linkedin_jobs ?? 0;
-        }
-
-        if (activeLinkedinJobsElement) {
-          activeLinkedinJobsElement.textContent = stats.active_linkedin_jobs ?? 0;
-        }
-
-        if (remoteJobsElement) {
-          remoteJobsElement.textContent = stats.remote_jobs ?? 0;
-        }
-
-        if (totalCompaniesElement) {
-          totalCompaniesElement.textContent = stats.total_companies ?? 0;
-        }
-
-        if (totalLocationsElement) {
-          totalLocationsElement.textContent = stats.total_locations ?? 0;
-        }
-
-        if (lastLinkedinJobSeenAtElement) {
-          if (stats.last_linkedin_job_seen_at) {
-            lastLinkedinJobSeenAtElement.textContent = new Date(
-              stats.last_linkedin_job_seen_at
-            ).toLocaleString();
-          } else {
-            lastLinkedinJobSeenAtElement.textContent = "-";
-          }
-        }
+        setText("totalJobs", stats.total_jobs ?? 0);
+        setText("linkedinJobs", stats.linkedin_jobs ?? 0);
+        setText("activeLinkedinJobs", stats.active_linkedin_jobs ?? 0);
+        setText("remoteJobs", stats.remote_jobs ?? 0);
+        setText("totalCompanies", stats.total_companies ?? 0);
+        setText("totalLocations", stats.total_locations ?? 0);
+        setText("lastLinkedinJobSeenAt", formatDateTime(stats.last_linkedin_job_seen_at));
       } catch (error) {
         console.error("Stats error:", error);
       }
     }
 
-
     async function loadHealthStatus() {
-        const statusElement = document.getElementById("systemStatus");
+      const systemStatusElement = document.getElementById("systemStatus");
+      const healthStatusElement = document.getElementById("healthStatus");
 
-        try {
-          const response = await fetch(`${API_BASE_URL}/health`);
+      try {
+        const response = await fetch(`${API_BASE_URL}/health`);
 
-          if (!response.ok) {
-            throw new Error(`API error: ${response.status}`);
-          }
-
-          const health = await response.json();
-
-          if (health.status === "ok" && health.database === "connected") {
-            statusElement.textContent = "Healthy";
-            statusElement.className = "status-ok-text";
-            return;
-          }
-
-          statusElement.textContent = "Issue";
-          statusElement.className = "status-error-text";
-        } catch (error) {
-          console.error("Health status error:", error);
-
-          statusElement.textContent = "Offline";
-          statusElement.className = "status-error-text";
+        if (!response.ok) {
+          throw new Error(`Health API error: ${response.status}`);
         }
+
+        const health = await response.json();
+
+        if (health.status === "ok" && health.database === "connected") {
+          systemStatusElement.textContent = "Healthy";
+          systemStatusElement.className = "status-ok-text";
+          healthStatusElement.textContent = "API connected · PostgreSQL connected";
+          return;
+        }
+
+        systemStatusElement.textContent = "Issue";
+        systemStatusElement.className = "status-error-text";
+        healthStatusElement.textContent = "API running · Database disconnected";
+      } catch (error) {
+        console.error("Health status error:", error);
+
+        systemStatusElement.textContent = "Offline";
+        systemStatusElement.className = "status-error-text";
+        healthStatusElement.textContent = "API unavailable";
+      }
     }
 
+    async function loadCollectorStatus() {
+      const statusElement = document.getElementById("collectorStatus");
+      const detailsElement = document.getElementById("collectorDetails");
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/collector-runs/latest`);
+
+        if (!response.ok) {
+          throw new Error(`Collector API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (data.status === "empty") {
+          statusElement.textContent = "No LinkedIn update has been recorded yet.";
+          detailsElement.textContent = "";
+          return;
+        }
+
+        const statusLabel = data.status === "success" ? "Success" : "Failed";
+        const startedAt = formatDateTime(data.started_at);
+
+        statusElement.textContent = `${statusLabel} · ${startedAt}`;
+        detailsElement.textContent =
+          `${data.keywords || "Unknown keywords"} · ` +
+          `${data.location || "Unknown location"} · ` +
+          `${data.duration_seconds || 0}s`;
+      } catch (error) {
+        statusElement.textContent = "Could not load LinkedIn update status.";
+        detailsElement.textContent = "";
+        console.error("Collector status error:", error);
+      }
+    }
 
     async function searchJobs(page = 1) {
       currentPage = page;
@@ -553,25 +620,22 @@
       }
 
       const apiUrl = `${API_BASE_URL}/jobs/search?${params.toString()}`;
-      console.log("API URL:", apiUrl);
 
       try {
         const response = await fetch(apiUrl);
 
         if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+          throw new Error(`Search API error: ${response.status}`);
         }
 
         const data = await response.json();
 
-        console.log("API Response:", data);
+        totalPages = data.total_pages || 0;
 
-        totalPages = data.total_pages;
+        setText("resultCount", `Results: ${data.count ?? 0}`);
 
-        document.getElementById("resultCount").textContent = `Results: ${data.count}`;
-
-        renderJobs(data.results);
-        renderPagination(data.page, data.total_pages);
+        renderJobs(data.results || []);
+        renderPagination(data.page || 0, data.total_pages || 0);
 
         statusMessage.className = "";
         statusMessage.textContent = "";
@@ -582,9 +646,55 @@
         statusMessage.textContent = "Could not load jobs. Check if the API server is running.";
 
         document.getElementById("jobsContainer").innerHTML = "";
-        document.getElementById("resultCount").textContent = "Results: -";
+        setText("resultCount", "Results: -");
         renderPagination(0, 0);
       }
+    }
+
+    function renderJobs(jobs) {
+      const container = document.getElementById("jobsContainer");
+      container.innerHTML = "";
+
+      if (!jobs.length) {
+        container.innerHTML = `<div class="empty">No jobs found.</div>`;
+        return;
+      }
+
+      jobs.forEach((job) => {
+        const card = document.createElement("div");
+        card.className = "job-card";
+
+        const salary = job.salary_min && job.salary_max
+          ? `${Number(job.salary_min).toLocaleString()} - ${Number(job.salary_max).toLocaleString()} ${job.currency || ""}`
+          : "Salary not provided";
+
+        card.innerHTML = `
+          <div class="job-title">${job.title || "Untitled job"}</div>
+          <div class="job-meta">${job.company || "Unknown Company"} • ${job.location || "Unknown Location"}</div>
+
+          <div class="tags">
+            <span class="tag">${job.remote ? "Remote" : "On-site"}</span>
+            <span class="tag">${job.job_type || "Job type unknown"}</span>
+            <span class="tag">${job.seniority || "Seniority unknown"}</span>
+            <span class="tag">${salary}</span>
+            <span class="tag">${job.date_posted || "Date unknown"}</span>
+          </div>
+
+          <div class="job-meta">
+            Poster: ${job.poster_name || "Unknown"}
+            ${job.poster_title ? `• ${job.poster_title}` : ""}
+          </div>
+
+          <div class="links">
+            ${job.job_url ? `<a href="${job.job_url}" target="_blank" rel="noopener noreferrer">Open Job</a>` : ""}
+            <a href="#" onclick="viewJobDetails(${job.id}); return false;">View Details</a>
+            ${job.poster_profile_url ? `<a href="${job.poster_profile_url}" target="_blank" rel="noopener noreferrer">Open Poster Profile</a>` : ""}
+            ${job.company_linkedin_url ? `<a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer">Company LinkedIn</a>` : ""}
+          </div>
+        `;
+
+        container.appendChild(card);
+      });
     }
 
     function renderPagination(page, total) {
@@ -632,98 +742,6 @@
       searchJobs(1);
     }
 
-    function renderJobs(jobs) {
-      const container = document.getElementById("jobsContainer");
-      container.innerHTML = "";
-
-      if (!jobs.length) {
-        container.innerHTML = `<div class="empty">No jobs found.</div>`;
-        return;
-      }
-
-      jobs.forEach((job) => {
-        const card = document.createElement("div");
-        card.className = "job-card";
-
-        const salary = job.salary_min && job.salary_max
-          ? `${job.salary_min.toLocaleString()} - ${job.salary_max.toLocaleString()} ${job.currency || ""}`
-          : "Salary not provided";
-
-        card.innerHTML = `
-          <div class="job-title">${job.title}</div>
-          <div class="job-meta">${job.company} • ${job.location}</div>
-
-          <div class="tags">
-            <span class="tag">${job.remote ? "Remote" : "On-site"}</span>
-            <span class="tag">${job.job_type || "Job type unknown"}</span>
-            <span class="tag">${job.seniority || "Seniority unknown"}</span>
-            <span class="tag">${salary}</span>
-            <span class="tag">${job.date_posted || "Date unknown"}</span>
-          </div>
-
-          <div class="job-meta">
-            Poster: ${job.poster_name || "Unknown"}
-            ${job.poster_title ? `• ${job.poster_title}` : ""}
-          </div>
-
-          <div class="links">
-            <a href="${job.job_url}" target="_blank">Open Job</a>
-            <a href="#" onclick="viewJobDetails(${job.id}); return false;">View Details</a>
-            ${
-              job.poster_profile_url
-                ? `<a href="${job.poster_profile_url}" target="_blank">Open Poster Profile</a>`
-                : ""
-            }
-            ${
-              job.company_linkedin_url
-                ? `<a href="${job.company_linkedin_url}" target="_blank">Company LinkedIn</a>`
-                : ""
-            }
-          </div>
-        `;
-
-        container.appendChild(card);
-      });
-    }
-
-
-    async function loadCollectorStatus() {
-      const statusElement = document.getElementById("collector-status");
-      const detailsElement = document.getElementById("collector-details");
-
-      if (!statusElement || !detailsElement) {
-        return;
-      }
-
-      try {
-        const response = await fetch(`${API_BASE_URL}/collector-runs/latest`);
-        const data = await response.json();
-
-        if (data.status === "empty") {
-          statusElement.textContent = "No LinkedIn update has been recorded yet.";
-          detailsElement.textContent = "";
-          return;
-        }
-
-        const startedAt = data.started_at
-          ? new Date(data.started_at).toLocaleString()
-          : "Unknown time";
-
-        const statusLabel = data.status === "success" ? "Success" : "Failed";
-
-        statusElement.textContent = `${statusLabel} · ${startedAt}`;
-
-        detailsElement.textContent =
-          `${data.keywords || "Unknown keywords"} · ` +
-          `${data.location || "Unknown location"} · ` +
-          `${data.duration_seconds || 0}s`;
-      } catch (error) {
-        statusElement.textContent = "Could not load LinkedIn update status.";
-        detailsElement.textContent = "";
-        console.error("Collector status error:", error);
-      }
-    }
-
     async function viewJobDetails(jobId) {
       const detailsContainer = document.getElementById("jobDetailsContainer");
 
@@ -737,19 +755,19 @@
         const response = await fetch(`${API_BASE_URL}/jobs/${jobId}`);
 
         if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+          throw new Error(`Job details API error: ${response.status}`);
         }
 
         const job = await response.json();
 
         const salary = job.salary_min && job.salary_max
-          ? `${job.salary_min.toLocaleString()} - ${job.salary_max.toLocaleString()} ${job.currency || ""}`
+          ? `${Number(job.salary_min).toLocaleString()} - ${Number(job.salary_max).toLocaleString()} ${job.currency || ""}`
           : "Salary not provided";
 
         detailsContainer.innerHTML = `
           <div class="job-details">
-            <h2>${job.title}</h2>
-            <p>${job.company} • ${job.location}</p>
+            <h2>${job.title || "Untitled job"}</h2>
+            <p>${job.company || "Unknown Company"} • ${job.location || "Unknown Location"}</p>
 
             <div class="job-details-grid">
               <div class="detail-item">
@@ -794,17 +812,9 @@
             </div>
 
             <div class="links" style="margin-top: 18px;">
-              <a href="${job.job_url}" target="_blank" style="color:white;">Open Job</a>
-              ${
-                job.poster_profile_url
-                  ? `<a href="${job.poster_profile_url}" target="_blank" style="color:white;">Open Poster Profile</a>`
-                  : ""
-              }
-              ${
-                job.company_linkedin_url
-                  ? `<a href="${job.company_linkedin_url}" target="_blank" style="color:white;">Company LinkedIn</a>`
-                  : ""
-              }
+              ${job.job_url ? `<a href="${job.job_url}" target="_blank" rel="noopener noreferrer" style="color:white;">Open Job</a>` : ""}
+              ${job.poster_profile_url ? `<a href="${job.poster_profile_url}" target="_blank" rel="noopener noreferrer" style="color:white;">Open Poster Profile</a>` : ""}
+              ${job.company_linkedin_url ? `<a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer" style="color:white;">Company LinkedIn</a>` : ""}
             </div>
 
             <button class="close-details" onclick="closeJobDetails()">Close Details</button>
@@ -827,13 +837,11 @@
       document.getElementById("jobDetailsContainer").innerHTML = "";
     }
 
-    checkHealth();
+    loadHealthStatus();
     loadStats();
     loadCollectorStatus();
-    loadJobs();
-    loadHealthStatus();
     searchJobs(1);
-    loadCollectorStatus();
   </script>
+
 </body>
 </html>
