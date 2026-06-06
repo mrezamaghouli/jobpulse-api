@@ -319,6 +319,12 @@
         <span>System Status</span>
         <strong id="systemStatus">-</strong>
       </div>
+
+      <div class="status-card">
+        <h3>Last LinkedIn Update</h3>
+        <p id="collector-status">Loading...</p>
+        <p id="collector-details"></p>
+      </div>
 </div>
 
     <div class="search-box">
@@ -628,6 +634,44 @@
       });
     }
 
+
+    async function loadCollectorStatus() {
+      const statusElement = document.getElementById("collector-status");
+      const detailsElement = document.getElementById("collector-details");
+
+      if (!statusElement || !detailsElement) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/collector-runs/latest`);
+        const data = await response.json();
+
+        if (data.status === "empty") {
+          statusElement.textContent = "No LinkedIn update has been recorded yet.";
+          detailsElement.textContent = "";
+          return;
+        }
+
+        const startedAt = data.started_at
+          ? new Date(data.started_at).toLocaleString()
+          : "Unknown time";
+
+        const statusLabel = data.status === "success" ? "Success" : "Failed";
+
+        statusElement.textContent = `${statusLabel} · ${startedAt}`;
+
+        detailsElement.textContent =
+          `${data.keywords || "Unknown keywords"} · ` +
+          `${data.location || "Unknown location"} · ` +
+          `${data.duration_seconds || 0}s`;
+      } catch (error) {
+        statusElement.textContent = "Could not load LinkedIn update status.";
+        detailsElement.textContent = "";
+        console.error("Collector status error:", error);
+      }
+    }
+
     async function viewJobDetails(jobId) {
       const detailsContainer = document.getElementById("jobDetailsContainer");
 
@@ -734,6 +778,7 @@
     loadStats();
     loadHealthStatus();
     searchJobs(1);
+    loadCollectorStatus();
   </script>
 </body>
 </html>
