@@ -60,3 +60,18 @@ def get_app_version():
 
 def get_app_environment():
     return get_env_value("APP_ENV", "development")
+
+def get_linkedin_browser():
+    return get_env_value("LINKEDIN_BROWSER", "chrome").lower().strip()
+
+
+def get_linkedin_keywords():
+    return get_env_value("LINKEDIN_KEYWORDS", "UX Designer").strip()
+
+
+def get_linkedin_location():
+    return get_env_value("LINKEDIN_LOCATION", "Germany").strip()
+
+
+def get_linkedin_limit():
+    return int(get_env_value("LINKEDIN_LIMIT", "10"))
