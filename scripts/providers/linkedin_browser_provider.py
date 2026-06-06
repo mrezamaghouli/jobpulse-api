@@ -129,7 +129,7 @@ class LinkedInBrowserProvider:
             page.mouse.wheel(0, 1200)
             page.wait_for_timeout(1500)
 
-        jobs = page.evaluate(
+        basic_jobs = page.evaluate(
             """
             (limit) => {
                 const cards = Array.from(document.querySelectorAll(
@@ -153,11 +153,13 @@ class LinkedInBrowserProvider:
 
                     const companyEl =
                         card.querySelector('.job-card-container__company-name') ||
-                        card.querySelector('[class*="company-name"]');
+                        card.querySelector('[class*="company-name"]') ||
+                        card.querySelector('.artdeco-entity-lockup__subtitle');
 
                     const locationEl =
                         card.querySelector('.job-card-container__metadata-item') ||
-                        card.querySelector('[class*="metadata-item"]');
+                        card.querySelector('[class*="metadata-item"]') ||
+                        card.querySelector('.artdeco-entity-lockup__caption');
 
                     const linkEl =
                         card.querySelector('a[href*="/jobs/view/"]');
@@ -204,23 +206,172 @@ class LinkedInBrowserProvider:
             limit
         )
 
-        return jobs
+        enriched_jobs = []
 
-    def normalize_job(self, raw_job: dict) -> dict:
-        job_url = raw_job.get("job_url", "")
-        linkedin_job_id = self.extract_job_id(
-            job_url=job_url,
-            fallback=raw_job.get("linkedin_job_id", "")
+        for index, job in enumerate(basic_jobs, start=1):
+            print(f"Reading detail panel for job {index}/{len(basic_jobs)}...")
+
+            detail_data = self.extract_detail_for_job(page, job)
+
+            merged_job = {
+                **job,
+                **detail_data,
+            }
+
+            enriched_jobs.append(merged_job)
+
+            page.wait_for_timeout(1200)
+
+        return enriched_jobs
+
+    def extract_detail_for_job(self, page, job: dict) -> dict:
+        job_id = self.extract_job_id(
+            job_url=job.get("job_url", ""),
+            fallback=job.get("linkedin_job_id", "")
+        )
+
+        if job_id:
+            selector = f'li[data-occludable-job-id="{job_id}"], div[data-job-id="{job_id}"]'
+        else:
+            selector = f'a[href="{job.get("job_url", "")}"]'
+
+        try:
+            card = page.locator(selector).first
+
+            if card.count() > 0:
+                card.click(timeout=8000)
+                page.wait_for_timeout(2500)
+        except Exception as error:
+            print(f"Could not click job card: {error}")
+
+        detail_data = page.evaluate(
+            """
+            () => {
+                const getText = (selectors) => {
+                    for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+
+                        if (el && el.innerText && el.innerText.trim()) {
+                            return el.innerText.trim();
+                        }
+                    }
+
+                    return '';
+                };
+
+                const getHref = (selectors) => {
+                    for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+
+                        if (el && el.href) {
+                            return el.href;
+                        }
+                    }
+
+                    return '';
+                };
+
+                const title = getText([
+                    '.jobs-unified-top-card__job-title',
+                    '.job-details-jobs-unified-top-card__job-title',
+                    'h1'
+                ]);
+
+                const company = getText([
+                    '.jobs-unified-top-card__company-name',
+                    '.job-details-jobs-unified-top-card__company-name',
+                    '.jobs-unified-top-card__primary-description-container a',
+                    'a[href*="/company/"]'
+                ]);
+
+                const location = getText([
+                    '.jobs-unified-top-card__bullet',
+                    '.job-details-jobs-unified-top-card__primary-description-container span',
+                    '.jobs-unified-top-card__primary-description-container span'
+                ]);
+
+                const companyUrl = getHref([
+                    '.jobs-unified-top-card__company-name a',
+                    '.job-details-jobs-unified-top-card__company-name a',
+                    'a[href*="/company/"]'
+                ]);
+
+                const detailsText = getText([
+                    '.jobs-unified-top-card__primary-description-container',
+                    '.job-details-jobs-unified-top-card__primary-description-container'
+                ]);
+
+                return {
+                    detail_title: title,
+                    detail_company: company,
+                    detail_location: location,
+                    company_linkedin_url: companyUrl || null,
+                    details_text: detailsText
+                };
+            }
+            """
         )
 
         return {
+            "title": detail_data.get("detail_title") or job.get("title", ""),
+            "company": detail_data.get("detail_company") or job.get("company", ""),
+            "location": self.extract_location_from_details(
+                detail_location=detail_data.get("detail_location", ""),
+                details_text=detail_data.get("details_text", ""),
+                fallback=job.get("location", "")
+            ),
+            "company_linkedin_url": detail_data.get("company_linkedin_url") or job.get("company_linkedin_url"),
+        }
+
+    def extract_location_from_details(
+        self,
+        detail_location: str,
+        details_text: str,
+        fallback: str
+    ) -> str:
+        detail_location = self.clean_text(detail_location)
+        details_text = self.clean_text(details_text)
+        fallback = self.clean_text(fallback)
+
+        if detail_location:
+            return detail_location
+
+        if details_text:
+            parts = [part.strip() for part in details_text.split("·")]
+
+            for part in parts:
+                lower_part = part.lower()
+
+                if any(keyword in lower_part for keyword in ["germany", "berlin", "munich", "hamburg", "frankfurt", "remote"]):
+                    return part
+
+        return fallback
+
+    def normalize_job(self, raw_job: dict) -> dict:
+        raw_job_url = raw_job.get("job_url", "")
+
+        linkedin_job_id = self.extract_job_id(
+            job_url=raw_job_url,
+            fallback=raw_job.get("linkedin_job_id", "")
+        )
+
+        job_url = self.canonicalize_job_url(
+            job_url=raw_job_url,
+            linkedin_job_id=linkedin_job_id
+        )
+
+        title = self.clean_text(raw_job.get("title"))
+        company = self.clean_text(raw_job.get("company")) or "Unknown Company"
+        location = self.clean_text(raw_job.get("location")) or "Unknown Location"
+
+        return {
             "linkedin_job_id": linkedin_job_id,
-            "title": self.clean_text(raw_job.get("title")),
-            "company": self.clean_text(raw_job.get("company")),
+            "title": title,
+            "company": company,
             "company_linkedin_url": raw_job.get("company_linkedin_url") or None,
 
-            "location": self.clean_text(raw_job.get("location")),
-            "remote": "remote" in self.clean_text(raw_job.get("location")).lower(),
+            "location": location,
+            "remote": "remote" in location.lower(),
 
             "job_type": None,
             "seniority": None,
@@ -239,14 +390,35 @@ class LinkedInBrowserProvider:
             "date_posted": str(date.today()),
         }
 
+    def canonicalize_job_url(self, job_url: str, linkedin_job_id: str) -> str:
+        if linkedin_job_id:
+            return f"https://www.linkedin.com/jobs/view/{linkedin_job_id}/"
+
+        extracted_job_id = self.extract_job_id(job_url)
+
+        if extracted_job_id:
+            return f"https://www.linkedin.com/jobs/view/{extracted_job_id}/"
+
+        return job_url
+
     def extract_job_id(self, job_url: str, fallback: str = "") -> str:
         if fallback:
-            return fallback
+            return str(fallback).strip()
 
-        match = re.search(r"/jobs/view/(\d+)", job_url)
+        if not job_url:
+            return ""
 
-        if match:
-            return match.group(1)
+        patterns = [
+            r"/jobs/view/(\d+)",
+            r"currentJobId=(\d+)",
+            r"jobId=(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, job_url)
+
+            if match:
+                return match.group(1)
 
         return ""
 
