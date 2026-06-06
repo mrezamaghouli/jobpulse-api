@@ -325,6 +325,25 @@
         <p id="collector-status">Loading...</p>
         <p id="collector-details"></p>
       </div>
+      <div class="stat-card">
+        <span class="stat-label">LinkedIn Jobs</span>
+        <strong id="linkedin-jobs">-</strong>
+      </div>
+
+      <div class="stat-card">
+        <span class="stat-label">Active Jobs</span>
+        <strong id="active-linkedin-jobs">-</strong>
+      </div>
+
+      <div class="stat-card">
+        <span class="stat-label">Remote Jobs</span>
+        <strong id="remote-jobs">-</strong>
+      </div>
+
+      <div class="stat-card">
+        <span class="stat-label">Last Job Update</span>
+        <strong id="last-linkedin-job-seen-at">-</strong>
+      </div>
 </div>
 
     <div class="search-box">
@@ -404,16 +423,49 @@
     async function loadStats() {
       try {
         const response = await fetch(`${API_BASE_URL}/jobs/stats`);
-
-        if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
-        }
-
         const stats = await response.json();
 
-        document.getElementById("totalJobs").textContent = stats.total_jobs;
-        document.getElementById("remoteJobs").textContent = stats.remote_jobs;
-        document.getElementById("onsiteJobs").textContent = stats.onsite_jobs;
+        const totalJobsElement = document.getElementById("total-jobs");
+        const linkedinJobsElement = document.getElementById("linkedin-jobs");
+        const activeLinkedinJobsElement = document.getElementById("active-linkedin-jobs");
+        const remoteJobsElement = document.getElementById("remote-jobs");
+        const totalCompaniesElement = document.getElementById("total-companies");
+        const totalLocationsElement = document.getElementById("total-locations");
+        const lastLinkedinJobSeenAtElement = document.getElementById("last-linkedin-job-seen-at");
+
+        if (totalJobsElement) {
+          totalJobsElement.textContent = stats.total_jobs ?? 0;
+        }
+
+        if (linkedinJobsElement) {
+          linkedinJobsElement.textContent = stats.linkedin_jobs ?? 0;
+        }
+
+        if (activeLinkedinJobsElement) {
+          activeLinkedinJobsElement.textContent = stats.active_linkedin_jobs ?? 0;
+        }
+
+        if (remoteJobsElement) {
+          remoteJobsElement.textContent = stats.remote_jobs ?? 0;
+        }
+
+        if (totalCompaniesElement) {
+          totalCompaniesElement.textContent = stats.total_companies ?? 0;
+        }
+
+        if (totalLocationsElement) {
+          totalLocationsElement.textContent = stats.total_locations ?? 0;
+        }
+
+        if (lastLinkedinJobSeenAtElement) {
+          if (stats.last_linkedin_job_seen_at) {
+            lastLinkedinJobSeenAtElement.textContent = new Date(
+              stats.last_linkedin_job_seen_at
+            ).toLocaleString();
+          } else {
+            lastLinkedinJobSeenAtElement.textContent = "-";
+          }
+        }
       } catch (error) {
         console.error("Stats error:", error);
       }
@@ -775,7 +827,10 @@
       document.getElementById("jobDetailsContainer").innerHTML = "";
     }
 
+    checkHealth();
     loadStats();
+    loadCollectorStatus();
+    loadJobs();
     loadHealthStatus();
     searchJobs(1);
     loadCollectorStatus();
