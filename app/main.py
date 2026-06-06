@@ -15,7 +15,10 @@ from app.config import (
     get_app_version,
     get_app_environment
 )
-
+from app.repositories.collector_runs_repository import (
+    get_latest_collector_run_from_db,
+    get_recent_collector_runs_from_db
+)
 from app.models import Job, JobSearchResponse
 from app.postgres_database import check_postgres_connection
 from app.repositories.jobs_postgres_repository import (
@@ -76,6 +79,8 @@ async def api_key_auth(request: Request, call_next):
         "/docs",
         "/openapi.json",
         "/redoc"
+        "/collector-runs/latest",
+        "/collector-runs/recent",
     ]
 
     if not configured_api_key:
@@ -202,6 +207,31 @@ def health_check():
         "details": database_status.get("error")
     }
 
+
+@app.get("/collector-runs/latest")
+def get_latest_collector_run():
+    collector_run = get_latest_collector_run_from_db()
+
+    if collector_run is None:
+        return {
+            "status": "empty",
+            "message": "No collector runs found."
+        }
+
+    return collector_run
+
+
+@app.get("/collector-runs/recent")
+def get_recent_collector_runs(limit: int = 10):
+    if limit < 1:
+        limit = 1
+
+    if limit > 50:
+        limit = 50
+
+    return {
+        "results": get_recent_collector_runs_from_db(limit=limit)
+    }
 
 @app.get("/jobs", response_model=list[Job])
 def get_all_jobs():
