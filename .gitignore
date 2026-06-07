@@ -14,3 +14,4 @@ storage/
 
 .auth/
 sample_output/
+logs/

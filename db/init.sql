@@ -37,3 +37,25 @@ CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
 CREATE INDEX IF NOT EXISTS idx_jobs_salary_min ON jobs(salary_min);
 CREATE INDEX IF NOT EXISTS idx_jobs_salary_max ON jobs(salary_max);
 CREATE INDEX IF NOT EXISTS idx_jobs_date_posted ON jobs(date_posted);
+CREATE TABLE IF NOT EXISTS collector_runs (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    keywords TEXT,
+    location TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'running',
+    raw_jobs_count INTEGER DEFAULT 0,
+    added_count INTEGER DEFAULT 0,
+    skipped_duplicate_count INTEGER DEFAULT 0,
+    skipped_non_linkedin_count INTEGER DEFAULT 0,
+    skipped_invalid_count INTEGER DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_collector_runs_started_at
+ON collector_runs(started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_collector_runs_provider
+ON collector_runs(provider);
