@@ -213,8 +213,11 @@ def main():
     print(f"Deactivated stale jobs: {deactivated_count}")
     print("=" * 70)
 
-    if failed_count > 0:
+    if success_count == 0:
         raise SystemExit(1)
+
+    if failed_count > 0:
+        print("Some queries failed, but at least one query succeeded. Treating run as partial success.")
 
 
 if __name__ == "__main__":
