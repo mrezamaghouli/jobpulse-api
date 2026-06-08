@@ -1,230 +1,496 @@
-import math
+from datetime import date, datetime
+from decimal import Decimal
+from math import ceil
+from typing import Any
+
+from psycopg2.extras import RealDictCursor
 
 from app.postgres_database import get_postgres_connection
 
 
-def row_to_job(row):
+JOB_SELECT_COLUMNS = """
+    id,
+    linkedin_job_id,
+    title,
+    company,
+    company_linkedin_url,
+    location,
+    remote,
+    job_type,
+    seniority,
+    salary_min,
+    salary_max,
+    currency,
+    source,
+    job_url,
+    apply_type,
+    apply_url,
+    apply_label,
+    poster_name,
+    poster_title,
+    poster_profile_url,
+    date_posted,
+    first_seen_at,
+    last_seen_at,
+    is_active
+"""
+
+
+ALLOWED_SORT_FIELDS = {
+    "id": "id",
+    "title": "title",
+    "company": "company",
+    "location": "location",
+    "date_posted": "date_posted",
+    "first_seen_at": "first_seen_at",
+    "last_seen_at": "last_seen_at",
+    "salary_min": "salary_min",
+    "salary_max": "salary_max",
+    "source": "source",
+    "apply_type": "apply_type",
+}
+
+
+def serialize_value(value: Any):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    return value
+
+
+def serialize_row(row):
+    if row is None:
+        return None
+
     return {
-        "id": row["id"],
-        "linkedin_job_id": row["linkedin_job_id"],
-
-        "title": row["title"],
-        "company": row["company"],
-        "company_linkedin_url": row["company_linkedin_url"],
-
-        "location": row["location"],
-        "remote": bool(row["remote"]),
-
-        "job_type": row["job_type"],
-        "seniority": row["seniority"],
-
-        "salary_min": row["salary_min"],
-        "salary_max": row["salary_max"],
-        "currency": row["currency"],
-
-        "source": row["source"],
-        "job_url": row["job_url"],
-
-        "poster_name": row["poster_name"],
-        "poster_title": row["poster_title"],
-        "poster_profile_url": row["poster_profile_url"],
-
-        "date_posted": row["date_posted"]
+        key: serialize_value(value)
+        for key, value in dict(row).items()
     }
 
 
-def get_all_jobs_from_db():
-    connection = get_postgres_connection()
-    cursor = connection.cursor()
+def normalize_bool(value):
+    if value is None:
+        return None
 
-    cursor.execute("""
-        SELECT *
-        FROM jobs
-        ORDER BY id DESC
-    """)
+    if isinstance(value, bool):
+        return value
 
-    rows = cursor.fetchall()
+    value_as_text = str(value).strip().lower()
 
-    cursor.close()
-    connection.close()
+    if value_as_text in ["true", "1", "yes", "y"]:
+        return True
 
-    return [row_to_job(row) for row in rows]
+    if value_as_text in ["false", "0", "no", "n"]:
+        return False
+
+    return None
 
 
-def search_jobs_from_db(
+def normalize_positive_int(value, default_value, min_value=1, max_value=100):
+    try:
+        normalized_value = int(value)
+    except (TypeError, ValueError):
+        normalized_value = default_value
+
+    if normalized_value < min_value:
+        normalized_value = min_value
+
+    if normalized_value > max_value:
+        normalized_value = max_value
+
+    return normalized_value
+
+
+def build_jobs_filters(
     title=None,
+    company=None,
     location=None,
     remote=None,
-    job_type=None,
     seniority=None,
+    job_type=None,
     min_salary=None,
     max_salary=None,
     source=None,
-    sort_by="date_posted",
-    sort_order="desc",
-    page=1,
-    limit=10
+    apply_type=None,
+    is_active=None,
+    active_only=None,
 ):
-    connection = get_postgres_connection()
-    cursor = connection.cursor()
-
-    where_clauses = []
+    filters = []
     params = []
 
     if title:
-        where_clauses.append("title ILIKE %s")
+        filters.append("title ILIKE %s")
         params.append(f"%{title}%")
 
+    if company:
+        filters.append("company ILIKE %s")
+        params.append(f"%{company}%")
+
     if location:
-        where_clauses.append("location ILIKE %s")
+        filters.append("location ILIKE %s")
         params.append(f"%{location}%")
 
-    if remote is not None:
-        where_clauses.append("remote = %s")
-        params.append(remote)
-
-    if job_type:
-        where_clauses.append("job_type ILIKE %s")
-        params.append(f"%{job_type}%")
+    remote_value = normalize_bool(remote)
+    if remote_value is not None:
+        filters.append("remote = %s")
+        params.append(remote_value)
 
     if seniority:
-        where_clauses.append("seniority ILIKE %s")
-        params.append(f"%{seniority}%")
+        filters.append("seniority = %s")
+        params.append(seniority)
+
+    if job_type:
+        filters.append("job_type = %s")
+        params.append(job_type)
+
+    if min_salary:
+        try:
+            min_salary_value = float(min_salary)
+            filters.append(
+                """
+                (
+                    salary_min >= %s
+                    OR salary_max >= %s
+                )
+                """
+            )
+            params.extend([min_salary_value, min_salary_value])
+        except (TypeError, ValueError):
+            pass
+
+    if max_salary:
+        try:
+            max_salary_value = float(max_salary)
+            filters.append(
+                """
+                (
+                    salary_min <= %s
+                    OR salary_max <= %s
+                )
+                """
+            )
+            params.extend([max_salary_value, max_salary_value])
+        except (TypeError, ValueError):
+            pass
 
     if source:
-        where_clauses.append("source ILIKE %s")
-        params.append(f"%{source}%")
+        filters.append("LOWER(source) = LOWER(%s)")
+        params.append(source)
 
-    if min_salary is not None:
-        where_clauses.append("salary_max IS NOT NULL AND salary_max >= %s")
-        params.append(min_salary)
+    if apply_type:
+        filters.append("apply_type = %s")
+        params.append(apply_type)
 
-    if max_salary is not None:
-        where_clauses.append("salary_min IS NOT NULL AND salary_min <= %s")
-        params.append(max_salary)
+    active_value = normalize_bool(is_active)
 
-    where_sql = ""
+    if active_value is None:
+        active_value = normalize_bool(active_only)
 
-    if where_clauses:
-        where_sql = "WHERE " + " AND ".join(where_clauses)
+    if active_value is not None:
+        filters.append("is_active = %s")
+        params.append(active_value)
 
-    allowed_sort_fields = {
-        "id": "id",
-        "title": "title",
-        "company": "company",
-        "location": "location",
-        "salary_min": "salary_min",
-        "salary_max": "salary_max",
-        "date_posted": "date_posted"
-    }
+    if filters:
+        return "WHERE " + " AND ".join(filters), params
 
-    sort_column = allowed_sort_fields.get(sort_by, "date_posted")
+    return "", params
 
-    if sort_order.lower() not in ["asc", "desc"]:
-        sort_order = "desc"
 
-    sort_direction = sort_order.upper()
+def get_safe_sort_clause(sort_by=None, sort_order=None):
+    sort_field = ALLOWED_SORT_FIELDS.get(sort_by or "last_seen_at", "last_seen_at")
 
-    count_query = f"""
-        SELECT COUNT(*) AS total_count
-        FROM jobs
-        {where_sql}
-    """
+    normalized_sort_order = str(sort_order or "desc").lower()
 
-    cursor.execute(count_query, params)
-    total_count = cursor.fetchone()["total_count"]
+    if normalized_sort_order not in ["asc", "desc"]:
+        normalized_sort_order = "desc"
 
-    total_pages = math.ceil(total_count / limit) if total_count > 0 else 0
+    direction = normalized_sort_order.upper()
+
+    if sort_field in [
+        "salary_min",
+        "salary_max",
+        "date_posted",
+        "first_seen_at",
+        "last_seen_at",
+    ]:
+        return f"{sort_field} {direction} NULLS LAST"
+
+    return f"{sort_field} {direction}"
+
+
+def get_jobs_from_db(
+    title=None,
+    company=None,
+    location=None,
+    remote=None,
+    seniority=None,
+    job_type=None,
+    min_salary=None,
+    max_salary=None,
+    source=None,
+    apply_type=None,
+    is_active=None,
+    active_only=None,
+    page=1,
+    limit=10,
+    sort_by="last_seen_at",
+    sort_order="desc",
+    **ignored_kwargs,
+):
+    page = normalize_positive_int(
+        page,
+        default_value=1,
+        min_value=1,
+        max_value=100000
+    )
+
+    limit = normalize_positive_int(
+        limit,
+        default_value=10,
+        min_value=1,
+        max_value=100
+    )
+
     offset = (page - 1) * limit
 
-    data_query = f"""
-        SELECT *
-        FROM jobs
-        {where_sql}
-        ORDER BY {sort_column} {sort_direction}
-        LIMIT %s
-        OFFSET %s
-    """
+    where_clause, params = build_jobs_filters(
+        title=title,
+        company=company,
+        location=location,
+        remote=remote,
+        seniority=seniority,
+        job_type=job_type,
+        min_salary=min_salary,
+        max_salary=max_salary,
+        source=source,
+        apply_type=apply_type,
+        is_active=is_active,
+        active_only=active_only,
+    )
 
-    cursor.execute(data_query, params + [limit, offset])
-    rows = cursor.fetchall()
+    order_clause = get_safe_sort_clause(
+        sort_by=sort_by,
+        sort_order=sort_order
+    )
 
-    cursor.close()
-    connection.close()
+    connection = get_postgres_connection()
 
-    return {
-        "count": total_count,
-        "page": page,
-        "limit": limit,
-        "total_pages": total_pages,
-        "results": [row_to_job(row) for row in rows]
-    }
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) AS total_count
+                FROM jobs
+                {where_clause};
+                """,
+                params
+            )
+
+            count_row = cursor.fetchone()
+            total_count = count_row["total_count"] if count_row else 0
+
+            cursor.execute(
+                f"""
+                SELECT
+                    {JOB_SELECT_COLUMNS}
+                FROM jobs
+                {where_clause}
+                ORDER BY {order_clause}
+                LIMIT %s
+                OFFSET %s;
+                """,
+                params + [limit, offset]
+            )
+
+            rows = cursor.fetchall()
+
+        total_pages = ceil(total_count / limit) if total_count else 0
+
+        return {
+            "results": [serialize_row(row) for row in rows],
+            "count": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
+        }
+
+    finally:
+        connection.close()
+
+
+def search_jobs_from_db(**kwargs):
+    return get_jobs_from_db(**kwargs)
+
+
+def get_all_jobs_from_db(**kwargs):
+    return get_jobs_from_db(**kwargs)
+
+
+def get_job_by_id_from_db(job_id):
+    connection = get_postgres_connection()
+
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    {JOB_SELECT_COLUMNS}
+                FROM jobs
+                WHERE id = %s
+                LIMIT 1;
+                """,
+                (job_id,)
+            )
+
+            row = cursor.fetchone()
+
+        return serialize_row(row)
+
+    finally:
+        connection.close()
+
+
+def get_job_from_db(job_id):
+    return get_job_by_id_from_db(job_id)
+
+
+def get_job_details_from_db(job_id):
+    return get_job_by_id_from_db(job_id)
 
 
 def get_jobs_stats_from_db():
     connection = get_postgres_connection()
-    cursor = connection.cursor()
 
-    cursor.execute(
-        """
-        SELECT
-            COUNT(*) AS total_jobs,
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_jobs,
 
-            COUNT(*) FILTER (
-                WHERE source = 'LinkedIn'
-            ) AS linkedin_jobs,
+                    COUNT(*) FILTER (
+                        WHERE source = 'LinkedIn'
+                    ) AS linkedin_jobs,
 
-            COUNT(*) FILTER (
-                WHERE source = 'LinkedIn' AND is_active = TRUE
-            ) AS active_linkedin_jobs,
+                    COUNT(*) FILTER (
+                        WHERE source = 'LinkedIn' AND is_active = TRUE
+                    ) AS active_linkedin_jobs,
 
-            COUNT(*) FILTER (
-                WHERE source = 'LinkedIn' AND is_active = FALSE
-            ) AS inactive_linkedin_jobs,
+                    COUNT(*) FILTER (
+                        WHERE source = 'LinkedIn' AND is_active = FALSE
+                    ) AS inactive_linkedin_jobs,
 
-            COUNT(*) FILTER (
-                WHERE remote = TRUE
-            ) AS remote_jobs,
+                    COUNT(*) FILTER (
+                        WHERE remote = TRUE
+                    ) AS remote_jobs,
 
-            COUNT(DISTINCT company) AS total_companies,
+                    COUNT(*) FILTER (
+                        WHERE remote = FALSE
+                    ) AS onsite_jobs,
 
-            COUNT(DISTINCT location) AS total_locations,
+                    COUNT(*) FILTER (
+                        WHERE apply_type = 'easy_apply'
+                    ) AS easy_apply_jobs,
 
-            MAX(last_seen_at) FILTER (
-                WHERE source = 'LinkedIn'
-            ) AS last_linkedin_job_seen_at,
+                    COUNT(*) FILTER (
+                        WHERE apply_type = 'external'
+                    ) AS external_apply_jobs,
 
-            MAX(first_seen_at) FILTER (
-                WHERE source = 'LinkedIn'
-            ) AS newest_linkedin_job_first_seen_at
-        FROM jobs;
-        """
+                    COUNT(*) FILTER (
+                        WHERE apply_url IS NOT NULL
+                    ) AS jobs_with_apply_url,
+
+                    COUNT(DISTINCT company) AS total_companies,
+
+                    COUNT(DISTINCT location) AS total_locations,
+
+                    MAX(last_seen_at) FILTER (
+                        WHERE source = 'LinkedIn'
+                    ) AS last_linkedin_job_seen_at,
+
+                    MAX(first_seen_at) FILTER (
+                        WHERE source = 'LinkedIn'
+                    ) AS newest_linkedin_job_first_seen_at
+                FROM jobs;
+                """
+            )
+
+            stats = cursor.fetchone()
+
+        return serialize_row(stats)
+
+    finally:
+        connection.close()
+
+
+def get_job_stats_from_db():
+    return get_jobs_stats_from_db()
+
+
+def get_distinct_companies_from_db(limit=100):
+    limit = normalize_positive_int(
+        limit,
+        default_value=100,
+        min_value=1,
+        max_value=500
     )
 
-    stats = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    return stats
-
-
-def get_job_by_id_from_db(job_id: int):
     connection = get_postgres_connection()
-    cursor = connection.cursor()
 
-    cursor.execute("""
-        SELECT *
-        FROM jobs
-        WHERE id = %s
-    """, (job_id,))
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT company, COUNT(*) AS job_count
+                FROM jobs
+                WHERE company IS NOT NULL
+                  AND company != ''
+                GROUP BY company
+                ORDER BY job_count DESC, company ASC
+                LIMIT %s;
+                """,
+                (limit,)
+            )
 
-    row = cursor.fetchone()
+            rows = cursor.fetchall()
 
-    cursor.close()
-    connection.close()
+        return [serialize_row(row) for row in rows]
 
-    if row is None:
-        return None
+    finally:
+        connection.close()
 
-    return row_to_job(row)
+
+def get_distinct_locations_from_db(limit=100):
+    limit = normalize_positive_int(
+        limit,
+        default_value=100,
+        min_value=1,
+        max_value=500
+    )
+
+    connection = get_postgres_connection()
+
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                SELECT location, COUNT(*) AS job_count
+                FROM jobs
+                WHERE location IS NOT NULL
+                  AND location != ''
+                GROUP BY location
+                ORDER BY job_count DESC, location ASC
+                LIMIT %s;
+                """,
+                (limit,)
+            )
+
+            rows = cursor.fetchall()
+
+        return [serialize_row(row) for row in rows]
+
+    finally:
+        connection.close()
