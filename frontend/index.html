@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -315,7 +314,6 @@
       }
     }
   </style>
-
 </head>
 
 <body>
@@ -327,125 +325,122 @@
       </p>
     </div>
 
-```
-<div class="stats">
-  <div class="stat-card">
-    <span>Total Jobs</span>
-    <strong id="totalJobs">-</strong>
-  </div>
+    <div class="stats">
+      <div class="stat-card">
+        <span>Total Jobs</span>
+        <strong id="totalJobs">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>LinkedIn Jobs</span>
-    <strong id="linkedinJobs">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>LinkedIn Jobs</span>
+        <strong id="linkedinJobs">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>Active Jobs</span>
-    <strong id="activeLinkedinJobs">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>Active Jobs</span>
+        <strong id="activeLinkedinJobs">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>Remote Jobs</span>
-    <strong id="remoteJobs">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>Remote Jobs</span>
+        <strong id="remoteJobs">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>Companies</span>
-    <strong id="totalCompanies">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>Companies</span>
+        <strong id="totalCompanies">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>Locations</span>
-    <strong id="totalLocations">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>Locations</span>
+        <strong id="totalLocations">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>Last Job Update</span>
-    <strong id="lastLinkedinJobSeenAt">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>Last Job Update</span>
+        <strong id="lastLinkedinJobSeenAt">-</strong>
+      </div>
 
-  <div class="stat-card">
-    <span>System Status</span>
-    <strong id="systemStatus">-</strong>
-  </div>
+      <div class="stat-card">
+        <span>System Status</span>
+        <strong id="systemStatus">-</strong>
+      </div>
 
-  <div class="status-card">
-    <h3>System Health</h3>
-    <p id="healthStatus">Checking...</p>
-  </div>
+      <div class="status-card">
+        <h3>System Health</h3>
+        <p id="healthStatus">Checking...</p>
+      </div>
 
-  <div class="status-card">
-    <h3>Last LinkedIn Collector Run</h3>
-    <p id="collectorStatus">Loading...</p>
-    <p id="collectorDetails"></p>
-  </div>
-</div>
+      <div class="status-card">
+        <h3>Last LinkedIn Collector Run</h3>
+        <p id="collectorStatus">Loading...</p>
+        <p id="collectorDetails"></p>
+      </div>
+    </div>
 
-<div class="search-box">
-  <div class="form-grid">
-    <input id="titleInput" type="text" placeholder="Job title, e.g. UX, Data, Frontend" />
-    <input id="locationInput" type="text" placeholder="Location, e.g. Berlin, Germany" />
+    <div class="search-box">
+      <div class="form-grid">
+        <input id="titleInput" type="text" placeholder="Job title, e.g. UX, Data, Frontend" />
+        <input id="locationInput" type="text" placeholder="Location, e.g. Berlin, Germany" />
 
-    <select id="seniorityInput">
-      <option value="">Any seniority</option>
-      <option value="Junior">Junior</option>
-      <option value="Mid">Mid</option>
-      <option value="Senior">Senior</option>
-    </select>
+        <select id="seniorityInput">
+          <option value="">Any seniority</option>
+          <option value="Junior">Junior</option>
+          <option value="Mid">Mid</option>
+          <option value="Senior">Senior</option>
+        </select>
 
-    <select id="jobTypeInput">
-      <option value="">Any job type</option>
-      <option value="Full-time">Full-time</option>
-      <option value="Part-time">Part-time</option>
-      <option value="Contract">Contract</option>
-      <option value="Internship">Internship</option>
-    </select>
+        <select id="jobTypeInput">
+          <option value="">Any job type</option>
+          <option value="Full-time">Full-time</option>
+          <option value="Part-time">Part-time</option>
+          <option value="Contract">Contract</option>
+          <option value="Internship">Internship</option>
+        </select>
 
-    <input id="minSalaryInput" type="number" placeholder="Min salary, e.g. 60000" />
+        <input id="minSalaryInput" type="number" placeholder="Min salary, e.g. 60000" />
 
-    <select id="sortByInput">
-      <option value="date_posted">Sort by date</option>
-      <option value="salary_max">Sort by max salary</option>
-      <option value="salary_min">Sort by min salary</option>
-      <option value="title">Sort by title</option>
-      <option value="company">Sort by company</option>
-    </select>
+        <select id="sortByInput">
+          <option value="date_posted">Sort by date</option>
+          <option value="salary_max">Sort by max salary</option>
+          <option value="salary_min">Sort by min salary</option>
+          <option value="title">Sort by title</option>
+          <option value="company">Sort by company</option>
+        </select>
 
-    <select id="sortOrderInput">
-      <option value="desc">Descending</option>
-      <option value="asc">Ascending</option>
-    </select>
+        <select id="sortOrderInput">
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
 
-    <label>
-      <input id="remoteInput" type="checkbox" />
-      Remote only
-    </label>
-  </div>
+        <label>
+          <input id="remoteInput" type="checkbox" />
+          Remote only
+        </label>
+      </div>
 
-  <br />
+      <br />
 
-  <button onclick="searchJobs(1)">Search Jobs</button>
-  <button onclick="resetFilters()" class="secondary-button">Reset</button>
-</div>
+      <button onclick="searchJobs(1)">Search Jobs</button>
+      <button onclick="resetFilters()" class="secondary-button">Reset</button>
+    </div>
 
-<div class="results-header">
-  <div id="resultCount">Results: -</div>
-  <div>Source: LinkedIn</div>
-</div>
+    <div class="results-header">
+      <div id="resultCount">Results: -</div>
+      <div>Source: LinkedIn</div>
+    </div>
 
-<div id="statusMessage"></div>
+    <div id="statusMessage"></div>
 
-<div id="jobsContainer" class="jobs"></div>
+    <div id="jobsContainer" class="jobs"></div>
 
-<div id="jobDetailsContainer"></div>
+    <div id="jobDetailsContainer"></div>
 
-<div class="pagination">
-  <button id="prevButton" onclick="goToPreviousPage()">Previous</button>
-  <span id="pageInfo">Page - of -</span>
-  <button id="nextButton" onclick="goToNextPage()">Next</button>
-</div>
-```
-
+    <div class="pagination">
+      <button id="prevButton" onclick="goToPreviousPage()">Previous</button>
+      <span id="pageInfo">Page - of -</span>
+      <button id="nextButton" onclick="goToNextPage()">Next</button>
+    </div>
   </div>
 
   <script src="config.js"></script>
@@ -478,6 +473,30 @@
       }
 
       return date.toLocaleString();
+    }
+
+    function getApplyTag(job) {
+      if (job.apply_type === "easy_apply") {
+        return "Easy Apply";
+      }
+
+      if (job.apply_type === "external") {
+        return "External Apply";
+      }
+
+      return "Apply unknown";
+    }
+
+    function getApplyButtonText(job) {
+      if (job.apply_type === "easy_apply") {
+        return "Easy Apply on LinkedIn";
+      }
+
+      if (job.apply_label) {
+        return job.apply_label;
+      }
+
+      return "Apply";
     }
 
     async function loadStats() {
@@ -678,13 +697,7 @@
             <span class="tag">${job.seniority || "Seniority unknown"}</span>
             <span class="tag">${salary}</span>
             <span class="tag">${job.date_posted || "Date unknown"}</span>
-            <span class="tag">${
-              job.apply_type === "easy_apply"
-                ? "Easy Apply"
-                : job.apply_type === "external"
-                  ? "External Apply"
-                  : "Apply unknown"
-            }</span>
+            <span class="tag">${getApplyTag(job)}</span>
           </div>
 
           <div class="job-meta">
@@ -701,7 +714,7 @@
 
             ${job.apply_url ? `
               <a href="${job.apply_url}" target="_blank" rel="noopener noreferrer">
-                ${job.apply_type === "easy_apply" ? "Easy Apply on LinkedIn" : "Apply"}
+                ${getApplyButtonText(job)}
               </a>
             ` : ""}
 
@@ -833,15 +846,6 @@
                 <span>Poster Title</span>
                 <strong>${job.poster_title || "Unknown"}</strong>
               </div>
-              <div class="detail-item">
-                <span>Apply Type</span>
-                <strong>${job.apply_type || "Unknown"}</strong>
-              </div>
-
-              <div class="detail-item">
-                <span>Apply Link</span>
-                <strong>${job.apply_url ? "Available" : "Not available"}</strong>
-              </div>
 
               <div class="detail-item">
                 <span>Apply Type</span>
@@ -854,31 +858,31 @@
               </div>
             </div>
 
-          <div class="links" style="margin-top: 18px;">
-            ${job.job_url ? `
-              <a href="${job.job_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                Open Job
-              </a>
-            ` : ""}
+            <div class="links" style="margin-top: 18px;">
+              ${job.job_url ? `
+                <a href="${job.job_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
+                  Open Job
+                </a>
+              ` : ""}
 
-            ${job.apply_url ? `
-              <a href="${job.apply_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                ${job.apply_type === "easy_apply" ? "Easy Apply on LinkedIn" : "Apply"}
-              </a>
-            ` : ""}
+              ${job.apply_url ? `
+                <a href="${job.apply_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
+                  ${getApplyButtonText(job)}
+                </a>
+              ` : ""}
 
-            ${job.poster_profile_url ? `
-              <a href="${job.poster_profile_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                Open Poster Profile
-              </a>
-            ` : ""}
+              ${job.poster_profile_url ? `
+                <a href="${job.poster_profile_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
+                  Open Poster Profile
+                </a>
+              ` : ""}
 
-            ${job.company_linkedin_url ? `
-              <a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                Company LinkedIn
-              </a>
-            ` : ""}
-          </div>
+              ${job.company_linkedin_url ? `
+                <a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
+                  Company LinkedIn
+                </a>
+              ` : ""}
+            </div>
 
             <button class="close-details" onclick="closeJobDetails()">Close Details</button>
           </div>
@@ -905,6 +909,5 @@
     loadCollectorStatus();
     searchJobs(1);
   </script>
-
 </body>
 </html>
