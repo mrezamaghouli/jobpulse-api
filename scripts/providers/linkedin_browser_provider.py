@@ -1,4 +1,6 @@
 import json
+import os
+import psycopg2
 import re
 import time
 from datetime import date
@@ -10,11 +12,13 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from app.config import get_postgres_config
 from app.config import (
     get_linkedin_browser,
     get_linkedin_keywords,
     get_linkedin_limit,
     get_linkedin_location,
+    get_postgres_config,
 )
 
 
@@ -124,14 +128,37 @@ class LinkedInBrowserProvider:
         )
 
     def build_jobs_search_url(self, keywords: str, location: str) -> str:
+        lookback_days_raw = os.getenv("LINKEDIN_LOOKBACK_DAYS", "7")
+        work_mode = os.getenv("LINKEDIN_WORK_MODE", "any").strip().lower()
+
+        try:
+            lookback_days = int(lookback_days_raw)
+        except ValueError:
+            lookback_days = 7
+
+        if lookback_days < 1:
+            lookback_days = 1
+
+        lookback_seconds = lookback_days * 24 * 60 * 60
+
         query_params = {
             "keywords": keywords,
-            "f_TPR": "r604800",
+            "f_TPR": f"r{lookback_seconds}",
             "sortBy": "DD",
         }
 
         if location:
             query_params["location"] = location
+
+        work_mode_map = {
+            "onsite": "1",
+            "on-site": "1",
+            "remote": "2",
+            "hybrid": "3",
+        }
+
+        if work_mode in work_mode_map:
+            query_params["f_WT"] = work_mode_map[work_mode]
 
         return f"https://www.linkedin.com/jobs/search/?{urlencode(query_params)}"
 
@@ -168,6 +195,65 @@ class LinkedInBrowserProvider:
             )
 
             page.wait_for_timeout(5000)
+
+
+    def should_skip_existing_enriched_jobs(self) -> bool:
+        value = os.getenv("LINKEDIN_SKIP_EXISTING_ENRICHED", "true")
+        return value.strip().lower() in ["true", "1", "yes", "y"]
+
+    def get_existing_enriched_job_urls(self, jobs: list[dict]) -> set[str]:
+        if not self.should_skip_existing_enriched_jobs():
+            return set()
+
+        canonical_urls = []
+
+        for job in jobs:
+            linkedin_job_id = self.extract_job_id(
+                job_url=job.get("job_url", ""),
+                fallback=job.get("linkedin_job_id", ""),
+            )
+
+            canonical_url = self.canonicalize_job_url(
+                job_url=job.get("job_url", ""),
+                linkedin_job_id=linkedin_job_id,
+            )
+
+            if canonical_url:
+                canonical_urls.append(canonical_url)
+
+        if not canonical_urls:
+            return set()
+
+        try:
+            connection = psycopg2.connect(**get_postgres_config())
+            cursor = connection.cursor()
+
+            cursor.execute(
+                """
+                SELECT job_url
+                FROM jobs
+                WHERE source = 'LinkedIn'
+                  AND job_url = ANY(%s)
+                  AND apply_url IS NOT NULL
+                  AND job_description IS NOT NULL;
+                """,
+                (canonical_urls,),
+            )
+
+            rows = cursor.fetchall()
+
+            cursor.close()
+            connection.close()
+
+            return {
+                row[0]
+                for row in rows
+                if row and row[0]
+            }
+
+        except Exception as error:
+            print(f"Could not check existing enriched jobs: {error}")
+            return set()
 
     def extract_jobs_from_page(self, page, limit: int) -> list[dict]:
         print("Waiting for LinkedIn job results...")
@@ -389,9 +475,36 @@ class LinkedInBrowserProvider:
 
         print(f"Basic LinkedIn jobs found before enrichment: {len(basic_jobs)}")
 
+        existing_enriched_job_urls = self.get_existing_enriched_job_urls(basic_jobs)
+
+        if existing_enriched_job_urls:
+            print(f"Existing enriched jobs to skip: {len(existing_enriched_job_urls)}")
+
         enriched_jobs = []
 
         for index, job in enumerate(basic_jobs, start=1):
+            linkedin_job_id = self.extract_job_id(
+                job_url=job.get("job_url", ""),
+                fallback=job.get("linkedin_job_id", ""),
+            )
+
+            canonical_job_url = self.canonicalize_job_url(
+                job_url=job.get("job_url", ""),
+                linkedin_job_id=linkedin_job_id,
+            )
+
+            job["job_url"] = canonical_job_url
+
+            if canonical_job_url in existing_enriched_job_urls:
+                print(
+                    f"Skipping detail enrichment for existing job "
+                    f"{index}/{len(basic_jobs)}: {canonical_job_url}"
+                )
+
+                job["skip_detail_enrichment"] = True
+                enriched_jobs.append(job)
+                continue
+
             print(f"Reading detail panel for job {index}/{len(basic_jobs)}...")
 
             detail_data = self.extract_detail_for_job(page, job)
@@ -492,12 +605,52 @@ class LinkedInBrowserProvider:
                     '.job-details-jobs-unified-top-card__primary-description-container'
                 ]);
 
+                const jobDescription = getText([
+                    '.jobs-description-content__text',
+                    '.jobs-box__html-content',
+                    '#job-details',
+                    '.jobs-description'
+                ]);
+
+                const companyLogoEl =
+                    document.querySelector('.jobs-unified-top-card__company-logo img') ||
+                    document.querySelector('.job-details-jobs-unified-top-card__company-logo img') ||
+                    document.querySelector('img[alt*="logo"]') ||
+                    document.querySelector('a[href*="/company/"] img');
+
+                const companyLogoUrl =
+                    companyLogoEl
+                        ? (
+                            companyLogoEl.src ||
+                            companyLogoEl.getAttribute('src') ||
+                            companyLogoEl.getAttribute('data-delayed-url') ||
+                            ''
+                        )
+                        : '';
+
+                const fullPageText = document.body ? document.body.innerText : '';
+
+                let workMode = '';
+
+                if (fullPageText.toLowerCase().includes('remote')) {
+                    workMode = 'remote';
+                } else if (fullPageText.toLowerCase().includes('hybrid')) {
+                    workMode = 'hybrid';
+                } else if (fullPageText.toLowerCase().includes('on-site') || fullPageText.toLowerCase().includes('onsite')) {
+                    workMode = 'onsite';
+                }
+
                 return {
                     detail_title: title,
                     detail_company: company,
                     detail_location: location,
                     company_linkedin_url: companyUrl || null,
-                    details_text: detailsText
+                    company_logo_url: companyLogoUrl || null,
+                    details_text: detailsText,
+                    job_description: jobDescription || null,
+                    job_about: jobDescription || null,
+                    work_mode: workMode || null,
+                    date_posted_text: detailsText || null
                 };
             }
             """
@@ -520,6 +673,11 @@ class LinkedInBrowserProvider:
                 detail_data.get("company_linkedin_url")
                 or job.get("company_linkedin_url")
             ),
+            "company_logo_url": detail_data.get("company_logo_url"),
+            "job_description": detail_data.get("job_description"),
+            "job_about": detail_data.get("job_about"),
+            "work_mode": detail_data.get("work_mode"),
+            "date_posted_text": detail_data.get("date_posted_text"),
             "apply_type": apply_info.get("apply_type") or "unknown",
             "apply_url": apply_info.get("apply_url"),
             "apply_label": apply_info.get("apply_label"),
@@ -826,6 +984,11 @@ class LinkedInBrowserProvider:
             "title": title,
             "company": company,
             "company_linkedin_url": raw_job.get("company_linkedin_url") or None,
+            "company_logo_url": raw_job.get("company_logo_url") or None,
+            "job_description": raw_job.get("job_description") or None,
+            "job_about": raw_job.get("job_about") or None,
+            "work_mode": raw_job.get("work_mode") or None,
+            "date_posted_text": raw_job.get("date_posted_text") or None,
 
             "location": location,
             "remote": "remote" in location.lower(),

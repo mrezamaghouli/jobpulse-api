@@ -137,6 +137,12 @@ def normalize_job(raw_job):
         "title": title,
         "company": company,
         "company_linkedin_url": raw_job.get("company_linkedin_url"),
+        "company_logo_url": raw_job.get("company_logo_url"),
+        "job_description": raw_job.get("job_description"),
+        "job_about": raw_job.get("job_about"),
+        "work_mode": raw_job.get("work_mode"),
+        "date_posted_text": raw_job.get("date_posted_text"),
+        "date_posted_at": raw_job.get("date_posted_at"),
 
         "location": location,
         "remote": normalize_bool(raw_job.get("remote")) or ("remote" in location.lower()),
@@ -192,6 +198,12 @@ def insert_job(cursor, job):
             title,
             company,
             company_linkedin_url,
+            company_logo_url,
+            job_description,
+            job_about,
+            work_mode,
+            date_posted_text,
+            date_posted_at,
             location,
             remote,
             job_type,
@@ -217,6 +229,12 @@ def insert_job(cursor, job):
             %(title)s,
             %(company)s,
             %(company_linkedin_url)s,
+            %(company_logo_url)s,
+            %(job_description)s,
+            %(job_about)s,
+            %(work_mode)s,
+            %(date_posted_text)s,
+            %(date_posted_at)s,
             %(location)s,
             %(remote)s,
             %(job_type)s,
@@ -238,25 +256,46 @@ def insert_job(cursor, job):
             TRUE
         )
         ON CONFLICT (job_url) DO UPDATE SET
-            linkedin_job_id = EXCLUDED.linkedin_job_id,
-            title = EXCLUDED.title,
-            company = EXCLUDED.company,
-            company_linkedin_url = EXCLUDED.company_linkedin_url,
-            location = EXCLUDED.location,
-            remote = EXCLUDED.remote,
-            job_type = EXCLUDED.job_type,
-            seniority = EXCLUDED.seniority,
-            salary_min = EXCLUDED.salary_min,
-            salary_max = EXCLUDED.salary_max,
-            currency = EXCLUDED.currency,
-            source = EXCLUDED.source,
-            apply_type = EXCLUDED.apply_type,
-            apply_url = EXCLUDED.apply_url,
-            apply_label = EXCLUDED.apply_label,
-            poster_name = EXCLUDED.poster_name,
-            poster_title = EXCLUDED.poster_title,
-            poster_profile_url = EXCLUDED.poster_profile_url,
-            date_posted = EXCLUDED.date_posted,
+            linkedin_job_id = COALESCE(EXCLUDED.linkedin_job_id, jobs.linkedin_job_id),
+
+            title = COALESCE(EXCLUDED.title, jobs.title),
+            company = COALESCE(EXCLUDED.company, jobs.company),
+            company_linkedin_url = COALESCE(EXCLUDED.company_linkedin_url, jobs.company_linkedin_url),
+
+            company_logo_url = COALESCE(EXCLUDED.company_logo_url, jobs.company_logo_url),
+            job_description = COALESCE(EXCLUDED.job_description, jobs.job_description),
+            job_about = COALESCE(EXCLUDED.job_about, jobs.job_about),
+            work_mode = COALESCE(EXCLUDED.work_mode, jobs.work_mode),
+            date_posted_text = COALESCE(EXCLUDED.date_posted_text, jobs.date_posted_text),
+            date_posted_at = COALESCE(EXCLUDED.date_posted_at, jobs.date_posted_at),
+
+            location = COALESCE(EXCLUDED.location, jobs.location),
+            remote = COALESCE(EXCLUDED.remote, jobs.remote),
+            job_type = COALESCE(EXCLUDED.job_type, jobs.job_type),
+            seniority = COALESCE(EXCLUDED.seniority, jobs.seniority),
+
+            salary_min = COALESCE(EXCLUDED.salary_min, jobs.salary_min),
+            salary_max = COALESCE(EXCLUDED.salary_max, jobs.salary_max),
+            currency = COALESCE(EXCLUDED.currency, jobs.currency),
+
+            source = COALESCE(EXCLUDED.source, jobs.source),
+
+            apply_type = CASE
+                WHEN EXCLUDED.apply_type IS NOT NULL
+                AND EXCLUDED.apply_type != 'unknown'
+                THEN EXCLUDED.apply_type
+                ELSE jobs.apply_type
+            END,
+
+            apply_url = COALESCE(EXCLUDED.apply_url, jobs.apply_url),
+            apply_label = COALESCE(EXCLUDED.apply_label, jobs.apply_label),
+
+            poster_name = COALESCE(EXCLUDED.poster_name, jobs.poster_name),
+            poster_title = COALESCE(EXCLUDED.poster_title, jobs.poster_title),
+            poster_profile_url = COALESCE(EXCLUDED.poster_profile_url, jobs.poster_profile_url),
+
+            date_posted = COALESCE(EXCLUDED.date_posted, jobs.date_posted),
+
             last_seen_at = CURRENT_TIMESTAMP,
             is_active = TRUE;
         """,
