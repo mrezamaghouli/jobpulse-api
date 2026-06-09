@@ -68,6 +68,15 @@ def build_query_env(query: dict) -> dict:
     env["LINKEDIN_WORK_MODE"] = query["work_mode"]
     env["LINKEDIN_LOOKBACK_DAYS"] = str(query["lookback_days"])
     env["LINKEDIN_MAX_PAGES"] = str(query["max_pages"])
+    env["LINKEDIN_QUERY_RETRY_COUNT"] = env.get(
+        "LINKEDIN_QUERY_RETRY_COUNT",
+        "1"
+    )
+
+    env["LINKEDIN_QUERY_RETRY_DELAY_SECONDS"] = env.get(
+        "LINKEDIN_QUERY_RETRY_DELAY_SECONDS",
+        "10"
+    )
     env["LINKEDIN_SKIP_EXISTING_ENRICHED"] = env.get(
         "LINKEDIN_SKIP_EXISTING_ENRICHED",
         "true"
@@ -82,61 +91,118 @@ def build_query_env(query: dict) -> dict:
     return env
 
 
+def get_retry_count() -> int:
+    try:
+        retry_count = int(os.getenv("LINKEDIN_QUERY_RETRY_COUNT", "1"))
+    except ValueError:
+        retry_count = 1
+
+    if retry_count < 0:
+        retry_count = 0
+
+    if retry_count > 3:
+        retry_count = 3
+
+    return retry_count
+
+
+def get_retry_delay_seconds() -> int:
+    try:
+        delay_seconds = int(os.getenv("LINKEDIN_QUERY_RETRY_DELAY_SECONDS", "10"))
+    except ValueError:
+        delay_seconds = 10
+
+    if delay_seconds < 0:
+        delay_seconds = 0
+
+    if delay_seconds > 120:
+        delay_seconds = 120
+
+    return delay_seconds
+
+
 def run_single_query(query: dict, index: int, total: int) -> dict:
-    started_at = datetime.now()
+    retry_count = get_retry_count()
+    retry_delay_seconds = get_retry_delay_seconds()
 
-    label = (
-        f"[{index}/{total}] "
-        f"{query['category']} | "
-        f"{query['keywords']} | "
-        f"{query['location'] or 'Worldwide'} | "
-        f"{query['work_mode']}"
-    )
+    attempts = []
+    final_result = None
 
-    print("\n" + "=" * 90)
-    print(f"Starting query {label}")
-    print("=" * 90)
+    for attempt_number in range(1, retry_count + 2):
+        started_at = datetime.now()
 
-    env = build_query_env(query)
+        label = (
+            f"[{index}/{total}] "
+            f"{query['category']} | "
+            f"{query['keywords']} | "
+            f"{query['location'] or 'Worldwide'} | "
+            f"{query['work_mode']} | "
+            f"attempt {attempt_number}/{retry_count + 1}"
+        )
 
-    process = subprocess.run(
-        [sys.executable, "-m", "scripts.collector_postgres"],
-        cwd=str(BASE_DIR),
-        env=env,
-        text=True,
-        capture_output=True,
-    )
+        print("\n" + "=" * 90)
+        print(f"Starting query {label}")
+        print("=" * 90)
 
-    finished_at = datetime.now()
-    duration_seconds = round((finished_at - started_at).total_seconds(), 2)
+        env = build_query_env(query)
 
-    success = process.returncode == 0
+        process = subprocess.run(
+            [sys.executable, "-m", "scripts.collector_postgres"],
+            cwd=str(BASE_DIR),
+            env=env,
+            text=True,
+            capture_output=True,
+        )
 
-    result = {
-        "index": index,
-        "total": total,
-        "success": success,
-        "returncode": process.returncode,
-        "category": query["category"],
-        "keywords": query["keywords"],
-        "location": query["location"],
-        "work_mode": query["work_mode"],
-        "lookback_days": query["lookback_days"],
-        "limit": query["limit"],
-        "duration_seconds": duration_seconds,
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "stdout": process.stdout,
-        "stderr": process.stderr,
-    }
+        finished_at = datetime.now()
+        duration_seconds = round((finished_at - started_at).total_seconds(), 2)
 
-    if success:
-        print(f"Finished successfully: {label} in {duration_seconds}s")
-    else:
+        success = process.returncode == 0
+
+        attempt_result = {
+            "attempt_number": attempt_number,
+            "success": success,
+            "returncode": process.returncode,
+            "duration_seconds": duration_seconds,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+        }
+
+        attempts.append(attempt_result)
+
+        final_result = {
+            "index": index,
+            "total": total,
+            "success": success,
+            "returncode": process.returncode,
+            "category": query["category"],
+            "keywords": query["keywords"],
+            "location": query["location"],
+            "work_mode": query["work_mode"],
+            "lookback_days": query["lookback_days"],
+            "limit": query["limit"],
+            "duration_seconds": duration_seconds,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "attempts": attempts,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+        }
+
+        if success:
+            print(f"Finished successfully: {label} in {duration_seconds}s")
+            return final_result
+
         print(f"Failed: {label} in {duration_seconds}s")
         print(process.stderr[-1500:])
 
-    return result
+        if attempt_number <= retry_count:
+            print(f"Retrying after {retry_delay_seconds}s...")
+            time.sleep(retry_delay_seconds)
+
+    return final_result
 
 
 def write_run_log(results: list[dict]):
