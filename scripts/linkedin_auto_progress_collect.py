@@ -1,4 +1,5 @@
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -92,20 +93,26 @@ def run_batch(offset: int, batch_size: int, workers: int, category: str | None):
     }
 
 
-def run_logo_sync() -> dict:
+def run_module_task(module_name: str, title: str, extra_env: dict | None = None) -> dict:
     print("\n" + "=" * 90)
-    print("Running logo sync after batch")
+    print(title)
     print("=" * 90)
 
     started_at = datetime.now()
+
+    env = os.environ.copy()
+
+    if extra_env:
+        env.update(extra_env)
 
     process = subprocess.run(
         [
             sys.executable,
             "-m",
-            "scripts.sync_job_company_logos",
+            module_name,
         ],
         cwd=str(BASE_DIR),
+        env=env,
         text=True,
         capture_output=True,
     )
@@ -113,12 +120,14 @@ def run_logo_sync() -> dict:
     finished_at = datetime.now()
     duration_seconds = round((finished_at - started_at).total_seconds(), 2)
 
-    print(process.stdout)
+    if process.stdout:
+        print(process.stdout)
 
     if process.stderr:
         print(process.stderr)
 
     return {
+        "module": module_name,
         "success": process.returncode == 0,
         "returncode": process.returncode,
         "started_at": started_at.isoformat(),
@@ -127,6 +136,31 @@ def run_logo_sync() -> dict:
         "stdout": process.stdout,
         "stderr": process.stderr,
     }
+
+def run_company_backfill() -> dict:
+    return run_module_task(
+        module_name="scripts.backfill_companies_from_jobs",
+        title="Running company backfill after batch",
+    )
+
+
+def run_company_enrichment(company_enrich_limit: int, company_enrich_stale_days: int) -> dict:
+    return run_module_task(
+        module_name="scripts.enrich_companies_from_linkedin",
+        title="Running company enrichment after batch",
+        extra_env={
+            "COMPANY_ENRICH_LIMIT": str(company_enrich_limit),
+            "COMPANY_ENRICH_STALE_DAYS": str(company_enrich_stale_days),
+        },
+    )
+
+
+def run_logo_sync() -> dict:
+    return run_module_task(
+        module_name="scripts.sync_job_company_logos",
+        title="Running logo sync after batch",
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -164,6 +198,26 @@ def main():
         "--show",
         action="store_true",
         help="Show current progress and exit."
+    )
+
+    parser.add_argument(
+        "--company-enrich-limit",
+        type=int,
+        default=5,
+        help="Number of companies to enrich after each successful batch."
+    )
+
+    parser.add_argument(
+        "--company-enrich-stale-days",
+        type=int,
+        default=30,
+        help="Only enrich companies older than this many days."
+    )
+
+    parser.add_argument(
+        "--skip-company-enrichment",
+        action="store_true",
+        help="Skip LinkedIn company enrichment after batch."
     )
 
     args = parser.parse_args()
@@ -208,11 +262,23 @@ def main():
         category=args.category,
     )
 
+    company_backfill_result = None
+    company_enrichment_result = None
     logo_sync_result = None
 
     if result["success"]:
+        company_backfill_result = run_company_backfill()
+
+        if not args.skip_company_enrichment:
+            company_enrichment_result = run_company_enrichment(
+                company_enrich_limit=max(1, args.company_enrich_limit),
+                company_enrich_stale_days=max(1, args.company_enrich_stale_days),
+            )
+
         logo_sync_result = run_logo_sync()
 
+    result["company_backfill"] = company_backfill_result
+    result["company_enrichment"] = company_enrichment_result
     result["logo_sync"] = logo_sync_result
 
     progress.setdefault("runs", [])
@@ -222,6 +288,18 @@ def main():
         progress["next_offset"] = offset + effective_batch_size
         print("\nBatch finished successfully.")
         print(f"Next offset saved: {progress['next_offset']}")
+
+        if company_backfill_result and company_backfill_result["success"]:
+            print("Company backfill completed successfully.")
+        else:
+            print("Batch succeeded, but company backfill failed or did not run.")
+
+        if args.skip_company_enrichment:
+            print("Company enrichment skipped.")
+        elif company_enrichment_result and company_enrichment_result["success"]:
+            print("Company enrichment completed successfully.")
+        else:
+            print("Batch succeeded, but company enrichment failed or did not run.")
 
         if logo_sync_result and logo_sync_result["success"]:
             print("Logo sync completed successfully.")
