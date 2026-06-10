@@ -108,11 +108,15 @@ class Job(BaseModel):
     linkedin_job_id: Optional[str] = None
 
     title: str
-    company: Optional[str] = None
+    company: str
+    company_id: Optional[int] = None
     company_linkedin_url: Optional[str] = None
-    location: Optional[str] = None
+    company_logo_url: Optional[str] = None
 
-    remote: Optional[bool] = None
+    location: str
+    remote: bool
+    work_mode: Optional[str] = None
+
     job_type: Optional[str] = None
     seniority: Optional[str] = None
 
@@ -120,8 +124,14 @@ class Job(BaseModel):
     salary_max: Optional[float] = None
     currency: Optional[str] = None
 
-    source: Optional[str] = None
-    job_url: Optional[str] = None
+    source: str
+    job_url: str
+
+    job_description: Optional[str] = None
+    job_about: Optional[str] = None
+
+    date_posted_text: Optional[str] = None
+    date_posted_at: Optional[Any] = None
 
     apply_type: Optional[str] = None
     apply_url: Optional[str] = None
@@ -131,9 +141,9 @@ class Job(BaseModel):
     poster_title: Optional[str] = None
     poster_profile_url: Optional[str] = None
 
-    date_posted: Optional[str] = None
-    first_seen_at: Optional[str] = None
-    last_seen_at: Optional[str] = None
+    date_posted: Optional[Any] = None
+    first_seen_at: Optional[Any] = None
+    last_seen_at: Optional[Any] = None
     is_active: Optional[bool] = None
 
 
@@ -391,7 +401,74 @@ def get_jobs_stats():
 
     return serialize_data(stats)
 
+@app.get("/jobs/quality")
+def get_jobs_quality():
+    connection = None
+    cursor = None
 
+    try:
+        connection = get_postgres_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_linkedin_jobs,
+                COUNT(*) FILTER (WHERE is_active = TRUE) AS active_linkedin_jobs,
+                COUNT(*) FILTER (WHERE apply_url IS NOT NULL AND apply_url != '') AS jobs_with_apply_url,
+                COUNT(*) FILTER (WHERE apply_type = 'easy_apply') AS easy_apply_jobs,
+                COUNT(*) FILTER (WHERE apply_type = 'external') AS external_apply_jobs,
+                COUNT(*) FILTER (WHERE job_description IS NOT NULL AND job_description != '') AS jobs_with_description,
+                COUNT(*) FILTER (WHERE company_logo_url IS NOT NULL AND company_logo_url != '') AS jobs_with_company_logo,
+                COUNT(*) FILTER (WHERE work_mode IS NOT NULL AND work_mode != '') AS jobs_with_work_mode,
+                COUNT(*) FILTER (WHERE date_posted_text IS NOT NULL AND date_posted_text != '') AS jobs_with_date_posted_text,
+                COUNT(DISTINCT company) AS unique_companies,
+                MAX(first_seen_at) AS newest_job_first_seen_at,
+                MAX(last_seen_at) AS last_job_seen_at
+            FROM jobs
+            WHERE source = 'LinkedIn';
+            """
+        )
+
+        job_columns = [column[0] for column in cursor.description]
+        job_row = cursor.fetchone()
+        job_summary = dict(zip(job_columns, job_row))
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total_companies,
+                COUNT(*) FILTER (WHERE logo_url IS NOT NULL AND logo_url != '') AS companies_with_logo,
+                COUNT(*) FILTER (WHERE about IS NOT NULL AND about != '') AS companies_with_about,
+                COUNT(*) FILTER (WHERE website_url IS NOT NULL AND website_url != '') AS companies_with_website,
+                COUNT(*) FILTER (WHERE industry IS NOT NULL AND industry != '') AS companies_with_industry,
+                COUNT(*) FILTER (WHERE company_size IS NOT NULL AND company_size != '') AS companies_with_size,
+                COUNT(*) FILTER (WHERE headquarters IS NOT NULL AND headquarters != '') AS companies_with_headquarters,
+                MAX(last_enriched_at) AS last_company_enriched_at
+            FROM companies;
+            """
+        )
+
+        company_columns = [column[0] for column in cursor.description]
+        company_row = cursor.fetchone()
+        company_summary = dict(zip(company_columns, company_row))
+
+        return {
+            "jobs": job_summary,
+            "companies": company_summary,
+        }
+
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if connection:
+            connection.close()
+
+            
 @app.get("/jobs/{job_id}", response_model=Job)
 def get_job(job_id: int):
     job = get_job_by_id_from_db(job_id)
