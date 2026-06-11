@@ -5,6 +5,9 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+import psycopg2
+
+from app.config import get_postgres_config
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -154,12 +157,101 @@ def run_company_enrichment(company_enrich_limit: int, company_enrich_stale_days:
         },
     )
 
-
 def run_logo_sync() -> dict:
     return run_module_task(
         module_name="scripts.sync_job_company_logos",
         title="Running logo sync after batch",
     )
+
+def run_stale_jobs_cleanup(stale_job_days: int) -> dict:
+    return run_module_task(
+        module_name="scripts.mark_stale_jobs_inactive",
+        title="Running stale jobs cleanup after batch",
+        extra_env={
+            "STALE_JOB_DAYS": str(stale_job_days),
+        },
+    )
+
+def get_database_summary() -> dict:
+    connection = psycopg2.connect(**get_postgres_config())
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total_linkedin_jobs,
+            COUNT(*) FILTER (WHERE is_active = TRUE) AS active_linkedin_jobs,
+            COUNT(*) FILTER (WHERE apply_url IS NOT NULL AND apply_url != '') AS jobs_with_apply_url,
+            COUNT(*) FILTER (WHERE apply_type = 'easy_apply') AS easy_apply_jobs,
+            COUNT(*) FILTER (WHERE apply_type = 'external') AS external_apply_jobs,
+            COUNT(*) FILTER (WHERE job_description IS NOT NULL AND job_description != '') AS jobs_with_description,
+            COUNT(*) FILTER (WHERE company_logo_url IS NOT NULL AND company_logo_url != '') AS jobs_with_company_logo,
+            COUNT(DISTINCT company) AS unique_companies,
+            MAX(last_seen_at) AS last_linkedin_job_seen_at
+        FROM jobs
+        WHERE source = 'LinkedIn';
+        """
+    )
+
+    job_row = cursor.fetchone()
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total_companies,
+            COUNT(*) FILTER (WHERE logo_url IS NOT NULL AND logo_url != '') AS companies_with_logo,
+            COUNT(*) FILTER (WHERE about IS NOT NULL AND about != '') AS companies_with_about,
+            COUNT(*) FILTER (WHERE website_url IS NOT NULL AND website_url != '') AS companies_with_website,
+            MAX(last_enriched_at) AS last_company_enriched_at
+        FROM companies;
+        """
+    )
+
+    company_row = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    summary = {
+        "total_linkedin_jobs": job_row[0],
+        "active_linkedin_jobs": job_row[1],
+        "jobs_with_apply_url": job_row[2],
+        "easy_apply_jobs": job_row[3],
+        "external_apply_jobs": job_row[4],
+        "jobs_with_description": job_row[5],
+        "jobs_with_company_logo": job_row[6],
+        "unique_companies": job_row[7],
+        "last_linkedin_job_seen_at": job_row[8].isoformat() if job_row[8] else None,
+
+        "total_companies": company_row[0],
+        "companies_with_logo": company_row[1],
+        "companies_with_about": company_row[2],
+        "companies_with_website": company_row[3],
+        "last_company_enriched_at": company_row[4].isoformat() if company_row[4] else None,
+    }
+
+    return summary
+
+
+def print_database_summary(summary: dict):
+    print("\n" + "=" * 90)
+    print("Database summary after batch")
+    print("=" * 90)
+
+    print(f"Total LinkedIn jobs: {summary.get('total_linkedin_jobs')}")
+    print(f"Active LinkedIn jobs: {summary.get('active_linkedin_jobs')}")
+    print(f"Jobs with apply URL: {summary.get('jobs_with_apply_url')}")
+    print(f"Easy Apply jobs: {summary.get('easy_apply_jobs')}")
+    print(f"External Apply jobs: {summary.get('external_apply_jobs')}")
+    print(f"Jobs with description: {summary.get('jobs_with_description')}")
+    print(f"Jobs with company logo: {summary.get('jobs_with_company_logo')}")
+    print(f"Unique companies: {summary.get('unique_companies')}")
+    print(f"Total companies: {summary.get('total_companies')}")
+    print(f"Companies with logo: {summary.get('companies_with_logo')}")
+    print(f"Companies with about: {summary.get('companies_with_about')}")
+    print(f"Companies with website: {summary.get('companies_with_website')}")
+    print(f"Last job seen at: {summary.get('last_linkedin_job_seen_at')}")
+    print(f"Last company enriched at: {summary.get('last_company_enriched_at')}")
 
 
 def main():
@@ -220,6 +312,13 @@ def main():
         help="Skip LinkedIn company enrichment after batch."
     )
 
+    parser.add_argument(
+        "--stale-job-days",
+        type=int,
+        default=30,
+        help="Mark LinkedIn jobs inactive if not seen for this many days."
+    )
+
     args = parser.parse_args()
 
     total_queries = load_queries_count()
@@ -265,6 +364,7 @@ def main():
     company_backfill_result = None
     company_enrichment_result = None
     logo_sync_result = None
+    stale_jobs_cleanup_result = None
 
     if result["success"]:
         company_backfill_result = run_company_backfill()
@@ -277,9 +377,25 @@ def main():
 
         logo_sync_result = run_logo_sync()
 
+        stale_jobs_cleanup_result = run_stale_jobs_cleanup(
+            stale_job_days=max(1, args.stale_job_days),
+        )
+
     result["company_backfill"] = company_backfill_result
     result["company_enrichment"] = company_enrichment_result
     result["logo_sync"] = logo_sync_result
+    result["stale_jobs_cleanup"] = stale_jobs_cleanup_result
+
+    database_summary = None
+
+    if result["success"]:
+        try:
+            database_summary = get_database_summary()
+            print_database_summary(database_summary)
+        except Exception as error:
+            print(f"Could not generate database summary: {error}")
+
+    result["database_summary"] = database_summary
 
     progress.setdefault("runs", [])
     progress["runs"].append(result)
@@ -305,6 +421,10 @@ def main():
             print("Logo sync completed successfully.")
         else:
             print("Batch succeeded, but logo sync failed or did not run.")
+        if stale_jobs_cleanup_result and stale_jobs_cleanup_result["success"]:
+            print("Stale jobs cleanup completed successfully.")
+        else:
+            print("Batch succeeded, but stale jobs cleanup failed or did not run.")
     else:
         progress["next_offset"] = offset
         print("\nBatch failed.")
