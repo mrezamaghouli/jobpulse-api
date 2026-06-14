@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
 
 COPY app ./app
 COPY scripts ./scripts
+COPY config ./config
 
 EXPOSE 8000
 

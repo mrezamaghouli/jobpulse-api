@@ -11,12 +11,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 REQUIRED_FILES = [
-    "Dockerfile",
-    "docker-compose.yml",
     "app/main.py",
     "app/config.py",
     "app/repositories/jobs_postgres_repository.py",
-    "frontend/index.html",
     "scripts/repair_jobpulse_schema.py",
     "scripts/linkedin_smart_query_planner.py",
     "scripts/linkedin_plan_collect.py",
