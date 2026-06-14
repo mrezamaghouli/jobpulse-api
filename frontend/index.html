@@ -3,911 +3,1428 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>JobPulse Dashboard</title>
+  <title>JobPulse Dashboard V2</title>
 
   <style>
+    :root {
+      --bg: #070b12;
+      --panel: #0e1522;
+      --panel-soft: #121c2d;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --border: rgba(255, 255, 255, 0.1);
+      --accent: #22c55e;
+      --accent-soft: rgba(34, 197, 94, 0.16);
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --blue: #38bdf8;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       margin: 0;
-      font-family: Arial, sans-serif;
-      background: #f4f4f5;
-      color: #18181b;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(34, 197, 94, 0.16), transparent 34%),
+        radial-gradient(circle at top right, rgba(56, 189, 248, 0.12), transparent 32%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
     }
 
-    .container {
-      max-width: 1180px;
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .app {
+      width: min(1440px, calc(100% - 32px));
       margin: 0 auto;
-      padding: 32px 20px;
+      padding: 28px 0 48px;
     }
 
-    .header {
-      margin-bottom: 24px;
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 26px;
     }
 
-    .header h1 {
-      margin: 0 0 8px;
-      font-size: 34px;
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
     }
 
-    .header p {
-      margin: 0;
-      color: #71717a;
-      line-height: 1.6;
-    }
-
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-
-    .stat-card,
-    .status-card {
-      background: white;
-      padding: 20px;
+    .logo {
+      width: 46px;
+      height: 46px;
       border-radius: 16px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, var(--accent), #16a34a);
+      box-shadow: 0 12px 40px rgba(34, 197, 94, 0.25);
+      color: #04130a;
+      font-weight: 900;
+      font-size: 20px;
     }
 
-    .stat-card span,
-    .stat-label {
-      display: block;
-      color: #71717a;
-      font-size: 14px;
+    .brand h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: -0.04em;
+    }
+
+    .brand p {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.045);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.13);
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.25fr 0.75fr;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .hero-main {
+      padding: 26px;
+    }
+
+    .hero-main h2 {
+      margin: 0;
+      font-size: 34px;
+      line-height: 1.08;
+      letter-spacing: -0.06em;
+    }
+
+    .hero-main p {
+      color: var(--muted);
+      line-height: 1.7;
+      max-width: 760px;
+      margin: 14px 0 0;
+    }
+
+    .hero-side {
+      padding: 22px;
+      background: linear-gradient(135deg, rgba(34, 197, 94, 0.12), rgba(56, 189, 248, 0.08));
+    }
+
+    .hero-side h3 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .metric-big {
+      font-size: 42px;
+      font-weight: 900;
+      letter-spacing: -0.06em;
+      margin-bottom: 6px;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .stat-card {
+      padding: 18px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.045);
+    }
+
+    .stat-card .label {
+      color: var(--muted);
+      font-size: 12px;
       margin-bottom: 8px;
     }
 
-    .stat-card strong {
-      display: block;
-      font-size: 28px;
-      line-height: 1.2;
+    .stat-card .value {
+      font-size: 24px;
+      font-weight: 850;
+      letter-spacing: -0.04em;
     }
 
-    .status-card h3 {
-      margin: 0 0 8px;
-      font-size: 16px;
+    .filters {
+      padding: 18px;
+      margin-bottom: 18px;
     }
 
-    .status-card p {
-      margin: 4px 0;
-      color: #52525b;
-      line-height: 1.5;
-    }
-
-    .search-box {
-      background: white;
-      padding: 20px;
-      border-radius: 16px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
-      margin-bottom: 24px;
-    }
-
-    .form-grid {
+    .filter-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-      align-items: center;
+      grid-template-columns: 1.4fr 1fr 1fr 0.8fr 0.8fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .field label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 7px;
     }
 
     input,
     select {
-      padding: 12px 14px;
-      border: 1px solid #d4d4d8;
-      border-radius: 10px;
-      font-size: 14px;
-      background: white;
-    }
-
-    label {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: #3f3f46;
+      width: 100%;
+      background: rgba(0, 0, 0, 0.24);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px 13px;
+      color: var(--text);
+      outline: none;
       font-size: 14px;
     }
 
-    button {
-      padding: 12px 18px;
-      border: none;
-      border-radius: 10px;
-      background: #18181b;
-      color: white;
+    input:focus,
+    select:focus {
+      border-color: rgba(34, 197, 94, 0.5);
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.1);
+    }
+
+    option {
+      background: #111827;
+      color: var(--text);
+    }
+
+    .btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      color: #04130a;
+      background: var(--accent);
+      font-weight: 800;
       cursor: pointer;
-      font-size: 14px;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+      white-space: nowrap;
     }
 
-    button:hover {
-      opacity: 0.9;
+    .btn:hover {
+      transform: translateY(-1px);
     }
 
-    .secondary-button {
-      margin-left: 8px;
-      background: #e4e4e7;
-      color: #18181b;
+    .btn.secondary {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
     }
 
-    .results-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-      color: #52525b;
-    }
-
-    #statusMessage {
-      margin-bottom: 16px;
-      color: #71717a;
-    }
-
-    .status-error {
-      background: #fee2e2;
-      color: #991b1b;
-      padding: 12px 16px;
-      border-radius: 12px;
-      margin-bottom: 16px;
-    }
-
-    .status-loading {
-      background: #fef3c7;
-      color: #92400e;
-      padding: 12px 16px;
-      border-radius: 12px;
-      margin-bottom: 16px;
-    }
-
-    .jobs {
+    .main-grid {
       display: grid;
-      gap: 16px;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .jobs-panel {
+      padding: 18px;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      gap: 12px;
+    }
+
+    .section-header h2 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: -0.03em;
+    }
+
+    .job-count {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .job-list {
+      display: grid;
+      gap: 12px;
     }
 
     .job-card {
-      background: white;
-      padding: 20px;
-      border-radius: 16px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.06);
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 18px;
+      transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+      cursor: pointer;
+    }
+
+    .job-card:hover {
+      border-color: rgba(34, 197, 94, 0.38);
+      background: rgba(255, 255, 255, 0.07);
+      transform: translateY(-1px);
+    }
+
+    .job-card.active {
+      border-color: rgba(34, 197, 94, 0.7);
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.09);
+    }
+
+    .job-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
     }
 
     .job-title {
-      font-size: 20px;
-      font-weight: bold;
-      margin-bottom: 6px;
+      font-size: 17px;
+      font-weight: 850;
+      letter-spacing: -0.035em;
+      line-height: 1.35;
     }
 
-    .job-meta {
-      color: #52525b;
-      margin-bottom: 12px;
-      line-height: 1.5;
+    .company-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .company-logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      object-fit: contain;
+      background: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 4px;
+      flex-shrink: 0;
+    }
+
+    .company-logo-placeholder {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 900;
+      flex-shrink: 0;
+      border: 1px solid rgba(34, 197, 94, 0.22);
+    }
+
+    .company-name {
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .company-location {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 2px;
     }
 
     .tags {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 14px;
+      gap: 7px;
+      margin-top: 13px;
     }
 
-    .tag {
-      background: #f4f4f5;
-      border: 1px solid #e4e4e7;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 13px;
-      color: #3f3f46;
-    }
-
-    .links {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
-    .links a {
-      color: #18181b;
-      font-weight: bold;
-      text-decoration: none;
-    }
-
-    .links a:hover {
-      text-decoration: underline;
-    }
-
-    .empty {
-      background: white;
-      padding: 24px;
-      border-radius: 16px;
-      color: #71717a;
-      text-align: center;
-    }
-
-    .pagination {
-      display: flex;
-      justify-content: center;
+    .tag,
+    .meta-tag {
+      display: inline-flex;
       align-items: center;
-      gap: 14px;
-      margin-top: 24px;
+      gap: 4px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.06);
     }
 
-    .pagination button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
+    .tag.green {
+      background: rgba(34, 197, 94, 0.14);
+      color: #86efac;
+      border-color: rgba(34, 197, 94, 0.18);
     }
 
-    #pageInfo {
-      color: #52525b;
+    .tag.blue {
+      background: rgba(56, 189, 248, 0.14);
+      color: #7dd3fc;
+      border-color: rgba(56, 189, 248, 0.18);
+    }
+
+    .tag.orange {
+      background: rgba(245, 158, 11, 0.13);
+      color: #fcd34d;
+      border-color: rgba(245, 158, 11, 0.18);
+    }
+
+    .job-description-preview {
+      margin: 12px 0 0;
+      font-size: 13px;
+      line-height: 1.65;
+      opacity: 0.8;
+      color: #dbeafe;
+    }
+
+    .job-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 14px;
+    }
+
+    .link-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border-radius: 12px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 800;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .link-btn.apply {
+      background: var(--accent);
+      color: #04130a;
+      border-color: transparent;
+    }
+
+    .details-panel {
+      padding: 18px;
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+    }
+
+    .details-empty {
+      color: var(--muted);
+      line-height: 1.7;
+      padding: 22px;
+      border-radius: 18px;
+      border: 1px dashed var(--border);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .details-title {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.25;
+      letter-spacing: -0.045em;
+    }
+
+    .detail-block {
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+    }
+
+    .detail-block h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .job-description-full {
+      margin-top: 10px;
+      font-size: 14px;
+      line-height: 1.75;
+      white-space: pre-line;
+      color: rgba(255, 255, 255, 0.86);
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 10px;
+      margin: 9px 0;
       font-size: 14px;
     }
 
-    .job-details {
-      background: #18181b;
-      color: white;
-      padding: 24px;
-      border-radius: 16px;
-      margin-top: 24px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+    .kv .k {
+      color: var(--muted);
     }
 
-    .job-details h2 {
-      margin-top: 0;
-      margin-bottom: 8px;
+    .kv .v {
+      color: var(--text);
+      overflow-wrap: anywhere;
     }
 
-    .job-details p {
-      color: #d4d4d8;
+    .loading,
+    .error-box {
+      padding: 18px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.045);
+      color: var(--muted);
       line-height: 1.6;
     }
 
-    .job-details-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 12px;
+    .error-box {
+      border-color: rgba(239, 68, 68, 0.28);
+      background: rgba(239, 68, 68, 0.09);
+      color: #fecaca;
+    }
+
+    .footer-note {
       margin-top: 18px;
-    }
-
-    .detail-item {
-      background: #27272a;
-      padding: 12px;
-      border-radius: 12px;
-    }
-
-    .detail-item span {
-      display: block;
+      color: var(--muted);
       font-size: 12px;
-      color: #a1a1aa;
-      margin-bottom: 4px;
+      text-align: center;
     }
 
-    .detail-item strong {
-      font-size: 14px;
-    }
-
-    .close-details {
-      margin-top: 18px;
-      background: white;
-      color: #18181b;
-    }
-
-    .status-ok-text {
-      color: #15803d;
-    }
-
-    .status-error-text {
-      color: #b91c1c;
-    }
-
-    @media (max-width: 900px) {
-      .stats {
+    @media (max-width: 1100px) {
+      .hero,
+      .main-grid {
         grid-template-columns: 1fr;
       }
 
-      .form-grid {
-        grid-template-columns: 1fr;
+      .details-panel {
+        position: static;
+        max-height: none;
       }
 
-      .job-details-grid {
-        grid-template-columns: 1fr;
+      .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
       }
 
-      .results-header {
-        flex-direction: column;
+      .filter-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .app {
+        width: min(100% - 20px, 1440px);
+        padding-top: 18px;
+      }
+
+      .topbar {
         align-items: flex-start;
-        gap: 8px;
+        flex-direction: column;
+      }
+
+      .hero-main h2 {
+        font-size: 27px;
+      }
+
+      .stats-grid,
+      .filter-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .job-top {
+        flex-direction: column;
+      }
+
+      .kv {
+        grid-template-columns: 1fr;
       }
     }
   </style>
 </head>
 
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>JobPulse Dashboard</h1>
-      <p>
-        Search and monitor authorized LinkedIn job listings collected into PostgreSQL.
-      </p>
-    </div>
-
-    <div class="stats">
-      <div class="stat-card">
-        <span>Total Jobs</span>
-        <strong id="totalJobs">-</strong>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">JP</div>
+        <div>
+          <h1>JobPulse</h1>
+          <p>LinkedIn job intelligence dashboard</p>
+        </div>
       </div>
 
-      <div class="stat-card">
-        <span>LinkedIn Jobs</span>
-        <strong id="linkedinJobs">-</strong>
+      <div class="status-pill">
+        <span class="status-dot"></span>
+        <span id="apiStatus">Connecting to API...</span>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="panel hero-main">
+        <h2>Search, monitor, and inspect collected job listings.</h2>
+        <p>
+          This dashboard reads from your JobPulse API and shows collected jobs with apply links,
+          company logos, work mode, posting text, and job descriptions.
+        </p>
       </div>
 
-      <div class="stat-card">
-        <span>Active Jobs</span>
-        <strong id="activeLinkedinJobs">-</strong>
+      <div class="panel hero-side">
+        <h3>Total LinkedIn Jobs</h3>
+        <div class="metric-big" id="heroTotalJobs">—</div>
+        <div class="muted" id="heroLastSeen">Waiting for data...</div>
       </div>
+    </section>
 
+    <section class="stats-grid">
       <div class="stat-card">
-        <span>Remote Jobs</span>
-        <strong id="remoteJobs">-</strong>
-      </div>
-
-      <div class="stat-card">
-        <span>Companies</span>
-        <strong id="totalCompanies">-</strong>
-      </div>
-
-      <div class="stat-card">
-        <span>Locations</span>
-        <strong id="totalLocations">-</strong>
-      </div>
-
-      <div class="stat-card">
-        <span>Last Job Update</span>
-        <strong id="lastLinkedinJobSeenAt">-</strong>
+        <div class="label">Apply Coverage</div>
+        <div class="value" id="statApplyCoverage">—</div>
       </div>
 
       <div class="stat-card">
-        <span>System Status</span>
-        <strong id="systemStatus">-</strong>
+        <div class="label">Description Coverage</div>
+        <div class="value" id="statDescriptionCoverage">—</div>
       </div>
 
-      <div class="status-card">
-        <h3>System Health</h3>
-        <p id="healthStatus">Checking...</p>
+      <div class="stat-card">
+        <div class="label">Logo Coverage</div>
+        <div class="value" id="statLogoCoverage">—</div>
       </div>
 
-      <div class="status-card">
-        <h3>Last LinkedIn Collector Run</h3>
-        <p id="collectorStatus">Loading...</p>
-        <p id="collectorDetails"></p>
-      </div>
-    </div>
-
-    <div class="search-box">
-      <div class="form-grid">
-        <input id="titleInput" type="text" placeholder="Job title, e.g. UX, Data, Frontend" />
-        <input id="locationInput" type="text" placeholder="Location, e.g. Berlin, Germany" />
-
-        <select id="seniorityInput">
-          <option value="">Any seniority</option>
-          <option value="Junior">Junior</option>
-          <option value="Mid">Mid</option>
-          <option value="Senior">Senior</option>
-        </select>
-
-        <select id="jobTypeInput">
-          <option value="">Any job type</option>
-          <option value="Full-time">Full-time</option>
-          <option value="Part-time">Part-time</option>
-          <option value="Contract">Contract</option>
-          <option value="Internship">Internship</option>
-        </select>
-
-        <input id="minSalaryInput" type="number" placeholder="Min salary, e.g. 60000" />
-
-        <select id="sortByInput">
-          <option value="date_posted">Sort by date</option>
-          <option value="salary_max">Sort by max salary</option>
-          <option value="salary_min">Sort by min salary</option>
-          <option value="title">Sort by title</option>
-          <option value="company">Sort by company</option>
-        </select>
-
-        <select id="sortOrderInput">
-          <option value="desc">Descending</option>
-          <option value="asc">Ascending</option>
-        </select>
-
-        <label>
-          <input id="remoteInput" type="checkbox" />
-          Remote only
-        </label>
+      <div class="stat-card">
+        <div class="label">Overall Quality</div>
+        <div class="value" id="statOverallQuality">—</div>
       </div>
 
-      <br />
+      <div class="stat-card">
+        <div class="label">Total Jobs</div>
+        <div class="value" id="statTotal">—</div>
+      </div>
 
-      <button onclick="searchJobs(1)">Search Jobs</button>
-      <button onclick="resetFilters()" class="secondary-button">Reset</button>
-    </div>
+      <div class="stat-card">
+        <div class="label">With Apply URL</div>
+        <div class="value" id="statApply">—</div>
+      </div>
 
-    <div class="results-header">
-      <div id="resultCount">Results: -</div>
-      <div>Source: LinkedIn</div>
-    </div>
+      <div class="stat-card">
+        <div class="label">With Description</div>
+        <div class="value" id="statDescriptions">—</div>
+      </div>
 
-    <div id="statusMessage"></div>
+      <div class="stat-card">
+        <div class="label">With Logo</div>
+        <div class="value" id="statLogos">—</div>
+      </div>
 
-    <div id="jobsContainer" class="jobs"></div>
+      <div class="stat-card">
+        <div class="label">Companies Logo</div>
+        <div class="value" id="statCompanyLogos">—</div>
+      </div>
 
-    <div id="jobDetailsContainer"></div>
+      <div class="stat-card">
+        <div class="label">Companies About</div>
+        <div class="value" id="statCompanyAbout">—</div>
+      </div>
 
-    <div class="pagination">
-      <button id="prevButton" onclick="goToPreviousPage()">Previous</button>
-      <span id="pageInfo">Page - of -</span>
-      <button id="nextButton" onclick="goToNextPage()">Next</button>
+      <div class="stat-card">
+        <div class="label">Easy Apply</div>
+        <div class="value" id="statEasy">—</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="label">External Apply</div>
+        <div class="value" id="statExternal">—</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="label">Companies</div>
+        <div class="value" id="statCompanies">—</div>
+      </div>
+    </section>
+
+    <section class="panel filters">
+      <div class="filter-grid">
+        <div class="field">
+          <label>Search title / company / description</label>
+          <input id="searchInput" placeholder="Data Analyst, Full Stack, Product..." />
+        </div>
+
+        <div class="field">
+          <label>Location</label>
+          <input id="locationInput" placeholder="Germany, Dubai, Remote..." />
+        </div>
+
+        <div class="field">
+          <label>Company</label>
+          <input id="companyInput" placeholder="Company name..." />
+        </div>
+
+        <div class="field">
+          <label>Apply Type</label>
+          <select id="applyTypeInput">
+            <option value="">All</option>
+            <option value="easy_apply">Easy Apply</option>
+            <option value="external">External</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Work Mode</label>
+          <select id="workModeInput">
+            <option value="">All</option>
+            <option value="remote">Remote</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="onsite">On-site</option>
+          </select>
+        </div>
+
+        <button class="btn" onclick="applyFilters()">Search</button>
+      </div>
+    </section>
+
+    <main class="main-grid">
+      <section class="panel jobs-panel">
+        <div class="section-header">
+          <h2>Jobs</h2>
+          <div class="job-count" id="jobCount">Loading...</div>
+        </div>
+
+        <div id="jobsContainer" class="job-list">
+          <div class="loading">Loading jobs from API...</div>
+        </div>
+
+        <div style="margin-top: 14px; display: flex; justify-content: center;">
+          <button class="btn secondary" id="loadMoreButton" onclick="loadMoreJobs()">
+            Load More
+          </button>
+        </div>
+      </section>
+
+      <aside class="panel details-panel">
+        <div class="section-header">
+          <h2>Details</h2>
+          <button class="btn secondary" onclick="reloadData()">Refresh</button>
+        </div>
+
+        <div id="detailsContainer">
+          <div class="details-empty">
+            Select a job from the list to see its full description, apply link,
+            company details, and collected metadata.
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <div class="footer-note">
+      JobPulse API: <span id="apiBaseLabel"></span>
     </div>
   </div>
 
-  <script src="config.js"></script>
-
   <script>
-    const API_BASE_URL =
-      window.JOBPULSE_CONFIG?.API_BASE_URL || "http://127.0.0.1:8000";
+    const API_BASE_URL = window.JOBPULSE_API_URL || 'http://127.0.0.1:8000';
 
+    let allJobs = [];
+    let filteredJobs = [];
+    let selectedJobId = null;
     let currentPage = 1;
-    let totalPages = 0;
-    const pageLimit = 5;
+    const pageSize = 50;
+    let isLoadingMore = false;
+    let hasMoreJobs = true;
 
-    function setText(id, value) {
-      const element = document.getElementById(id);
+    document.getElementById('apiBaseLabel').textContent = API_BASE_URL;
 
-      if (element) {
-        element.textContent = value;
+    function escapeHtml(value) {
+      if (value === null || value === undefined) {
+        return '';
       }
+
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
     }
 
-    function formatDateTime(value) {
+    function shortenText(value, maxLength = 220) {
       if (!value) {
-        return "-";
+        return '';
       }
 
-      const date = new Date(value);
+      const cleanValue = String(value).replace(/\s+/g, ' ').trim();
 
-      if (Number.isNaN(date.getTime())) {
-        return value;
+      if (cleanValue.length <= maxLength) {
+        return cleanValue;
       }
 
-      return date.toLocaleString();
+      return cleanValue.slice(0, maxLength).trim() + '...';
+    }
+
+    function formatNumber(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return '0';
+      }
+
+      return Number(value).toLocaleString();
+    }
+
+    function normalizeText(value) {
+      return String(value || '').toLowerCase().trim();
+    }
+
+    function getCompanyInitial(company) {
+      const clean = String(company || 'Company').trim();
+
+      if (!clean) {
+        return 'C';
+      }
+
+      return clean[0].toUpperCase();
     }
 
     function getApplyTag(job) {
-      if (job.apply_type === "easy_apply") {
-        return "Easy Apply";
+      const applyType = job.apply_type || 'unknown';
+
+      if (applyType === 'easy_apply') {
+        return '<span class="tag green">Easy Apply</span>';
       }
 
-      if (job.apply_type === "external") {
-        return "External Apply";
+      if (applyType === 'external') {
+        return '<span class="tag blue">External Apply</span>';
       }
 
-      return "Apply unknown";
+      return '<span class="tag orange">Unknown Apply</span>';
     }
 
     function getApplyButtonText(job) {
-      if (job.apply_type === "easy_apply") {
-        return "Easy Apply on LinkedIn";
-      }
-
       if (job.apply_label) {
         return job.apply_label;
       }
 
-      return "Apply";
+      if (job.apply_type === 'easy_apply') {
+        return 'Easy Apply';
+      }
+
+      if (job.apply_type === 'external') {
+        return 'Apply';
+      }
+
+      return 'Open Job';
+    }
+
+    function getApplyUrl(job) {
+      return job.apply_url || job.job_url;
+    }
+
+    function renderCompanyLogo(job) {
+      if (job.company_logo_url) {
+        return `
+          <img
+            src="${escapeHtml(job.company_logo_url)}"
+            alt="${escapeHtml(job.company || 'Company')} logo"
+            class="company-logo"
+            loading="lazy"
+            onerror="this.outerHTML='<div class=&quot;company-logo-placeholder&quot;>${escapeHtml(getCompanyInitial(job.company))}</div>'"
+          />
+        `;
+      }
+
+      return `
+        <div class="company-logo-placeholder">
+          ${escapeHtml(getCompanyInitial(job.company))}
+        </div>
+      `;
+    }
+
+    function renderTags(job) {
+      const tags = [];
+
+      tags.push(getApplyTag(job));
+
+      if (job.work_mode) {
+        tags.push(`<span class="meta-tag">${escapeHtml(job.work_mode)}</span>`);
+      }
+
+      if (job.remote) {
+        tags.push('<span class="meta-tag">Remote</span>');
+      }
+
+      if (job.date_posted_text) {
+        tags.push(`<span class="meta-tag">${escapeHtml(shortenText(job.date_posted_text, 70))}</span>`);
+      } else if (job.date_posted) {
+        tags.push(`<span class="meta-tag">Posted: ${escapeHtml(job.date_posted)}</span>`);
+      }
+
+      if (job.source) {
+        tags.push(`<span class="meta-tag">${escapeHtml(job.source)}</span>`);
+      }
+
+      return tags.join('');
+    }
+
+    function createJobCard(job) {
+      const isActive = selectedJobId === job.id;
+      const applyUrl = getApplyUrl(job);
+
+      return `
+        <article class="job-card ${isActive ? 'active' : ''}" onclick="selectJob(${job.id})">
+          <div class="job-top">
+            <div>
+              <div class="job-title">${escapeHtml(job.title || 'Untitled Job')}</div>
+
+              <div class="company-row">
+                ${renderCompanyLogo(job)}
+                <div>
+                  <div class="company-name">${escapeHtml(job.company || 'Unknown Company')}</div>
+                  <div class="company-location">${escapeHtml(job.location || 'Unknown Location')}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tags">
+            ${renderTags(job)}
+          </div>
+
+          ${job.job_description ? `
+            <p class="job-description-preview">
+              ${escapeHtml(shortenText(job.job_description, 280))}
+            </p>
+          ` : ''}
+
+          <div class="job-actions" onclick="event.stopPropagation()">
+            <a
+              class="link-btn apply"
+              href="${escapeHtml(applyUrl)}"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              ${escapeHtml(getApplyButtonText(job))} ↗
+            </a>
+
+            <a
+              class="link-btn"
+              href="${escapeHtml(job.job_url)}"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Job
+            </a>
+
+            ${job.company_linkedin_url ? `
+              <a
+                class="link-btn"
+                href="${escapeHtml(job.company_linkedin_url)}"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Company
+              </a>
+            ` : ''}
+          </div>
+        </article>
+      `;
+    }
+
+    function renderJobs() {
+      const container = document.getElementById('jobsContainer');
+      const countLabel = document.getElementById('jobCount');
+
+      countLabel.textContent = `${formatNumber(filteredJobs.length)} shown / ${formatNumber(allJobs.length)} loaded`;
+
+      if (!filteredJobs.length) {
+        container.innerHTML = `
+          <div class="loading">
+            No jobs matched your current filters.
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = filteredJobs.map(createJobCard).join('');
+    }
+
+    function renderDetails(job) {
+      const container = document.getElementById('detailsContainer');
+
+      if (!job) {
+        container.innerHTML = `
+          <div class="details-empty">
+            Select a job from the list to see its full description, apply link,
+            company details, and collected metadata.
+          </div>
+        `;
+        return;
+      }
+
+      const applyUrl = getApplyUrl(job);
+
+      container.innerHTML = `
+        <h2 class="details-title">${escapeHtml(job.title || 'Untitled Job')}</h2>
+
+        <div class="company-row">
+          ${renderCompanyLogo(job)}
+          <div>
+            <div class="company-name">${escapeHtml(job.company || 'Unknown Company')}</div>
+            <div class="company-location">${escapeHtml(job.location || 'Unknown Location')}</div>
+          </div>
+        </div>
+
+        <div class="tags">
+          ${renderTags(job)}
+        </div>
+
+        <div class="job-actions">
+          <a
+            class="link-btn apply"
+            href="${escapeHtml(applyUrl)}"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            ${escapeHtml(getApplyButtonText(job))} ↗
+          </a>
+
+          <a
+            class="link-btn"
+            href="${escapeHtml(job.job_url)}"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open LinkedIn Job
+          </a>
+
+          ${job.company_linkedin_url ? `
+            <a
+              class="link-btn"
+              href="${escapeHtml(job.company_linkedin_url)}"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Company
+            </a>
+          ` : ''}
+        </div>
+
+        <div class="detail-block">
+          <h3>Metadata</h3>
+
+          <div class="kv">
+            <div class="k">Job ID</div>
+            <div class="v">${escapeHtml(job.linkedin_job_id || job.id)}</div>
+          </div>
+
+          <div class="kv">
+            <div class="k">Apply Type</div>
+            <div class="v">${escapeHtml(job.apply_type || 'unknown')}</div>
+          </div>
+
+          <div class="kv">
+            <div class="k">Work Mode</div>
+            <div class="v">${escapeHtml(job.work_mode || (job.remote ? 'remote' : 'unknown'))}</div>
+          </div>
+
+          <div class="kv">
+            <div class="k">Date Posted</div>
+            <div class="v">${escapeHtml(job.date_posted_text || job.date_posted || 'unknown')}</div>
+          </div>
+
+          <div class="kv">
+            <div class="k">First Seen</div>
+            <div class="v">${escapeHtml(job.first_seen_at || 'unknown')}</div>
+          </div>
+
+          <div class="kv">
+            <div class="k">Last Seen</div>
+            <div class="v">${escapeHtml(job.last_seen_at || 'unknown')}</div>
+          </div>
+        </div>
+
+        ${job.job_description ? `
+          <div class="detail-block">
+            <h3>Job Description</h3>
+            <div class="job-description-full">
+              ${escapeHtml(job.job_description)}
+            </div>
+          </div>
+        ` : `
+          <div class="detail-block">
+            <h3>Job Description</h3>
+            <div class="muted">
+              No job description was captured for this listing yet.
+            </div>
+          </div>
+        `}
+      `;
+    }
+
+    function selectJob(jobId) {
+      selectedJobId = jobId;
+
+      const job = allJobs.find((item) => item.id === jobId);
+
+      renderJobs();
+      renderDetails(job);
+    }
+
+    async function applyFilters() {
+      const container = document.getElementById('jobsContainer');
+      const button = document.getElementById('loadMoreButton');
+
+      if (container) {
+        container.innerHTML = '<div class="loading">Loading filtered jobs from API...</div>';
+      }
+
+      currentPage = 1;
+      hasMoreJobs = true;
+      selectedJobId = null;
+
+      try {
+        allJobs = await loadJobs(currentPage, pageSize);
+        filteredJobs = [...allJobs];
+
+        if (allJobs.length < pageSize) {
+          hasMoreJobs = false;
+        }
+
+        if (filteredJobs.length) {
+          selectedJobId = filteredJobs[0].id;
+        }
+
+        renderJobs();
+
+        if (selectedJobId) {
+          renderDetails(allJobs.find((job) => job.id === selectedJobId));
+        } else {
+          renderDetails(null);
+        }
+
+        if (button) {
+          button.textContent = hasMoreJobs ? 'Load More' : 'No more jobs';
+          button.disabled = !hasMoreJobs;
+        }
+
+      } catch (error) {
+        console.error(error);
+
+        if (container) {
+          container.innerHTML = `
+            <div class="error-box">
+              Could not load filtered jobs from API.<br />
+              ${escapeHtml(error.message)}
+            </div>
+          `;
+        }
+      }
+    }
+
+    async function fetchJson(path) {
+      const response = await fetch(`${API_BASE_URL}${path}`);
+
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+
+      return await response.json();
     }
 
     async function loadStats() {
       try {
-        const response = await fetch(`${API_BASE_URL}/jobs/stats`);
+        const stats = await fetchJson('/jobs/stats');
 
-        if (!response.ok) {
-          throw new Error(`Stats API error: ${response.status}`);
-        }
+        const total =
+          stats.linkedin_jobs ??
+          stats.total_linkedin_jobs ??
+          stats.total_jobs ??
+          0;
 
-        const stats = await response.json();
+        document.getElementById('heroTotalJobs').textContent = formatNumber(total);
+        document.getElementById('statTotal').textContent = formatNumber(total);
+        document.getElementById('statApply').textContent = formatNumber(stats.jobs_with_apply_url ?? 0);
+        document.getElementById('statEasy').textContent = formatNumber(stats.easy_apply_jobs ?? 0);
+        document.getElementById('statExternal').textContent = formatNumber(stats.external_apply_jobs ?? 0);
+        document.getElementById('statCompanies').textContent = formatNumber(stats.total_companies ?? 0);
 
-        setText("totalJobs", stats.total_jobs ?? 0);
-        setText("linkedinJobs", stats.linkedin_jobs ?? 0);
-        setText("activeLinkedinJobs", stats.active_linkedin_jobs ?? 0);
-        setText("remoteJobs", stats.remote_jobs ?? 0);
-        setText("totalCompanies", stats.total_companies ?? 0);
-        setText("totalLocations", stats.total_locations ?? 0);
-        setText("lastLinkedinJobSeenAt", formatDateTime(stats.last_linkedin_job_seen_at));
+        const lastSeen =
+          stats.last_linkedin_job_seen_at ||
+          stats.newest_linkedin_job_first_seen_at ||
+          '';
+
+        document.getElementById('heroLastSeen').textContent = lastSeen
+          ? `Last seen: ${lastSeen}`
+          : 'No last-seen timestamp yet.';
+
       } catch (error) {
-        console.error("Stats error:", error);
+        console.warn('Could not load stats:', error);
       }
     }
 
-    async function loadHealthStatus() {
-      const systemStatusElement = document.getElementById("systemStatus");
-      const healthStatusElement = document.getElementById("healthStatus");
-
+    async function loadQuality() {
       try {
-        const response = await fetch(`${API_BASE_URL}/health`);
+        const quality = await fetchJson('/jobs/quality');
 
-        if (!response.ok) {
-          throw new Error(`Health API error: ${response.status}`);
-        }
+        const jobs = quality.jobs || {};
+        const companies = quality.companies || {};
+        const scores = quality.quality_scores || {};
 
-        const health = await response.json();
+        document.getElementById('statApplyCoverage').textContent =
+          `${scores.apply_coverage ?? 0}%`;
 
-        if (health.status === "ok" && health.database === "connected") {
-          systemStatusElement.textContent = "Healthy";
-          systemStatusElement.className = "status-ok-text";
-          healthStatusElement.textContent = "API connected · PostgreSQL connected";
-          return;
-        }
+        document.getElementById('statDescriptionCoverage').textContent =
+          `${scores.description_coverage ?? 0}%`;
 
-        systemStatusElement.textContent = "Issue";
-        systemStatusElement.className = "status-error-text";
-        healthStatusElement.textContent = "API running · Database disconnected";
+        document.getElementById('statLogoCoverage').textContent =
+          `${scores.logo_coverage ?? 0}%`;
+
+        document.getElementById('statOverallQuality').textContent =
+          `${scores.overall_quality_score ?? 0}%`;
+
+        document.getElementById('statDescriptions').textContent =
+          formatNumber(jobs.jobs_with_description ?? 0);
+
+        document.getElementById('statLogos').textContent =
+          formatNumber(jobs.jobs_with_company_logo ?? 0);
+
+        document.getElementById('statCompanyLogos').textContent =
+          formatNumber(companies.companies_with_logo ?? 0);
+
+        document.getElementById('statCompanyAbout').textContent =
+          formatNumber(companies.companies_with_about ?? 0);
+
       } catch (error) {
-        console.error("Health status error:", error);
-
-        systemStatusElement.textContent = "Offline";
-        systemStatusElement.className = "status-error-text";
-        healthStatusElement.textContent = "API unavailable";
+        console.warn('Could not load quality summary:', error);
       }
     }
 
-    async function loadCollectorStatus() {
-      const statusElement = document.getElementById("collectorStatus");
-      const detailsElement = document.getElementById("collectorDetails");
 
-      try {
-        const response = await fetch(`${API_BASE_URL}/collector-runs/latest`);
-
-        if (!response.ok) {
-          throw new Error(`Collector API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        if (data.status === "empty") {
-          statusElement.textContent = "No LinkedIn update has been recorded yet.";
-          detailsElement.textContent = "";
-          return;
-        }
-
-        const statusLabel = data.status === "success" ? "Success" : "Failed";
-        const startedAt = formatDateTime(data.started_at);
-
-        statusElement.textContent = `${statusLabel} · ${startedAt}`;
-        detailsElement.textContent =
-          `${data.keywords || "Unknown keywords"} · ` +
-          `${data.location || "Unknown location"} · ` +
-          `${data.duration_seconds || 0}s`;
-      } catch (error) {
-        statusElement.textContent = "Could not load LinkedIn update status.";
-        detailsElement.textContent = "";
-        console.error("Collector status error:", error);
-      }
-    }
-
-    async function searchJobs(page = 1) {
-      currentPage = page;
-
-      const title = document.getElementById("titleInput").value.trim();
-      const location = document.getElementById("locationInput").value.trim();
-      const remoteOnly = document.getElementById("remoteInput").checked;
-
-      const seniority = document.getElementById("seniorityInput").value;
-      const jobType = document.getElementById("jobTypeInput").value;
-      const minSalary = document.getElementById("minSalaryInput").value;
-      const sortBy = document.getElementById("sortByInput").value;
-      const sortOrder = document.getElementById("sortOrderInput").value;
-
-      const statusMessage = document.getElementById("statusMessage");
-      statusMessage.className = "status-loading";
-      statusMessage.textContent = "Loading jobs...";
-
-      document.getElementById("jobDetailsContainer").innerHTML = "";
-
+    function buildJobsQueryParams(page = 1, limit = pageSize) {
       const params = new URLSearchParams();
 
-      params.append("source", "linkedin");
-      params.append("page", currentPage.toString());
-      params.append("limit", pageLimit.toString());
-      params.append("sort_by", sortBy);
-      params.append("sort_order", sortOrder);
+      const search = document.getElementById('searchInput').value.trim();
+      const location = document.getElementById('locationInput').value.trim();
+      const company = document.getElementById('companyInput').value.trim();
+      const applyType = document.getElementById('applyTypeInput').value.trim();
+      const workMode = document.getElementById('workModeInput').value.trim();
 
-      if (title) {
-        params.append("title", title);
+      params.set('page', page);
+      params.set('limit', limit);
+      params.set('active_only', 'true');
+      params.set('sort_by', 'last_seen_at');
+      params.set('sort_order', 'desc');
+
+      if (search) {
+        params.set('query', search);
       }
 
       if (location) {
-        params.append("location", location);
+        params.set('location', location);
       }
 
-      if (remoteOnly) {
-        params.append("remote", "true");
+      if (company) {
+        params.set('company', company);
       }
 
-      if (seniority) {
-        params.append("seniority", seniority);
+      if (applyType) {
+        params.set('apply_type', applyType);
       }
 
-      if (jobType) {
-        params.append("job_type", jobType);
+      if (workMode) {
+        params.set('work_mode', workMode);
       }
 
-      if (minSalary) {
-        params.append("min_salary", minSalary);
-      }
-
-      const apiUrl = `${API_BASE_URL}/jobs/search?${params.toString()}`;
-
-      try {
-        const response = await fetch(apiUrl);
-
-        if (!response.ok) {
-          throw new Error(`Search API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        totalPages = data.total_pages || 0;
-
-        setText("resultCount", `Results: ${data.count ?? 0}`);
-
-        renderJobs(data.results || []);
-        renderPagination(data.page || 0, data.total_pages || 0);
-
-        statusMessage.className = "";
-        statusMessage.textContent = "";
-      } catch (error) {
-        console.error("Search error:", error);
-
-        statusMessage.className = "status-error";
-        statusMessage.textContent = "Could not load jobs. Check if the API server is running.";
-
-        document.getElementById("jobsContainer").innerHTML = "";
-        setText("resultCount", "Results: -");
-        renderPagination(0, 0);
-      }
+      return params.toString();
     }
 
-    function renderJobs(jobs) {
-      const container = document.getElementById("jobsContainer");
-      container.innerHTML = "";
+    async function loadJobs(page = 1, limit = pageSize) {
+      const queryString = buildJobsQueryParams(page, limit);
+      const jobs = await fetchJson(`/jobs?${queryString}`);
 
-      if (!jobs.length) {
-        container.innerHTML = `<div class="empty">No jobs found.</div>`;
+      if (Array.isArray(jobs)) {
+        return jobs;
+      }
+
+      if (jobs && Array.isArray(jobs.value)) {
+        return jobs.value;
+      }
+
+      if (jobs && Array.isArray(jobs.jobs)) {
+        return jobs.jobs;
+      }
+
+      if (jobs && Array.isArray(jobs.results)) {
+        return jobs.results;
+      }
+
+      return [];
+    }
+
+    async function loadMoreJobs() {
+      if (isLoadingMore || !hasMoreJobs) {
         return;
       }
 
-      jobs.forEach((job) => {
-        const card = document.createElement("div");
-        card.className = "job-card";
+      isLoadingMore = true;
 
-        const salary = job.salary_min && job.salary_max
-          ? `${Number(job.salary_min).toLocaleString()} - ${Number(job.salary_max).toLocaleString()} ${job.currency || ""}`
-          : "Salary not provided";
+      const button = document.getElementById('loadMoreButton');
 
-        card.innerHTML = `
-          <div class="job-title">${job.title || "Untitled job"}</div>
-          <div class="job-meta">${job.company || "Unknown Company"} • ${job.location || "Unknown Location"}</div>
-
-          <div class="tags">
-            <span class="tag">${job.remote ? "Remote" : "On-site"}</span>
-            <span class="tag">${job.job_type || "Job type unknown"}</span>
-            <span class="tag">${job.seniority || "Seniority unknown"}</span>
-            <span class="tag">${salary}</span>
-            <span class="tag">${job.date_posted || "Date unknown"}</span>
-            <span class="tag">${getApplyTag(job)}</span>
-          </div>
-
-          <div class="job-meta">
-            Poster: ${job.poster_name || "Unknown"}
-            ${job.poster_title ? `• ${job.poster_title}` : ""}
-          </div>
-
-          <div class="links">
-            ${job.job_url ? `
-              <a href="${job.job_url}" target="_blank" rel="noopener noreferrer">
-                Open Job
-              </a>
-            ` : ""}
-
-            ${job.apply_url ? `
-              <a href="${job.apply_url}" target="_blank" rel="noopener noreferrer">
-                ${getApplyButtonText(job)}
-              </a>
-            ` : ""}
-
-            <a href="#" onclick="viewJobDetails(${job.id}); return false;">
-              View Details
-            </a>
-
-            ${job.company_linkedin_url ? `
-              <a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer">
-                Company LinkedIn
-              </a>
-            ` : ""}
-          </div>
-        `;
-
-        container.appendChild(card);
-      });
-    }
-
-    function renderPagination(page, total) {
-      const pageInfo = document.getElementById("pageInfo");
-      const prevButton = document.getElementById("prevButton");
-      const nextButton = document.getElementById("nextButton");
-
-      if (total === 0) {
-        pageInfo.textContent = "Page 0 of 0";
-        prevButton.disabled = true;
-        nextButton.disabled = true;
-        return;
+      if (button) {
+        button.textContent = 'Loading...';
+        button.disabled = true;
       }
-
-      pageInfo.textContent = `Page ${page} of ${total}`;
-
-      prevButton.disabled = page <= 1;
-      nextButton.disabled = page >= total;
-    }
-
-    function goToPreviousPage() {
-      if (currentPage > 1) {
-        searchJobs(currentPage - 1);
-      }
-    }
-
-    function goToNextPage() {
-      if (currentPage < totalPages) {
-        searchJobs(currentPage + 1);
-      }
-    }
-
-    function resetFilters() {
-      document.getElementById("titleInput").value = "";
-      document.getElementById("locationInput").value = "";
-      document.getElementById("remoteInput").checked = false;
-
-      document.getElementById("seniorityInput").value = "";
-      document.getElementById("jobTypeInput").value = "";
-      document.getElementById("minSalaryInput").value = "";
-      document.getElementById("sortByInput").value = "date_posted";
-      document.getElementById("sortOrderInput").value = "desc";
-
-      currentPage = 1;
-      searchJobs(1);
-    }
-
-    async function viewJobDetails(jobId) {
-      const detailsContainer = document.getElementById("jobDetailsContainer");
-
-      detailsContainer.innerHTML = `
-        <div class="job-details">
-          <p>Loading job details...</p>
-        </div>
-      `;
 
       try {
-        const response = await fetch(`${API_BASE_URL}/jobs/${jobId}`);
+        const nextPage = currentPage + 1;
+        const nextJobs = await loadJobs(nextPage, pageSize);
 
-        if (!response.ok) {
-          throw new Error(`Job details API error: ${response.status}`);
+        if (!nextJobs.length) {
+          hasMoreJobs = false;
+
+          if (button) {
+            button.textContent = 'No more jobs';
+            button.disabled = true;
+          }
+
+          return;
         }
 
-        const job = await response.json();
+        allJobs = [...allJobs, ...nextJobs];
+        currentPage = nextPage;
 
-        const salary = job.salary_min && job.salary_max
-          ? `${Number(job.salary_min).toLocaleString()} - ${Number(job.salary_max).toLocaleString()} ${job.currency || ""}`
-          : "Salary not provided";
+        if (nextJobs.length < pageSize) {
+          hasMoreJobs = false;
+        }
 
-        detailsContainer.innerHTML = `
-          <div class="job-details">
-            <h2>${job.title || "Untitled job"}</h2>
-            <p>${job.company || "Unknown Company"} • ${job.location || "Unknown Location"}</p>
+        applyFilters();
 
-            <div class="job-details-grid">
-              <div class="detail-item">
-                <span>LinkedIn Job ID</span>
-                <strong>${job.linkedin_job_id || "Not provided"}</strong>
-              </div>
+        if (button) {
+          button.textContent = hasMoreJobs ? 'Load More' : 'No more jobs';
+          button.disabled = !hasMoreJobs;
+        }
 
-              <div class="detail-item">
-                <span>Work Mode</span>
-                <strong>${job.remote ? "Remote" : "On-site"}</strong>
-              </div>
+      } catch (error) {
+        console.error(error);
 
-              <div class="detail-item">
-                <span>Job Type</span>
-                <strong>${job.job_type || "Unknown"}</strong>
-              </div>
+        if (button) {
+          button.textContent = 'Load failed';
+          button.disabled = false;
+        }
 
-              <div class="detail-item">
-                <span>Seniority</span>
-                <strong>${job.seniority || "Unknown"}</strong>
-              </div>
+      } finally {
+        isLoadingMore = false;
+      }
+    }
 
-              <div class="detail-item">
-                <span>Salary</span>
-                <strong>${salary}</strong>
-              </div>
+    async function reloadData() {
+      const status = document.getElementById('apiStatus');
+      const container = document.getElementById('jobsContainer');
 
-              <div class="detail-item">
-                <span>Date Posted</span>
-                <strong>${job.date_posted || "Unknown"}</strong>
-              </div>
+      status.textContent = 'Loading...';
+      container.innerHTML = '<div class="loading">Loading jobs from API...</div>';
 
-              <div class="detail-item">
-                <span>Poster</span>
-                <strong>${job.poster_name || "Unknown"}</strong>
-              </div>
+      try {
+        await loadStats();
+        await loadQuality();
+        await applyFilters();
 
-              <div class="detail-item">
-                <span>Poster Title</span>
-                <strong>${job.poster_title || "Unknown"}</strong>
-              </div>
+        status.textContent = 'API Connected';
 
-              <div class="detail-item">
-                <span>Apply Type</span>
-                <strong>${job.apply_type || "Unknown"}</strong>
-              </div>
+        currentPage = 1;
+        hasMoreJobs = true;
 
-              <div class="detail-item">
-                <span>Apply Link</span>
-                <strong>${job.apply_url ? "Available" : "Not available"}</strong>
-              </div>
-            </div>
+        // allJobs = await loadJobs(currentPage, pageSize);
+        // filteredJobs = [...allJobs];
 
-            <div class="links" style="margin-top: 18px;">
-              ${job.job_url ? `
-                <a href="${job.job_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                  Open Job
-                </a>
-              ` : ""}
+        if (allJobs.length < pageSize) {
+          hasMoreJobs = false;
+        }
 
-              ${job.apply_url ? `
-                <a href="${job.apply_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                  ${getApplyButtonText(job)}
-                </a>
-              ` : ""}
+        const loadMoreButton = document.getElementById('loadMoreButton');
 
-              ${job.poster_profile_url ? `
-                <a href="${job.poster_profile_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                  Open Poster Profile
-                </a>
-              ` : ""}
+        if (loadMoreButton) {
+          loadMoreButton.textContent = hasMoreJobs ? 'Load More' : 'No more jobs';
+          loadMoreButton.disabled = !hasMoreJobs;
+        }
 
-              ${job.company_linkedin_url ? `
-                <a href="${job.company_linkedin_url}" target="_blank" rel="noopener noreferrer" style="color:white;">
-                  Company LinkedIn
-                </a>
-              ` : ""}
-            </div>
+        if (!selectedJobId && filteredJobs.length) {
+          selectedJobId = filteredJobs[0].id;
+        }
 
-            <button class="close-details" onclick="closeJobDetails()">Close Details</button>
+        applyFilters();
+
+        status.textContent = 'API Connected';
+
+      } catch (error) {
+        console.error(error);
+
+        status.textContent = 'API Error';
+
+        container.innerHTML = `
+          <div class="error-box">
+            Could not load jobs from API.<br />
+            ${escapeHtml(error.message)}
           </div>
         `;
 
-        detailsContainer.scrollIntoView({ behavior: "smooth" });
-      } catch (error) {
-        console.error("Job details error:", error);
-
-        detailsContainer.innerHTML = `
-          <div class="status-error">
-            Could not load job details.
+        document.getElementById('detailsContainer').innerHTML = `
+          <div class="details-empty">
+            Check that your API is running on ${escapeHtml(API_BASE_URL)}.
           </div>
         `;
       }
     }
 
-    function closeJobDetails() {
-      document.getElementById("jobDetailsContainer").innerHTML = "";
-    }
+    document.getElementById('searchInput').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        applyFilters();
+      }
+    });
 
-    loadHealthStatus();
-    loadStats();
-    loadCollectorStatus();
-    searchJobs(1);
+    document.getElementById('locationInput').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        applyFilters();
+      }
+    });
+
+    document.getElementById('companyInput').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        applyFilters();
+      }
+    });
+
+    document.getElementById('applyTypeInput').addEventListener('change', applyFilters);
+    document.getElementById('workModeInput').addEventListener('change', applyFilters);
+
+    reloadData();
   </script>
 </body>
 </html>

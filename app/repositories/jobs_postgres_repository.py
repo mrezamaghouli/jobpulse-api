@@ -13,9 +13,12 @@ JOB_SELECT_COLUMNS = """
     linkedin_job_id,
     title,
     company,
+    company_id,
     company_linkedin_url,
+    company_logo_url,
     location,
     remote,
+    work_mode,
     job_type,
     seniority,
     salary_min,
@@ -23,6 +26,10 @@ JOB_SELECT_COLUMNS = """
     currency,
     source,
     job_url,
+    job_description,
+    job_about,
+    date_posted_text,
+    date_posted_at,
     apply_type,
     apply_url,
     apply_label,
@@ -32,7 +39,11 @@ JOB_SELECT_COLUMNS = """
     date_posted,
     first_seen_at,
     last_seen_at,
-    is_active
+    is_active,
+    inactive_at,
+    inactive_reason,
+    archived_at,
+    deleted_at
 """
 
 
@@ -325,8 +336,201 @@ def search_jobs_from_db(**kwargs):
     return get_jobs_from_db(**kwargs)
 
 
-def get_all_jobs_from_db(**kwargs):
-    return get_jobs_from_db(**kwargs)
+def get_all_jobs_from_db(
+    query=None,
+    title=None,
+    company=None,
+    location=None,
+    remote=None,
+    work_mode=None,
+    seniority=None,
+    job_type=None,
+    min_salary=None,
+    max_salary=None,
+    source=None,
+    apply_type=None,
+    is_active=None,
+    active_only=None,
+    page: int = 1,
+    limit: int = 10,
+    sort_by: str = "last_seen_at",
+    sort_order: str = "desc",
+):
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_postgres_connection()
+        cursor = connection.cursor()
+
+        safe_page = max(1, int(page or 1))
+        safe_limit = max(1, min(int(limit or 10), 500))
+        offset = (safe_page - 1) * safe_limit
+
+        where_clauses = []
+        params = []
+
+        if query:
+            where_clauses.append(
+                """
+                (
+                    title ILIKE %s
+                    OR company ILIKE %s
+                    OR location ILIKE %s
+                    OR job_description ILIKE %s
+                    OR job_about ILIKE %s
+                    OR source ILIKE %s
+                )
+                """
+            )
+
+            query_value = f"%{query}%"
+
+            params.extend([
+                query_value,
+                query_value,
+                query_value,
+                query_value,
+                query_value,
+                query_value,
+            ])
+
+        if title:
+            where_clauses.append("title ILIKE %s")
+            params.append(f"%{title}%")
+
+        if company:
+            where_clauses.append("company ILIKE %s")
+            params.append(f"%{company}%")
+
+        if location:
+            where_clauses.append("location ILIKE %s")
+            params.append(f"%{location}%")
+
+        if remote is not None:
+            where_clauses.append("remote = %s")
+            params.append(remote)
+
+        if work_mode:
+            where_clauses.append("work_mode = %s")
+            params.append(work_mode)
+
+        if seniority:
+            where_clauses.append("seniority ILIKE %s")
+            params.append(f"%{seniority}%")
+
+        if job_type:
+            where_clauses.append("job_type ILIKE %s")
+            params.append(f"%{job_type}%")
+
+        if min_salary is not None:
+            where_clauses.append("salary_max >= %s")
+            params.append(min_salary)
+
+        if max_salary is not None:
+            where_clauses.append("salary_min <= %s")
+            params.append(max_salary)
+
+        if source:
+            where_clauses.append("source = %s")
+            params.append(source)
+
+        if apply_type:
+            where_clauses.append("apply_type = %s")
+            params.append(apply_type)
+
+        if is_active is not None:
+            where_clauses.append("is_active = %s")
+            params.append(is_active)
+
+        if active_only:
+            where_clauses.append(
+                """
+                is_active = TRUE
+                AND archived_at IS NULL
+                AND deleted_at IS NULL
+                """
+            )
+        else:
+            where_clauses.append("deleted_at IS NULL")
+
+        where_sql = ""
+
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        allowed_sort_columns = {
+            "id": "id",
+            "title": "title",
+            "company": "company",
+            "location": "location",
+            "date_posted": "date_posted",
+            "first_seen_at": "first_seen_at",
+            "last_seen_at": "last_seen_at",
+            "apply_type": "apply_type",
+            "source": "source",
+        }
+
+        safe_sort_by = allowed_sort_columns.get(sort_by, "last_seen_at")
+        safe_sort_order = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM jobs
+            {where_sql};
+            """,
+            params,
+        )
+
+        total_row = cursor.fetchone()
+
+        if isinstance(total_row, dict):
+            total = total_row.get("total", 0)
+        else:
+            total = total_row[0] if total_row else 0
+
+        cursor.execute(
+            f"""
+            SELECT
+                {JOB_SELECT_COLUMNS}
+            FROM jobs
+            {where_sql}
+            ORDER BY
+                {safe_sort_by} {safe_sort_order} NULLS LAST,
+                id DESC
+            LIMIT %s
+            OFFSET %s;
+            """,
+            params + [safe_limit, offset],
+        )
+
+        rows = cursor.fetchall()
+
+        results = [
+            dict(row)
+            for row in rows
+        ]
+
+        total_pages = 0
+
+        if safe_limit > 0:
+            total_pages = (int(total) + safe_limit - 1) // safe_limit
+
+        return {
+            "results": results,
+            "page": safe_page,
+            "limit": safe_limit,
+            "total": int(total or 0),
+            "total_pages": total_pages,
+        }
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if connection:
+            connection.close()
 
 
 def get_job_by_id_from_db(job_id):

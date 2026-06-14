@@ -163,6 +163,24 @@ def run_logo_sync() -> dict:
         title="Running logo sync after batch",
     )
 
+def run_schema_repair() -> dict:
+    return run_module_task(
+        module_name="scripts.repair_jobpulse_schema",
+        title="Running schema repair before batch",
+    )
+
+def run_job_lifecycle_sync() -> dict:
+    return run_module_task(
+        module_name="scripts.sync_job_lifecycle",
+        title="Running job lifecycle sync",
+    )
+
+def run_smart_query_planner() -> dict:
+    return run_module_task(
+        module_name="scripts.linkedin_smart_query_planner",
+        title="Generating smart LinkedIn query plan",
+    )
+
 def run_stale_jobs_cleanup(stale_job_days: int) -> dict:
     return run_module_task(
         module_name="scripts.mark_stale_jobs_inactive",
@@ -354,12 +372,67 @@ def main():
     remaining_queries = total_queries - offset
     effective_batch_size = min(batch_size, remaining_queries)
 
+    schema_repair_result = run_schema_repair()
+
+    if not schema_repair_result["success"]:
+        result = {
+            "success": False,
+            "returncode": schema_repair_result["returncode"],
+            "offset": offset,
+            "batch_size": effective_batch_size,
+            "workers": workers,
+            "category": args.category,
+            "started_at": schema_repair_result["started_at"],
+            "finished_at": schema_repair_result["finished_at"],
+            "duration_seconds": schema_repair_result["duration_seconds"],
+            "schema_repair": schema_repair_result,
+            "error": "Schema repair failed. Batch was not started.",
+        }
+
+        progress.setdefault("runs", [])
+        progress["runs"].append(result)
+        progress["next_offset"] = offset
+        save_progress(progress)
+
+        print("Schema repair failed. Batch cancelled.")
+        print(f"Offset kept at: {offset}")
+        return
+    smart_planner_result = run_smart_query_planner()
+
+    if not smart_planner_result["success"]:
+        result = {
+            "success": False,
+            "returncode": smart_planner_result["returncode"],
+            "offset": offset,
+            "batch_size": effective_batch_size,
+            "workers": workers,
+            "category": args.category,
+            "started_at": smart_planner_result["started_at"],
+            "finished_at": smart_planner_result["finished_at"],
+            "duration_seconds": smart_planner_result["duration_seconds"],
+            "schema_repair": schema_repair_result,
+            "smart_planner": smart_planner_result,
+            "error": "Smart query planner failed. Batch was not started.",
+        }
+
+        progress.setdefault("runs", [])
+        progress["runs"].append(result)
+        progress["next_offset"] = offset
+        save_progress(progress)
+
+        print("Smart query planner failed. Batch cancelled.")
+        print(f"Offset kept at: {offset}")
+        return
+
+    os.environ["LINKEDIN_QUERIES_FILE"] = "config\\linkedin_smart_queries.json"
     result = run_batch(
         offset=offset,
         batch_size=effective_batch_size,
         workers=workers,
         category=args.category,
     )
+    result["smart_planner"] = smart_planner_result
+    result["schema_repair"] = schema_repair_result
 
     company_backfill_result = None
     company_enrichment_result = None
@@ -376,6 +449,9 @@ def main():
             )
 
         logo_sync_result = run_logo_sync()
+
+        job_lifecycle_result = run_job_lifecycle_sync()
+        result["job_lifecycle"] = job_lifecycle_result
 
         stale_jobs_cleanup_result = run_stale_jobs_cleanup(
             stale_job_days=max(1, args.stale_job_days),
@@ -421,6 +497,7 @@ def main():
             print("Logo sync completed successfully.")
         else:
             print("Batch succeeded, but logo sync failed or did not run.")
+
         if stale_jobs_cleanup_result and stale_jobs_cleanup_result["success"]:
             print("Stale jobs cleanup completed successfully.")
         else:

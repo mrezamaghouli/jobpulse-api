@@ -4,6 +4,10 @@ import os
 import subprocess
 import sys
 import time
+import hashlib
+import psycopg2
+
+from app.config import get_postgres_config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +17,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 QUERIES_FILE = BASE_DIR / "config" / "linkedin_expanded_queries.json"
 SEARCH_PLAN_FILE = BASE_DIR / "config" / "linkedin_search_plan.json"
 LOG_DIR = BASE_DIR / "logs"
+DEFAULT_QUERIES_FILE = BASE_DIR / "config" / "linkedin_expanded_queries.json"
+
+
+def get_queries_file() -> Path:
+    custom_file = os.getenv("LINKEDIN_QUERIES_FILE")
+
+    if custom_file:
+        path = Path(custom_file)
+
+        if not path.is_absolute():
+            path = BASE_DIR / path
+
+        return path
+
+    return DEFAULT_QUERIES_FILE
+
 
 
 def load_json_file(path: Path):
@@ -72,6 +92,10 @@ def build_query_env(query: dict) -> dict:
         "LINKEDIN_QUERY_RETRY_COUNT",
         "1"
     )
+    env["LINKEDIN_QUERY_COOLDOWN_HOURS"] = env.get(
+        "LINKEDIN_QUERY_COOLDOWN_HOURS",
+        "12"
+    )
 
     env["LINKEDIN_QUERY_RETRY_DELAY_SECONDS"] = env.get(
         "LINKEDIN_QUERY_RETRY_DELAY_SECONDS",
@@ -120,10 +144,226 @@ def get_retry_delay_seconds() -> int:
 
     return delay_seconds
 
+def make_query_signature(query: dict) -> str:
+    raw_signature = "|".join(
+        [
+            str(query.get("category", "")).strip().lower(),
+            str(query.get("keywords", "")).strip().lower(),
+            str(query.get("location", "")).strip().lower(),
+            str(query.get("work_mode", "")).strip().lower(),
+            str(query.get("lookback_days", "")).strip().lower(),
+        ]
+    )
+
+    return hashlib.sha256(raw_signature.encode("utf-8")).hexdigest()
+
+
+def get_query_cooldown_hours() -> int:
+    try:
+        cooldown_hours = int(os.getenv("LINKEDIN_QUERY_COOLDOWN_HOURS", "12"))
+    except ValueError:
+        cooldown_hours = 12
+
+    if cooldown_hours < 0:
+        cooldown_hours = 0
+
+    if cooldown_hours > 168:
+        cooldown_hours = 168
+
+    return cooldown_hours
+
+
+def count_linkedin_jobs() -> int:
+    try:
+        connection = psycopg2.connect(**get_postgres_config())
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE source = 'LinkedIn';
+            """
+        )
+
+        row = cursor.fetchone()
+
+        cursor.close()
+        connection.close()
+
+        return int(row[0] or 0)
+
+    except Exception as error:
+        print(f"Could not count LinkedIn jobs: {error}")
+        return 0
+
+
+def was_query_recently_successful(query_signature: str, cooldown_hours: int) -> bool:
+    if cooldown_hours <= 0:
+        return False
+
+    try:
+        connection = psycopg2.connect(**get_postgres_config())
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM linkedin_query_runs
+            WHERE query_signature = %s
+              AND status = 'success'
+              AND finished_at IS NOT NULL
+              AND finished_at >= NOW() - (%s || ' hours')::INTERVAL
+            ORDER BY finished_at DESC
+            LIMIT 1;
+            """,
+            (
+                query_signature,
+                cooldown_hours,
+            ),
+        )
+
+        row = cursor.fetchone()
+
+        cursor.close()
+        connection.close()
+
+        return row is not None
+
+    except Exception as error:
+        print(f"Could not check query cooldown: {error}")
+        return False
+
+
+def insert_query_run_record(record: dict):
+    try:
+        connection = psycopg2.connect(**get_postgres_config())
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO linkedin_query_runs (
+                query_signature,
+                category,
+                keywords,
+                location,
+                work_mode,
+                lookback_days,
+                status,
+                started_at,
+                finished_at,
+                duration_seconds,
+                jobs_before,
+                jobs_after,
+                jobs_delta,
+                failed_queries,
+                profile_level,
+                profile_name,
+                error,
+                log_file
+            )
+            VALUES (
+                %(query_signature)s,
+                %(category)s,
+                %(keywords)s,
+                %(location)s,
+                %(work_mode)s,
+                %(lookback_days)s,
+                %(status)s,
+                %(started_at)s,
+                %(finished_at)s,
+                %(duration_seconds)s,
+                %(jobs_before)s,
+                %(jobs_after)s,
+                %(jobs_delta)s,
+                %(failed_queries)s,
+                %(profile_level)s,
+                %(profile_name)s,
+                %(error)s,
+                %(log_file)s
+            );
+            """,
+            record,
+        )
+
+        connection.commit()
+
+        cursor.close()
+        connection.close()
+
+    except Exception as error:
+        print(f"Could not insert query run record: {error}")
+
 
 def run_single_query(query: dict, index: int, total: int) -> dict:
     retry_count = get_retry_count()
     retry_delay_seconds = get_retry_delay_seconds()
+    
+    query_signature = make_query_signature(query)
+    cooldown_hours = get_query_cooldown_hours()
+
+    jobs_before = count_linkedin_jobs()
+
+    if was_query_recently_successful(
+        query_signature=query_signature,
+        cooldown_hours=cooldown_hours,
+    ):
+        started_at = datetime.now()
+        finished_at = datetime.now()
+
+        print("\n" + "=" * 90)
+        print(
+            f"Skipping recently successful query [{index}/{total}] "
+            f"{query['category']} | {query['keywords']} | "
+            f"{query['location'] or 'Worldwide'} | {query['work_mode']}"
+        )
+        print(f"Cooldown hours: {cooldown_hours}")
+        print("=" * 90)
+
+        skipped_result = {
+            "index": index,
+            "total": total,
+            "success": True,
+            "skipped": True,
+            "returncode": 0,
+            "category": query["category"],
+            "keywords": query["keywords"],
+            "location": query["location"],
+            "work_mode": query["work_mode"],
+            "lookback_days": query["lookback_days"],
+            "limit": query["limit"],
+            "duration_seconds": 0,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "attempts": [],
+            "stdout": "",
+            "stderr": "",
+        }
+
+        insert_query_run_record(
+            {
+                "query_signature": query_signature,
+                "category": query.get("category"),
+                "keywords": query.get("keywords"),
+                "location": query.get("location"),
+                "work_mode": query.get("work_mode"),
+                "lookback_days": query.get("lookback_days"),
+                "status": "skipped_recent_success",
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "duration_seconds": 0,
+                "jobs_before": jobs_before,
+                "jobs_after": jobs_before,
+                "jobs_delta": 0,
+                "failed_queries": 0,
+                "profile_level": None,
+                "profile_name": None,
+                "error": None,
+                "log_file": None,
+            }
+        )
+
+        return skipped_result
 
     attempts = []
     final_result = None
@@ -201,6 +441,55 @@ def run_single_query(query: dict, index: int, total: int) -> dict:
         if attempt_number <= retry_count:
             print(f"Retrying after {retry_delay_seconds}s...")
             time.sleep(retry_delay_seconds)
+            
+            jobs_after = count_linkedin_jobs()
+
+            insert_query_run_record(
+                {
+                    "query_signature": query_signature,
+                    "category": query.get("category"),
+                    "keywords": query.get("keywords"),
+                    "location": query.get("location"),
+                    "work_mode": query.get("work_mode"),
+                    "lookback_days": query.get("lookback_days"),
+                    "status": "success",
+                    "started_at": started_at.isoformat(),
+                    "finished_at": finished_at.isoformat(),
+                    "duration_seconds": duration_seconds,
+                    "jobs_before": jobs_before,
+                    "jobs_after": jobs_after,
+                    "jobs_delta": jobs_after - jobs_before,
+                    "failed_queries": 0,
+                    "profile_level": None,
+                    "profile_name": None,
+                    "error": None,
+                    "log_file": None,
+                }
+            )
+    jobs_after = count_linkedin_jobs()
+
+    insert_query_run_record(
+        {
+            "query_signature": query_signature,
+            "category": query.get("category"),
+            "keywords": query.get("keywords"),
+            "location": query.get("location"),
+            "work_mode": query.get("work_mode"),
+            "lookback_days": query.get("lookback_days"),
+            "status": "failed",
+            "started_at": final_result.get("started_at") if final_result else None,
+            "finished_at": final_result.get("finished_at") if final_result else None,
+            "duration_seconds": final_result.get("duration_seconds") if final_result else None,
+            "jobs_before": jobs_before,
+            "jobs_after": jobs_after,
+            "jobs_delta": jobs_after - jobs_before,
+            "failed_queries": 1,
+            "profile_level": None,
+            "profile_name": None,
+            "error": (final_result.get("stderr") or "")[-2000:] if final_result else "unknown error",
+            "log_file": None,
+        }
+    )
 
     return final_result
 
@@ -223,7 +512,18 @@ def run_plan_collect(
     offset: int,
     categories: list[str] | None,
 ):
-    queries = load_json_file(QUERIES_FILE)
+ 
+    queries_file = get_queries_file()
+    queries_data = load_json_file(queries_file)
+
+    if isinstance(queries_data, list):
+        queries = queries_data
+    elif isinstance(queries_data, dict) and isinstance(queries_data.get("queries"), list):
+        queries = queries_data["queries"]
+    else:
+        raise ValueError(f"Unsupported queries file format: {queries_file}")
+
+    print(f"Loaded {len(queries)} queries from: {queries_file}")
     queries = [normalize_query(query) for query in queries]
 
     if categories:

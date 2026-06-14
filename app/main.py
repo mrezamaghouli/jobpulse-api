@@ -46,16 +46,24 @@ app = FastAPI(
     description="JobPulse API for searching and monitoring LinkedIn job listings.",
 )
 
+def get_cors_origins() -> list[str]:
+    raw_origins = os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://127.0.0.1,http://localhost,http://127.0.0.1:80,http://localhost:80,http://127.0.0.1:5500,http://localhost:5500",
+    )
+
+    origins = [
+        origin.strip()
+        for origin in raw_origins.split(",")
+        if origin.strip()
+    ]
+
+    return origins
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5500",
-        "http://localhost:5500",
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "*",
-    ],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -145,6 +153,11 @@ class Job(BaseModel):
     first_seen_at: Optional[Any] = None
     last_seen_at: Optional[Any] = None
     is_active: Optional[bool] = None
+
+    inactive_at: Optional[datetime] = None
+    inactive_reason: Optional[str] = None
+    archived_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
 
 
 class JobSearchResponse(BaseModel):
@@ -315,10 +328,12 @@ def get_meta():
 
 @app.get("/jobs", response_model=list[Job])
 def get_jobs(
+    query: Optional[str] = None,
     title: Optional[str] = None,
     company: Optional[str] = None,
     location: Optional[str] = None,
     remote: Optional[bool] = None,
+    work_mode: Optional[str] = None,
     seniority: Optional[str] = None,
     job_type: Optional[str] = None,
     min_salary: Optional[float] = None,
@@ -326,17 +341,19 @@ def get_jobs(
     source: Optional[str] = None,
     apply_type: Optional[str] = None,
     is_active: Optional[bool] = None,
-    active_only: Optional[bool] = None,
+    active_only: Optional[bool] = True,
     page: int = 1,
     limit: int = 10,
     sort_by: str = "last_seen_at",
     sort_order: str = "desc",
 ):
     data = get_all_jobs_from_db(
+        query=query,
         title=title,
         company=company,
         location=location,
         remote=remote,
+        work_mode=work_mode,
         seniority=seniority,
         job_type=job_type,
         min_salary=min_salary,
@@ -430,9 +447,8 @@ def get_jobs_quality():
             """
         )
 
-        job_columns = [column[0] for column in cursor.description]
         job_row = cursor.fetchone()
-        job_summary = dict(zip(job_columns, job_row))
+        job_summary = dict(job_row) if job_row else {}
 
         cursor.execute(
             """
@@ -449,13 +465,89 @@ def get_jobs_quality():
             """
         )
 
-        company_columns = [column[0] for column in cursor.description]
         company_row = cursor.fetchone()
-        company_summary = dict(zip(company_columns, company_row))
+        company_summary = dict(company_row) if company_row else {}  
+        def to_int(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
 
+        def percent(part, total):
+            part = to_int(part)
+            total = to_int(total)
+
+            if total <= 0:
+                return 0
+
+            return round((part / total) * 100, 2)
+
+        total_jobs = to_int(job_summary.get("total_linkedin_jobs"))
+        total_companies = to_int(company_summary.get("total_companies"))
+
+        apply_coverage = percent(
+            job_summary.get("jobs_with_apply_url"),
+            total_jobs,
+        )
+
+        description_coverage = percent(
+            job_summary.get("jobs_with_description"),
+            total_jobs,
+        )
+
+        logo_coverage = percent(
+            job_summary.get("jobs_with_company_logo"),
+            total_jobs,
+        )
+
+        work_mode_coverage = percent(
+            job_summary.get("jobs_with_work_mode"),
+            total_jobs,
+        )
+
+        company_logo_coverage = percent(
+            company_summary.get("companies_with_logo"),
+            total_companies,
+        )
+
+        company_about_coverage = percent(
+            company_summary.get("companies_with_about"),
+            total_companies,
+        )
+
+        company_enrichment_coverage = round(
+            (
+                company_logo_coverage +
+                company_about_coverage
+            ) / 2,
+            2,
+        )
+
+        overall_quality_score = round(
+            (
+                apply_coverage +
+                description_coverage +
+                logo_coverage +
+                work_mode_coverage +
+                company_enrichment_coverage
+            ) / 5,
+            2,
+        )
+
+        quality_scores = {
+            "apply_coverage": apply_coverage,
+            "description_coverage": description_coverage,
+            "logo_coverage": logo_coverage,
+            "work_mode_coverage": work_mode_coverage,
+            "company_logo_coverage": company_logo_coverage,
+            "company_about_coverage": company_about_coverage,
+            "company_enrichment_coverage": company_enrichment_coverage,
+            "overall_quality_score": overall_quality_score,
+        }
         return {
             "jobs": job_summary,
             "companies": company_summary,
+            "quality_scores": quality_scores,
         }
 
     except Exception as error:
@@ -468,7 +560,7 @@ def get_jobs_quality():
         if connection:
             connection.close()
 
-            
+
 @app.get("/jobs/{job_id}", response_model=Job)
 def get_job(job_id: int):
     job = get_job_by_id_from_db(job_id)

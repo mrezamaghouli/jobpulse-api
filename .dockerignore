@@ -1,14 +1,25 @@
-venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-.git/
+.git
 .gitignore
 
-.env
-.vscode/
+venv
+.venv
+__pycache__
+*.pyc
+.pytest_cache
 
-storage/
-README.md
+.env
+.env.*
+!.env.example
+!.env.prod.example
+
+.auth
+logs
+backups
+*.dump
+*.sql
+*.sqlite
+*.db
+
+node_modules
+.DS_Store
+Thumbs.db

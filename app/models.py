@@ -1,4 +1,6 @@
 from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
 
 
 class Job(BaseModel):
@@ -28,6 +30,11 @@ class Job(BaseModel):
     poster_profile_url: str | None = None
 
     date_posted: str | None = None
+
+    inactive_at: Optional[datetime] = None
+    inactive_reason: Optional[str] = None
+    archived_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
 
 
 class JobSearchResponse(BaseModel):

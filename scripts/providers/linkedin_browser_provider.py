@@ -1,18 +1,17 @@
 import json
 import os
-import psycopg2
 import re
 import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlencode
 
+import psycopg2
 from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
 
-from app.config import get_postgres_config
 from app.config import (
     get_linkedin_browser,
     get_linkedin_keywords,
@@ -196,7 +195,6 @@ class LinkedInBrowserProvider:
 
             page.wait_for_timeout(5000)
 
-
     def should_skip_existing_enriched_jobs(self) -> bool:
         value = os.getenv("LINKEDIN_SKIP_EXISTING_ENRICHED", "true")
         return value.strip().lower() in ["true", "1", "yes", "y"]
@@ -255,8 +253,82 @@ class LinkedInBrowserProvider:
             print(f"Could not check existing enriched jobs: {error}")
             return set()
 
+    def get_int_env(
+        self,
+        name: str,
+        default_value: int,
+        min_value: int,
+        max_value: int,
+    ) -> int:
+        raw_value = os.getenv(name, str(default_value))
+
+        try:
+            value = int(raw_value)
+        except ValueError:
+            value = default_value
+
+        if value < min_value:
+            value = min_value
+
+        if value > max_value:
+            value = max_value
+
+        return value
+
+    def scroll_linkedin_jobs_page(self, page):
+        try:
+            scrollable_selectors = [
+                ".jobs-search-results-list",
+                ".scaffold-layout__list",
+                "[class*='jobs-search-results']",
+                "main",
+                "body",
+            ]
+
+            scrolled = False
+
+            for selector in scrollable_selectors:
+                locator = page.locator(selector).first
+
+                if locator.count() == 0:
+                    continue
+
+                try:
+                    locator.hover(timeout=2000)
+                    page.mouse.wheel(0, 2200)
+                    page.wait_for_timeout(2200)
+                    scrolled = True
+                    break
+                except Exception:
+                    continue
+
+            if not scrolled:
+                page.mouse.wheel(0, 2200)
+                page.wait_for_timeout(2200)
+
+        except Exception as error:
+            print(f"Scroll failed: {error}")
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(2000)
+
     def extract_jobs_from_page(self, page, limit: int) -> list[dict]:
+        max_pages = self.get_int_env(
+            name="LINKEDIN_MAX_PAGES",
+            default_value=3,
+            min_value=1,
+            max_value=20,
+        )
+
+        stop_after_no_new_scrolls = self.get_int_env(
+            name="LINKEDIN_STOP_AFTER_NO_NEW_SCROLLS",
+            default_value=2,
+            min_value=1,
+            max_value=10,
+        )
+
         print("Waiting for LinkedIn job results...")
+        print(f"Deep scroll max pages: {max_pages}")
+        print(f"Job limit for this query: {limit}")
 
         try:
             page.wait_for_selector(
@@ -266,194 +338,252 @@ class LinkedInBrowserProvider:
         except Exception as error:
             print(f"Job result selector did not appear in time: {error}")
 
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(4000)
 
-        for scroll_index in range(6):
-            print(f"Scrolling job results: {scroll_index + 1}/6")
-            page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(1800)
+        all_jobs_by_key = {}
+        no_new_scrolls = 0
 
-        debug_counts = page.evaluate(
-            """
-            () => {
-                return {
-                    currentUrl: window.location.href,
-                    title: document.title,
-                    bodyTextStart: document.body ? document.body.innerText.slice(0, 1000) : '',
-                    jobViewLinks: document.querySelectorAll('a[href*="/jobs/view/"]').length,
-                    occludableCards: document.querySelectorAll('li[data-occludable-job-id]').length,
-                    jobCardContainers: document.querySelectorAll('div.job-card-container').length,
-                    dataJobIdCards: document.querySelectorAll('div[data-job-id]').length
-                };
-            }
-            """
-        )
+        for page_index in range(1, max_pages + 1):
+            print("\n" + "-" * 70)
+            print(f"Reading LinkedIn search results page/scroll {page_index}/{max_pages}")
 
-        print("LinkedIn page debug:")
-        print(debug_counts)
+            page.wait_for_timeout(2500)
 
-        basic_jobs = page.evaluate(
-            """
-            (limit) => {
-                const clean = (value) => {
-                    if (!value) {
-                        return '';
-                    }
+            snapshot_jobs = page.evaluate(
+                """
+                (limit) => {
+                    const clean = (value) => {
+                        if (!value) {
+                            return '';
+                        }
 
-                    return value.replace(/\\s+/g, ' ').trim();
-                };
+                        return String(value).replace(/\\s+/g, ' ').trim();
+                    };
 
-                const absoluteUrl = (url) => {
-                    if (!url) {
-                        return '';
-                    }
+                    const absoluteUrl = (url) => {
+                        if (!url) {
+                            return '';
+                        }
 
-                    if (url.startsWith('http')) {
+                        if (url.startsWith('http')) {
+                            return url;
+                        }
+
+                        if (url.startsWith('/')) {
+                            return `https://www.linkedin.com${url}`;
+                        }
+
                         return url;
-                    }
+                    };
 
-                    if (url.startsWith('/')) {
-                        return `https://www.linkedin.com${url}`;
-                    }
+                    const extractJobIdFromUrl = (url) => {
+                        if (!url) {
+                            return '';
+                        }
 
-                    return url;
-                };
+                        const patterns = [
+                            /\\/jobs\\/view\\/(\\d+)/,
+                            /currentJobId=(\\d+)/,
+                            /jobId=(\\d+)/
+                        ];
 
-                const extractJobIdFromUrl = (url) => {
-                    if (!url) {
+                        for (const pattern of patterns) {
+                            const match = url.match(pattern);
+
+                            if (match) {
+                                return match[1];
+                            }
+                        }
+
                         return '';
-                    }
+                    };
 
-                    const patterns = [
-                        /\\/jobs\\/view\\/(\\d+)/,
-                        /currentJobId=(\\d+)/,
-                        /jobId=(\\d+)/
-                    ];
+                    const getText = (root, selectors) => {
+                        for (const selector of selectors) {
+                            const el = root.querySelector(selector);
 
-                    for (const pattern of patterns) {
-                        const match = url.match(pattern);
+                            if (el && clean(el.innerText)) {
+                                return clean(el.innerText);
+                            }
 
-                        if (match) {
-                            return match[1];
-                        }
-                    }
+                            if (el && clean(el.getAttribute('aria-label'))) {
+                                return clean(el.getAttribute('aria-label'));
+                            }
 
-                    return '';
-                };
-
-                const getText = (root, selectors) => {
-                    for (const selector of selectors) {
-                        const el = root.querySelector(selector);
-
-                        if (el && clean(el.innerText)) {
-                            return clean(el.innerText);
+                            if (el && clean(el.getAttribute('title'))) {
+                                return clean(el.getAttribute('title'));
+                            }
                         }
 
-                        if (el && clean(el.getAttribute('aria-label'))) {
-                            return clean(el.getAttribute('aria-label'));
-                        }
+                        return '';
+                    };
 
-                        if (el && clean(el.getAttribute('title'))) {
-                            return clean(el.getAttribute('title'));
-                        }
-                    }
+                    const getClosestCard = (link) => {
+                        return (
+                            link.closest('li[data-occludable-job-id]') ||
+                            link.closest('div.job-card-container') ||
+                            link.closest('div[data-job-id]') ||
+                            link.closest('li') ||
+                            link.closest('div')
+                        );
+                    };
 
-                    return '';
-                };
-
-                const getClosestCard = (link) => {
-                    return (
-                        link.closest('li[data-occludable-job-id]') ||
-                        link.closest('div.job-card-container') ||
-                        link.closest('div[data-job-id]') ||
-                        link.closest('li') ||
-                        link.closest('div')
+                    const links = Array.from(
+                        document.querySelectorAll('a[href*="/jobs/view/"]')
                     );
-                };
 
-                const links = Array.from(document.querySelectorAll('a[href*="/jobs/view/"]'));
+                    const jobs = [];
+                    const seen = new Set();
 
-                const jobs = [];
-                const seen = new Set();
+                    for (const link of links) {
+                        let jobUrl = absoluteUrl(
+                            link.href ||
+                            link.getAttribute('href') ||
+                            ''
+                        );
 
-                for (const link of links) {
-                    let jobUrl = absoluteUrl(link.href || link.getAttribute('href') || '');
+                        if (!jobUrl) {
+                            continue;
+                        }
 
-                    if (!jobUrl) {
-                        continue;
-                    }
+                        const linkedinJobId = extractJobIdFromUrl(jobUrl);
+                        const card = getClosestCard(link) || document;
+                        const key = linkedinJobId || jobUrl.split('?')[0];
 
-                    const linkedinJobId = extractJobIdFromUrl(jobUrl);
-                    const card = getClosestCard(link) || document;
+                        if (seen.has(key)) {
+                            continue;
+                        }
 
-                    const key = linkedinJobId || jobUrl.split('?')[0];
+                        seen.add(key);
 
-                    if (seen.has(key)) {
-                        continue;
-                    }
+                        let title =
+                            clean(link.innerText) ||
+                            clean(link.getAttribute('aria-label')) ||
+                            clean(link.getAttribute('title')) ||
+                            getText(card, [
+                                '.job-card-list__title--link',
+                                '.job-card-list__title',
+                                '[class*="job-title"]',
+                                'strong',
+                                'h3'
+                            ]);
 
-                    seen.add(key);
+                        title = title
+                            .replace(/^View job\\s*/i, '')
+                            .replace(/^Open job\\s*/i, '')
+                            .trim();
 
-                    let title =
-                        clean(link.innerText) ||
-                        clean(link.getAttribute('aria-label')) ||
-                        clean(link.getAttribute('title')) ||
-                        getText(card, [
-                            '.job-card-list__title--link',
-                            '.job-card-list__title',
-                            '[class*="job-title"]',
-                            'strong',
-                            'h3'
+                        const company = getText(card, [
+                            '.job-card-container__company-name',
+                            '[class*="company-name"]',
+                            '.artdeco-entity-lockup__subtitle',
+                            '[class*="subtitle"]'
                         ]);
 
-                    title = title
-                        .replace(/^View job\\s*/i, '')
-                        .replace(/^Open job\\s*/i, '')
-                        .trim();
+                        const location = getText(card, [
+                            '.job-card-container__metadata-item',
+                            '[class*="metadata-item"]',
+                            '.artdeco-entity-lockup__caption',
+                            '[class*="caption"]'
+                        ]);
 
-                    const company = getText(card, [
-                        '.job-card-container__company-name',
-                        '[class*="company-name"]',
-                        '.artdeco-entity-lockup__subtitle',
-                        '[class*="subtitle"]'
-                    ]);
+                        if (!title) {
+                            continue;
+                        }
 
-                    const location = getText(card, [
-                        '.job-card-container__metadata-item',
-                        '[class*="metadata-item"]',
-                        '.artdeco-entity-lockup__caption',
-                        '[class*="caption"]'
-                    ]);
+                        jobs.push({
+                            linkedin_job_id: linkedinJobId,
+                            title,
+                            company,
+                            location,
+                            job_url: jobUrl,
+                            company_linkedin_url: null,
+                            apply_type: 'unknown',
+                            apply_url: null,
+                            apply_label: null
+                        });
 
-                    if (!title) {
-                        continue;
+                        if (jobs.length >= limit) {
+                            break;
+                        }
                     }
 
-                    jobs.push({
-                        linkedin_job_id: linkedinJobId,
-                        title,
-                        company,
-                        location,
-                        job_url: jobUrl,
-                        company_linkedin_url: null,
-                        apply_type: 'unknown',
-                        apply_url: null,
-                        apply_label: null
-                    });
-
-                    if (jobs.length >= limit) {
-                        break;
-                    }
+                    return jobs;
                 }
+                """,
+                limit,
+            )
 
-                return jobs;
-            }
-            """,
-            limit,
-        )
+            before_count = len(all_jobs_by_key)
+
+            for job in snapshot_jobs:
+                linkedin_job_id = self.extract_job_id(
+                    job_url=job.get("job_url", ""),
+                    fallback=job.get("linkedin_job_id", ""),
+                )
+
+                canonical_job_url = self.canonicalize_job_url(
+                    job_url=job.get("job_url", ""),
+                    linkedin_job_id=linkedin_job_id,
+                )
+
+                if not canonical_job_url:
+                    continue
+
+                job["job_url"] = canonical_job_url
+                job["linkedin_job_id"] = linkedin_job_id
+
+                key = linkedin_job_id or canonical_job_url
+
+                if key not in all_jobs_by_key:
+                    all_jobs_by_key[key] = job
+
+                if len(all_jobs_by_key) >= limit:
+                    break
+
+            after_count = len(all_jobs_by_key)
+            new_jobs_count = after_count - before_count
+
+            print(f"Snapshot jobs found: {len(snapshot_jobs)}")
+            print(f"New jobs added from this scroll: {new_jobs_count}")
+            print(f"Total unique jobs collected: {after_count}/{limit}")
+
+            if after_count >= limit:
+                print("Reached query job limit. Stopping deep scroll.")
+                break
+
+            if new_jobs_count == 0:
+                no_new_scrolls += 1
+                print(f"No new jobs in this scroll. No-new counter: {no_new_scrolls}")
+
+                if no_new_scrolls >= stop_after_no_new_scrolls:
+                    print("No new jobs for multiple scrolls. Stopping deep scroll.")
+                    break
+            else:
+                no_new_scrolls = 0
+
+            self.scroll_linkedin_jobs_page(page)
+
+        basic_jobs = list(all_jobs_by_key.values())[:limit]
 
         if not basic_jobs:
             debug_file = OUTPUT_DIR / "linkedin_debug_no_jobs.json"
+
+            debug_counts = page.evaluate(
+                """
+                () => {
+                    return {
+                        currentUrl: window.location.href,
+                        title: document.title,
+                        bodyTextStart: document.body ? document.body.innerText.slice(0, 1200) : '',
+                        jobViewLinks: document.querySelectorAll('a[href*="/jobs/view/"]').length,
+                        occludableCards: document.querySelectorAll('li[data-occludable-job-id]').length,
+                        jobCardContainers: document.querySelectorAll('div.job-card-container').length,
+                        dataJobIdCards: document.querySelectorAll('div[data-job-id]').length
+                    };
+                }
+                """
+            )
 
             debug_data = {
                 "url": page.url,
@@ -516,7 +646,7 @@ class LinkedInBrowserProvider:
 
             enriched_jobs.append(merged_job)
 
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1000)
 
         return enriched_jobs
 
@@ -526,23 +656,43 @@ class LinkedInBrowserProvider:
             fallback=job.get("linkedin_job_id", ""),
         )
 
+        click_selectors = []
+
         if job_id:
-            selector = (
-                f'li[data-occludable-job-id="{job_id}"], '
-                f'div[data-job-id="{job_id}"]'
-            )
+            click_selectors = [
+                f'li[data-occludable-job-id="{job_id}"]',
+                f'div[data-job-id="{job_id}"]',
+                f'a[href*="/jobs/view/{job_id}"]',
+                f'a[href*="currentJobId={job_id}"]',
+                f'a[href*="jobId={job_id}"]',
+            ]
         else:
-            selector = f'a[href="{job.get("job_url", "")}"]'
+            click_selectors = [
+                f'a[href="{job.get("job_url", "")}"]',
+                f'a[href*="{job.get("job_url", "").rstrip("/")}"]',
+            ]
 
-        try:
-            card = page.locator(selector).first
+        clicked_job = False
 
-            if card.count() > 0:
-                card.click(timeout=8000)
-                page.wait_for_timeout(2500)
+        for selector in click_selectors:
+            try:
+                locator = page.locator(selector).first
 
-        except Exception as error:
-            print(f"Could not click job card: {error}")
+                if locator.count() == 0:
+                    continue
+
+                locator.scroll_into_view_if_needed(timeout=5000)
+                locator.click(timeout=8000)
+                page.wait_for_timeout(3000)
+
+                clicked_job = True
+                break
+
+            except Exception:
+                continue
+
+        if not clicked_job:
+            print(f"Could not click job card for job_id={job_id}")
 
         detail_data = page.evaluate(
             """
@@ -612,31 +762,47 @@ class LinkedInBrowserProvider:
                     '.jobs-description'
                 ]);
 
-                const companyLogoEl =
-                    document.querySelector('.jobs-unified-top-card__company-logo img') ||
-                    document.querySelector('.job-details-jobs-unified-top-card__company-logo img') ||
-                    document.querySelector('img[alt*="logo"]') ||
-                    document.querySelector('a[href*="/company/"] img');
+                const logoSelectors = [
+                    '.jobs-unified-top-card__company-logo img',
+                    '.job-details-jobs-unified-top-card__company-logo img',
+                    '.jobs-unified-top-card a[href*="/company/"] img',
+                    '.job-details-jobs-unified-top-card a[href*="/company/"] img'
+                ];
 
-                const companyLogoUrl =
-                    companyLogoEl
-                        ? (
-                            companyLogoEl.src ||
-                            companyLogoEl.getAttribute('src') ||
-                            companyLogoEl.getAttribute('data-delayed-url') ||
-                            ''
-                        )
-                        : '';
+                let companyLogoUrl = '';
+
+                for (const selector of logoSelectors) {
+                    const logoEl = document.querySelector(selector);
+
+                    if (!logoEl) {
+                        continue;
+                    }
+
+                    const candidateUrl =
+                        logoEl.src ||
+                        logoEl.getAttribute('src') ||
+                        logoEl.getAttribute('data-delayed-url') ||
+                        '';
+
+                    if (candidateUrl && candidateUrl.includes('media.licdn.com')) {
+                        companyLogoUrl = candidateUrl;
+                        break;
+                    }
+                }
 
                 const fullPageText = document.body ? document.body.innerText : '';
+                const lowerFullPageText = fullPageText.toLowerCase();
 
                 let workMode = '';
 
-                if (fullPageText.toLowerCase().includes('remote')) {
+                if (lowerFullPageText.includes('remote')) {
                     workMode = 'remote';
-                } else if (fullPageText.toLowerCase().includes('hybrid')) {
+                } else if (lowerFullPageText.includes('hybrid')) {
                     workMode = 'hybrid';
-                } else if (fullPageText.toLowerCase().includes('on-site') || fullPageText.toLowerCase().includes('onsite')) {
+                } else if (
+                    lowerFullPageText.includes('on-site') ||
+                    lowerFullPageText.includes('onsite')
+                ) {
                     workMode = 'onsite';
                 }
 
@@ -843,8 +1009,8 @@ class LinkedInBrowserProvider:
             'a:has-text("Apply")',
             'a:has-text("Apply now")',
             'a:has-text("Bewerben")',
-            '.jobs-apply-button',
-            '.jobs-s-apply button',
+            ".jobs-apply-button",
+            ".jobs-s-apply button",
         ]
 
         for selector in selectors:
@@ -985,13 +1151,10 @@ class LinkedInBrowserProvider:
             "company": company,
             "company_linkedin_url": raw_job.get("company_linkedin_url") or None,
             "company_logo_url": raw_job.get("company_logo_url") or None,
-            "job_description": raw_job.get("job_description") or None,
-            "job_about": raw_job.get("job_about") or None,
-            "work_mode": raw_job.get("work_mode") or None,
-            "date_posted_text": raw_job.get("date_posted_text") or None,
 
             "location": location,
             "remote": "remote" in location.lower(),
+            "work_mode": raw_job.get("work_mode") or None,
 
             "job_type": None,
             "seniority": None,
@@ -1002,6 +1165,12 @@ class LinkedInBrowserProvider:
 
             "source": "LinkedIn",
             "job_url": job_url,
+
+            "job_description": raw_job.get("job_description") or None,
+            "job_about": raw_job.get("job_about") or raw_job.get("job_description") or None,
+
+            "date_posted_text": raw_job.get("date_posted_text") or None,
+            "date_posted_at": raw_job.get("date_posted_at") or None,
 
             "apply_type": apply_type,
             "apply_url": apply_url,
@@ -1014,7 +1183,7 @@ class LinkedInBrowserProvider:
             "date_posted": str(date.today()),
         }
 
-    def canonicalize_job_url(self, job_url: str, linkedin_job_id: str) -> str:
+    def canonicalize_job_url(self, job_url: str, linkedin_job_id: str = "") -> str:
         if linkedin_job_id:
             return f"https://www.linkedin.com/jobs/view/{linkedin_job_id}/"
 

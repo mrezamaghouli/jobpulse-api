@@ -1,0 +1,122 @@
+{
+  "name": "Global Job Search Plan",
+  "lookback_days": 60,
+  "sort_by": "newest",
+  "max_pages_per_query": 3,
+  "max_jobs_per_query": 30,
+  "delay_seconds_between_queries": 4,
+  "parallel_workers": 2,
+  "enabled_categories": [
+    "software",
+    "data",
+    "design",
+    "product",
+    "marketing",
+    "sales",
+    "finance",
+    "hr",
+    "operations",
+    "support"
+  ],
+  "locations": [
+    "",
+    "Germany",
+    "United States",
+    "United Kingdom",
+    "Canada",
+    "Netherlands",
+    "France",
+    "Spain",
+    "Italy",
+    "Sweden",
+    "United Arab Emirates",
+    "Remote"
+  ],
+  "work_modes": [
+    "any",
+    "remote",
+    "hybrid",
+    "onsite"
+  ],
+  "categories": {
+    "software": [
+      "Software Engineer",
+      "Frontend Developer",
+      "Backend Developer",
+      "Full Stack Developer",
+      "Python Developer",
+      "Java Developer",
+      "DevOps Engineer",
+      "Cloud Engineer",
+      "Mobile Developer",
+      "QA Engineer"
+    ],
+    "data": [
+      "Data Analyst",
+      "Data Scientist",
+      "Data Engineer",
+      "Business Intelligence Analyst",
+      "Machine Learning Engineer",
+      "AI Engineer",
+      "Analytics Engineer"
+    ],
+    "design": [
+      "UX Designer",
+      "UI Designer",
+      "UI UX Designer",
+      "Product Designer",
+      "UX Researcher",
+      "Interaction Designer",
+      "Graphic Designer",
+      "Visual Designer"
+    ],
+    "product": [
+      "Product Manager",
+      "Product Owner",
+      "Technical Product Manager",
+      "Product Analyst",
+      "Growth Product Manager"
+    ],
+    "marketing": [
+      "Marketing Manager",
+      "Digital Marketing Manager",
+      "SEO Specialist",
+      "Content Marketing Manager",
+      "Performance Marketing Manager",
+      "Social Media Manager"
+    ],
+    "sales": [
+      "Sales Manager",
+      "Account Executive",
+      "Business Development Manager",
+      "Sales Development Representative",
+      "Customer Success Manager"
+    ],
+    "finance": [
+      "Financial Analyst",
+      "Accountant",
+      "Finance Manager",
+      "Controller",
+      "Investment Analyst"
+    ],
+    "hr": [
+      "HR Manager",
+      "Recruiter",
+      "Talent Acquisition Specialist",
+      "People Operations Manager"
+    ],
+    "operations": [
+      "Operations Manager",
+      "Project Manager",
+      "Program Manager",
+      "Supply Chain Manager",
+      "Logistics Manager"
+    ],
+    "support": [
+      "Customer Support Specialist",
+      "Technical Support Engineer",
+      "Support Manager",
+      "Customer Service Representative"
+    ]
+  }
+}
