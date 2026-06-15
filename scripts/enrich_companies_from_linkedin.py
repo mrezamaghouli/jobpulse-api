@@ -1,5 +1,6 @@
 import os
 import re
+import traceback
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -178,37 +179,147 @@ def open_company_page(page, url):
 
 
 def extract_company_info_from_page(page):
-    return page.evaluate(
-        """
+    return page.evaluate(r"""
         () => {
             const clean = (value) => {
-                if (!value) {
+                if (!value || typeof value !== 'string') {
                     return null;
                 }
 
-                const cleaned = String(value).replace(/\\s+/g, ' ').trim();
+                const cleaned = value
+                    .replace(/\s+/g, ' ')
+                    .replace(/^\s+|\s+$/g, '');
 
                 return cleaned || null;
             };
 
-            const getText = (selectors) => {
+            const getTextBySelectors = (selectors) => {
                 for (const selector of selectors) {
                     const el = document.querySelector(selector);
 
-                    if (el && clean(el.innerText)) {
-                        return clean(el.innerText);
+                    if (!el) {
+                        continue;
                     }
 
-                    if (el && clean(el.getAttribute('aria-label'))) {
-                        return clean(el.getAttribute('aria-label'));
-                    }
+                    const text = clean(el.innerText || el.textContent);
 
-                    if (el && clean(el.getAttribute('title'))) {
-                        return clean(el.getAttribute('title'));
+                    if (text) {
+                        return text;
                     }
                 }
 
                 return null;
+            };
+
+            const normalizeUrl = (url) => {
+                if (!url || typeof url !== 'string') {
+                    return null;
+                }
+
+                const cleaned = url.trim();
+
+                if (
+                    !cleaned ||
+                    cleaned.startsWith('data:') ||
+                    cleaned.startsWith('blob:') ||
+                    cleaned.includes('ghost') ||
+                    cleaned.includes('transparent') ||
+                    cleaned.includes('spacer') ||
+                    cleaned.includes('static.licdn.com/scds/common/u/images')
+                ) {
+                    return null;
+                }
+
+                try {
+                    return new URL(cleaned, window.location.origin).href;
+                } catch (error) {
+                    return cleaned;
+                }
+            };
+
+            const getImageUrl = (img) => {
+                if (!img) {
+                    return null;
+                }
+
+                const directValues = [
+                    img.currentSrc,
+                    img.src,
+                    img.getAttribute('src'),
+                    img.getAttribute('data-delayed-url'),
+                    img.getAttribute('data-src'),
+                    img.getAttribute('data-lazy-src')
+                ];
+
+                for (const value of directValues) {
+                    const url = normalizeUrl(value);
+
+                    if (url) {
+                        return url;
+                    }
+                }
+
+                const srcset = img.getAttribute('srcset') || img.getAttribute('data-srcset') || '';
+
+                if (srcset) {
+                    const srcsetCandidates = srcset
+                        .split(',')
+                        .map((item) => item.trim().split(/\s+/)[0])
+                        .filter(Boolean);
+
+                    for (const candidate of srcsetCandidates.reverse()) {
+                        const url = normalizeUrl(candidate);
+
+                        if (url) {
+                            return url;
+                        }
+                    }
+                }
+
+                return null;
+            };
+
+            const scoreImage = (img, url) => {
+                const alt = (img.getAttribute('alt') || '').toLowerCase();
+                const className = (img.getAttribute('class') || '').toLowerCase();
+                const parentClassName = img.parentElement
+                    ? (img.parentElement.getAttribute('class') || '').toLowerCase()
+                    : '';
+
+                const text = [
+                    url,
+                    alt,
+                    className,
+                    parentClassName
+                ].join(' ').toLowerCase();
+
+                let score = 0;
+
+                if (url.includes('media.licdn.com')) score += 20;
+                if (url.includes('/dms/image/')) score += 20;
+                if (url.includes('company-logo')) score += 70;
+
+                if (text.includes('logo')) score += 55;
+                if (text.includes('company')) score += 30;
+                if (text.includes('org-top-card')) score += 40;
+                if (text.includes('entityphoto-square')) score += 35;
+                if (text.includes('profile-displayphoto')) score += 15;
+
+                const width = img.naturalWidth || img.width || 0;
+                const height = img.naturalHeight || img.height || 0;
+
+                if (width >= 40 && height >= 40) score += 10;
+                if (width > 600 || height > 600) score -= 35;
+
+                if (
+                    text.includes('banner') ||
+                    text.includes('background') ||
+                    text.includes('cover')
+                ) {
+                    score -= 45;
+                }
+
+                return score;
             };
 
             const getLogoUrl = () => {
@@ -217,27 +328,107 @@ def extract_company_info_from_page(page):
                     '.org-top-card-primary-content__logo img',
                     '.org-top-card-summary__logo img',
                     '.org-top-card__logo img',
+                    '.org-company-logo img',
+                    '.org-page-navigation__logo img',
+                    'img.EntityPhoto-square-3',
+                    'img.EntityPhoto-square-4',
+                    '.EntityPhoto-square-3 img',
+                    '.EntityPhoto-square-4 img',
                     'img[alt*="logo"]',
                     'img[alt*="Logo"]',
-                    'img[src*="media.licdn.com"]'
+                    'img[alt*="company"]',
+                    'img[alt*="Company"]',
+                    'img[src*="company-logo"]',
+                    'img[src*="media.licdn.com/dms/image"]',
+                    'img[data-delayed-url*="media.licdn.com"]'
                 ];
 
-                for (const selector of selectors) {
-                    const el = document.querySelector(selector);
+                const candidates = [];
 
-                    if (!el) {
+                for (const selector of selectors) {
+                    const images = Array.from(document.querySelectorAll(selector));
+
+                    for (const img of images) {
+                        const url = getImageUrl(img);
+
+                        if (!url || !url.includes('media.licdn.com')) {
+                            continue;
+                        }
+
+                        candidates.push({
+                            url: url,
+                            score: scoreImage(img, url) + 20
+                        });
+                    }
+                }
+
+                const allImages = Array.from(document.querySelectorAll('img'));
+
+                for (const img of allImages) {
+                    const url = getImageUrl(img);
+
+                    if (!url || !url.includes('media.licdn.com')) {
                         continue;
                     }
 
-                    const src =
-                        el.src ||
-                        el.getAttribute('src') ||
-                        el.getAttribute('data-delayed-url') ||
-                        el.getAttribute('data-ghost-url') ||
-                        null;
+                    const score = scoreImage(img, url);
 
-                    if (src) {
-                        return src;
+                    if (score >= 35) {
+                        candidates.push({
+                            url: url,
+                            score: score
+                        });
+                    }
+                }
+
+                const metaImage = normalizeUrl(
+                    document.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
+                    document.querySelector('meta[name="twitter:image"]')?.getAttribute('content')
+                );
+
+                if (metaImage && metaImage.includes('media.licdn.com')) {
+                    candidates.push({
+                        url: metaImage,
+                        score: 25
+                    });
+                }
+
+                const unique = new Map();
+
+                for (const item of candidates) {
+                    const existing = unique.get(item.url);
+
+                    if (!existing || item.score > existing.score) {
+                        unique.set(item.url, item);
+                    }
+                }
+
+                const ranked = Array.from(unique.values())
+                    .sort((a, b) => b.score - a.score);
+
+                return ranked.length ? ranked[0].url : null;
+            };
+
+            const getWebsiteUrl = () => {
+                const links = Array.from(document.querySelectorAll('a[href]'));
+
+                for (const link of links) {
+                    const href = link.getAttribute('href');
+
+                    if (!href) {
+                        continue;
+                    }
+
+                    const text = (link.innerText || link.textContent || '').toLowerCase();
+                    const aria = (link.getAttribute('aria-label') || '').toLowerCase();
+                    const combined = `${href} ${text} ${aria}`.toLowerCase();
+
+                    if (
+                        combined.includes('website') ||
+                        combined.includes('visit website') ||
+                        combined.includes('company website')
+                    ) {
+                        return normalizeUrl(href);
                     }
                 }
 
@@ -245,85 +436,62 @@ def extract_company_info_from_page(page):
             };
 
             const getDetailByLabel = (labels) => {
-                const normalizedLabels = labels.map(label => label.toLowerCase());
+                const normalizedLabels = labels.map((label) => label.toLowerCase());
 
-                const dts = Array.from(document.querySelectorAll('dt'));
+                const nodes = Array.from(document.querySelectorAll('dt, h3, div, span'));
 
-                for (const dt of dts) {
-                    const labelText = clean(dt.innerText);
+                for (const node of nodes) {
+                    const labelText = clean(node.innerText || node.textContent);
 
                     if (!labelText) {
                         continue;
                     }
 
-                    const lowerLabel = labelText.toLowerCase();
+                    const normalizedLabelText = labelText.toLowerCase();
 
-                    const matched = normalizedLabels.some(label => lowerLabel.includes(label));
+                    const matched = normalizedLabels.some((label) => {
+                        return normalizedLabelText === label ||
+                            normalizedLabelText.includes(label);
+                    });
 
                     if (!matched) {
                         continue;
                     }
 
-                    let dd = dt.nextElementSibling;
+                    const parent = node.parentElement;
 
-                    while (dd && dd.tagName && dd.tagName.toLowerCase() !== 'dd') {
-                        dd = dd.nextElementSibling;
+                    if (!parent) {
+                        continue;
                     }
 
-                    if (dd && clean(dd.innerText)) {
-                        return clean(dd.innerText);
-                    }
-                }
+                    const valueCandidates = Array.from(parent.querySelectorAll('dd, span, div, a'))
+                        .map((el) => clean(el.innerText || el.textContent))
+                        .filter(Boolean)
+                        .filter((value) => value.toLowerCase() !== normalizedLabelText);
 
-                const allText = document.body ? document.body.innerText : '';
-                const lines = allText
-                    .split('\\n')
-                    .map(line => clean(line))
-                    .filter(Boolean);
-
-                for (let index = 0; index < lines.length; index += 1) {
-                    const lowerLine = lines[index].toLowerCase();
-
-                    const matched = normalizedLabels.some(label => lowerLine === label || lowerLine.includes(label));
-
-                    if (matched && lines[index + 1]) {
-                        return lines[index + 1];
+                    if (valueCandidates.length) {
+                        return valueCandidates[valueCandidates.length - 1];
                     }
                 }
 
                 return null;
             };
 
-            const getWebsiteUrl = () => {
-                const selectors = [
-                    'a[data-control-name*="website"]',
-                    'a[href^="http"]:not([href*="linkedin.com"])'
-                ];
+            const name =
+                getTextBySelectors([
+                    'h1',
+                    '.org-top-card-summary__title',
+                    '.org-top-card-primary-content__title',
+                    '.org-top-card__primary-content h1'
+                ]);
 
-                for (const selector of selectors) {
-                    const el = document.querySelector(selector);
-
-                    if (el && el.href && !el.href.includes('linkedin.com')) {
-                        return el.href;
-                    }
-                }
-
-                return null;
-            };
-
-            const name = getText([
-                'h1.org-top-card-summary__title',
-                '.org-top-card-summary__title',
-                'h1'
-            ]);
-
-            const about = getText([
-                '.org-about-us-organization-description__text',
-                '.org-about-module__description',
-                'section.org-about-module p',
-                '.break-words.white-space-pre-wrap',
-                '.org-page-details__definition-text'
-            ]);
+            const about =
+                getTextBySelectors([
+                    '.org-about-us-organization-description__text',
+                    '.break-words.white-space-pre-wrap',
+                    '.org-page-details__definition-text',
+                    'section p'
+                ]);
 
             const logoUrl = getLogoUrl();
 
@@ -333,34 +501,30 @@ def extract_company_info_from_page(page):
 
             const industry = getDetailByLabel([
                 'industry',
-                'branche'
+                'industries'
             ]);
 
             const companySize = getDetailByLabel([
                 'company size',
-                'größe',
-                'employees',
-                'beschäftigte'
+                'size'
             ]);
 
             const headquarters = getDetailByLabel([
                 'headquarters',
-                'hauptsitz',
-                'location'
+                'headquarter'
             ]);
 
             return {
-                name,
+                name: name,
                 logo_url: logoUrl,
                 website_url: websiteUrl,
-                industry,
+                industry: industry,
                 company_size: companySize,
-                headquarters,
-                about
+                headquarters: headquarters,
+                about: about
             };
         }
-        """
-    )
+    """)
 
 
 def update_company(cursor, company_id, company_info):
