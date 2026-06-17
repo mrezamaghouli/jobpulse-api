@@ -3,3 +3,5 @@ uvicorn
 pydantic
 psycopg2-binary
 pytest
+sentence-transformers
+numpy
