@@ -292,10 +292,10 @@ def calculate_keyword_score(row, query):
         return 0.0
 
     fields = {
-        "title": 5.0,
+        "title": 6.0,
         "company": 2.0,
         "location": 2.0,
-        "work_mode": 1.5,
+        "work_mode": 2.0,
         "job_type": 1.5,
         "seniority": 1.5,
         "apply_type": 1.0,
@@ -314,8 +314,14 @@ def calculate_keyword_score(row, query):
             continue
 
         for term in terms:
-            if term in value:
-                score += weight
+            if len(term) <= 3:
+                pattern = r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])"
+
+                if re.search(pattern, value):
+                    score += weight
+            else:
+                if term in value:
+                    score += weight
 
     query_text = str(query).lower().strip()
 
@@ -419,6 +425,26 @@ def calculate_quality_score(row):
         score += 0.20
 
     return min(score, 1.0)
+
+
+
+
+def should_use_semantic_query(query):
+    query_text = str(query or "").strip()
+    terms = normalize_search_terms(query_text)
+
+    if not terms:
+        return False
+
+    # Very short searches like UX, UI, QA, HR should be keyword/rule based.
+    # Loading/running semantic search for them is slower and often less precise.
+    if len(query_text) <= 3:
+        return False
+
+    if len(terms) == 1 and len(terms[0]) <= 3:
+        return False
+
+    return True
 
 
 def build_hybrid_query_vector(query):
@@ -639,7 +665,7 @@ def get_all_jobs_from_db(
         )
 
         candidate_rows = cursor.fetchall()
-        query_vector = build_hybrid_query_vector(query)
+        query_vector = build_hybrid_query_vector(query) if should_use_semantic_query(query) else None
         semantic_threshold = float(os.getenv("JOB_SEARCH_SEMANTIC_THRESHOLD", "0.28"))
 
         ranked = []

@@ -35,6 +35,7 @@ class Job(BaseModel):
     inactive_reason: Optional[str] = None
     archived_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
+    search_score: Optional[float] = None
 
 
 class JobSearchResponse(BaseModel):

@@ -569,6 +569,14 @@
         grid-template-columns: 1fr;
       }
     }
+  
+    .relevance-tag {
+      font-weight: 700;
+      border: 1px solid rgba(37, 99, 235, 0.35);
+      background: rgba(37, 99, 235, 0.08);
+    }
+
+
   </style>
 </head>
 
@@ -752,7 +760,7 @@
   </div>
 
   <script>
-    const API_BASE_URL = window.JOBPULSE_API_URL || 'http://127.0.0.1:8000';
+    const API_BASE_URL = `${window.location.origin}/api`;
 
     let allJobs = [];
     let filteredJobs = [];
@@ -885,6 +893,8 @@
       } else if (job.date_posted) {
         tags.push(`<span class="meta-tag">Posted: ${escapeHtml(job.date_posted)}</span>`);
       }
+
+      tags.push(formatSearchScore(job.search_score));
 
       if (job.source) {
         tags.push(`<span class="meta-tag">${escapeHtml(job.source)}</span>`);
@@ -1425,6 +1435,24 @@
     document.getElementById('workModeInput').addEventListener('change', applyFilters);
 
     reloadData();
+  
+    function formatSearchScore(score) {
+      if (score === undefined || score === null || score === "") {
+        return "";
+      }
+
+      const numericScore = Number(score);
+
+      if (Number.isNaN(numericScore)) {
+        return "";
+      }
+
+      const percentage = Math.max(0, Math.min(100, Math.round(numericScore * 100)));
+
+      return `<span class="tag relevance-tag">Match ${percentage}%</span>`;
+    }
+
+
   </script>
 </body>
 </html>
