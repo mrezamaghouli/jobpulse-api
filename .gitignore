@@ -68,3 +68,7 @@ build/
 *.log
 served_frontend.html
 config/linkedin_smart_queries.json
+.env.local
+.env
+.auth/
+logs/
