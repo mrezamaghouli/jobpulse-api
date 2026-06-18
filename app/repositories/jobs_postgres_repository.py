@@ -13,6 +13,7 @@ from psycopg2.extras import RealDictCursor
 from app.postgres_database import get_postgres_connection
 
 
+from app.search_intelligence import record_job_search_event
 JOB_SELECT_COLUMNS = """
     id,
     linkedin_job_id,
@@ -513,6 +514,22 @@ def get_all_jobs_from_db(
         where_clauses = []
         params = []
 
+        filters_payload = {
+            "title": title,
+            "company": company,
+            "location": location,
+            "remote": remote,
+            "work_mode": work_mode,
+            "seniority": seniority,
+            "job_type": job_type,
+            "min_salary": min_salary,
+            "max_salary": max_salary,
+            "source": source,
+            "apply_type": apply_type,
+            "is_active": is_active,
+            "active_only": active_only,
+        }
+
         if title:
             where_clauses.append("j.title ILIKE %s")
             params.append(f"%{title}%")
@@ -694,6 +711,23 @@ def get_all_jobs_from_db(
 
         ranked.sort(key=lambda item: (item[0], item[1].get("id") or 0), reverse=True)
 
+
+        # Do not treat weak fuzzy/semantic matches as real inventory.
+        # Multi-word searches must pass a stronger relevance threshold.
+        # Short exact searches like UX/UI/QA can use a lower keyword threshold.
+        query_terms_for_threshold = normalize_search_terms(query)
+
+        if len(query_terms_for_threshold) >= 2:
+            min_relevance_score = float(os.getenv("JOB_SEARCH_MIN_RELEVANCE_SCORE", "0.38"))
+        else:
+            min_relevance_score = float(os.getenv("JOB_SEARCH_KEYWORD_MIN_RELEVANCE_SCORE", "0.12"))
+
+        ranked = [
+            item
+            for item in ranked
+            if float(item[0] or 0) >= min_relevance_score
+        ]
+
         total = len(ranked)
         page_items = ranked[offset:offset + safe_limit]
 
@@ -701,7 +735,7 @@ def get_all_jobs_from_db(
         if safe_limit > 0:
             total_pages = (int(total) + safe_limit - 1) // safe_limit
 
-        return {
+        response = {
             "results": [
                 serialize_search_result(row, score=score)
                 for score, row in page_items
@@ -712,6 +746,15 @@ def get_all_jobs_from_db(
             "total_pages": total_pages,
             "search_mode": "hybrid",
         }
+
+        record_job_search_event(
+            query=query,
+            filters=filters_payload,
+            result_count=int(total or 0),
+            search_mode="hybrid",
+        )
+
+        return response
 
     finally:
         if cursor:

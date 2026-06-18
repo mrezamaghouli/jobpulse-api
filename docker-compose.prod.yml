@@ -4,6 +4,9 @@ services:
     container_name: jobpulse-postgres-prod
     restart: unless-stopped
     environment:
+      JOB_SEARCH_MIN_RELEVANCE_SCORE: "0.38"
+      JOB_SEARCH_KEYWORD_MIN_RELEVANCE_SCORE: "0.12"
+      SEARCH_DEMAND_MIN_RESULTS: "3"
       POSTGRES_DB: ${POSTGRES_DB:-jobpulse}
       POSTGRES_USER: ${POSTGRES_USER:-jobpulse_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
