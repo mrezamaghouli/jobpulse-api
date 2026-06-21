@@ -36,7 +36,13 @@ send_telegram() {
       return 1
     }
 
-  log "telegram_send_ok response=$(cat /tmp/jobpulse_telegram_response.out)"
+  if grep -q '"ok":true' /tmp/jobpulse_telegram_response.out; then
+    log "telegram_send_ok response=$(cat /tmp/jobpulse_telegram_response.out)"
+    return 0
+  fi
+
+  log "telegram_send_failed response=$(cat /tmp/jobpulse_telegram_response.out)"
+  return 1
 }
 
 if [ -f "$ENV_FILE" ]; then
