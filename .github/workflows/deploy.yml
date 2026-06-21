@@ -45,10 +45,51 @@ jobs:
 
           ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
 
+      - name: Prepare deploy timestamp
+        run: |
+          echo "DEPLOY_TS=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_ENV"
+
       - name: Test SSH connection
         run: |
           ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" \
             "$VM_USER@$VM_HOST" "echo 'SSH connection OK' && hostname"
+
+      - name: Pre-deploy backup on VM
+        run: |
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<EOF
+          set -e
+
+          mkdir -p /opt/jobpulse_backups/releases
+          mkdir -p /opt/jobpulse_backups/db
+
+          if [ -d /opt/jobpulse ]; then
+            tar \
+              --exclude='/opt/jobpulse/.auth' \
+              --exclude='/opt/jobpulse/.env' \
+              --exclude='/opt/jobpulse/logs' \
+              --exclude='/opt/jobpulse/sample_output' \
+              --exclude='/opt/jobpulse/scripts/__pycache__' \
+              --exclude='/opt/jobpulse/jobpulse_local_backup.dump' \
+              -czf /opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz \
+              -C /opt jobpulse
+          fi
+
+          cd /opt/jobpulse
+
+          docker compose -f docker-compose.prod.yml exec -T db pg_dump \
+            -U jobpulse_user \
+            -d jobpulse \
+            -Fc \
+            -f /tmp/jobpulse_pre_deploy_${DEPLOY_TS}.dump
+
+          docker compose -f docker-compose.prod.yml cp \
+            db:/tmp/jobpulse_pre_deploy_${DEPLOY_TS}.dump \
+            /opt/jobpulse_backups/db/jobpulse_pre_deploy_${DEPLOY_TS}.dump
+
+          echo "Backup created:"
+          echo "/opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz"
+          echo "/opt/jobpulse_backups/db/jobpulse_pre_deploy_${DEPLOY_TS}.dump"
+          EOF
 
       - name: Sync repository to VM
         run: |
@@ -66,10 +107,28 @@ jobs:
             -e "ssh -i ~/.ssh/jobpulse_deploy_key -p $VM_PORT" \
             ./ "$VM_USER@$VM_HOST:/opt/jobpulse/"
 
-      - name: Deploy containers on VM
+      - name: Deploy containers with rollback
         run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'EOF'
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<EOF
           set -e
+
+          BACKUP_FILE="/opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz"
+
+          rollback() {
+            echo "Deploy failed. Rolling back..."
+
+            if [ -f "\$BACKUP_FILE" ]; then
+              tar -xzf "\$BACKUP_FILE" -C /opt
+              cd /opt/jobpulse
+              docker compose -f docker-compose.prod.yml build
+              docker compose -f docker-compose.prod.yml up -d --remove-orphans
+              echo "Rollback finished."
+            else
+              echo "No backup file found for rollback: \$BACKUP_FILE"
+            fi
+          }
+
+          trap rollback ERR
 
           cd /opt/jobpulse
 
@@ -81,7 +140,29 @@ jobs:
           docker compose -f docker-compose.prod.yml build
           docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
-          sleep 5
+          echo "Waiting for API health..."
+          for i in \$(seq 1 20); do
+            if curl -fsS http://localhost/api/health; then
+              echo "Health check passed."
+              trap - ERR
+              exit 0
+            fi
 
-          curl -fsS http://localhost/api/health
+            echo "Health check attempt \$i failed. Retrying..."
+            sleep 5
+          done
+
+          echo "Health check failed after retries."
+          exit 1
+          EOF
+
+      - name: Cleanup old backups
+        run: |
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'EOF'
+          set -e
+
+          find /opt/jobpulse_backups/releases -type f -name "jobpulse_*.tgz" -mtime +14 -delete || true
+          find /opt/jobpulse_backups/db -type f -name "jobpulse_pre_deploy_*.dump" -mtime +14 -delete || true
+
+          echo "Old backup cleanup finished."
           EOF
