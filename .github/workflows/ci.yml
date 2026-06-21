@@ -12,12 +12,12 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      POSTGRES_HOST: localhost
+      POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_DB: jobpulse
       POSTGRES_USER: jobpulse_user
       POSTGRES_PASSWORD: jobpulse_password
-      DATABASE_URL: postgresql://jobpulse_user:jobpulse_password@localhost:5432/jobpulse
+      DATABASE_URL: postgresql://jobpulse_user:jobpulse_password@db:5432/jobpulse
       LINKEDIN_BROWSER: chromium
       LINKEDIN_HEADLESS: "true"
       JOB_SEARCH_MIN_RELEVANCE_SCORE: "0.38"
@@ -26,6 +26,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Create CI env file
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_HOST=db
+          POSTGRES_PORT=5432
+          POSTGRES_DB=jobpulse
+          POSTGRES_USER=jobpulse_user
+          POSTGRES_PASSWORD=jobpulse_password
+          DATABASE_URL=postgresql://jobpulse_user:jobpulse_password@db:5432/jobpulse
+          LINKEDIN_BROWSER=chromium
+          LINKEDIN_HEADLESS=true
+          JOB_SEARCH_MIN_RELEVANCE_SCORE=0.38
+          JOB_SEARCH_KEYWORD_MIN_RELEVANCE_SCORE=0.12
+          EOF
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
