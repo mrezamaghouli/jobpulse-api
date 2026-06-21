@@ -72,3 +72,12 @@ config/linkedin_smart_queries.json
 .env
 .auth/
 logs/
+
+# production secrets / local runtime
+.env
+.auth/
+logs/
+sample_output/
+*.dump
+*.sql
+jobpulse_local_backup*

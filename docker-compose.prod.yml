@@ -50,6 +50,9 @@ services:
       timeout: 10s
       retries: 10
 
+    volumes:
+      - ./.auth:/app/.auth:ro
+      - ./logs:/app/logs
   frontend:
     image: nginx:alpine
     container_name: jobpulse-frontend-prod

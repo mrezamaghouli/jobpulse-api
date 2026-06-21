@@ -122,7 +122,7 @@ class LinkedInBrowserProvider:
 
         return playwright.chromium.launch(
             channel=channel,
-            headless=False,
+            headless=os.getenv("LINKEDIN_HEADLESS", "true").lower() not in ("0", "false", "no"),
             slow_mo=200,
         )
 

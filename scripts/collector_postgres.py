@@ -189,6 +189,33 @@ def is_linkedin_job(job):
 
 
 def insert_job(cursor, job):
+    # LinkedIn jobs must have a stable linkedin_job_id.
+    # If provider returns an empty ID, try to recover it from job_url/apply_url.
+    # If it still cannot be recovered, skip it to avoid unique constraint errors on "".
+    import re as _re
+
+    linkedin_job_id = str(job.get("linkedin_job_id") or "").strip()
+
+    if not linkedin_job_id:
+        for _url_key in ("job_url", "apply_url"):
+            _url = str(job.get(_url_key) or "")
+            _match = _re.search(r"/jobs/view/(\d+)", _url)
+            if _match:
+                linkedin_job_id = _match.group(1)
+                job["linkedin_job_id"] = linkedin_job_id
+                break
+
+    if not linkedin_job_id:
+        print(
+            "Skipping job without linkedin_job_id:",
+            job.get("title"),
+            "|",
+            job.get("company"),
+        )
+        return
+
+    job["linkedin_job_id"] = linkedin_job_id
+
     job = normalize_apply_fields(job)
 
     cursor.execute(

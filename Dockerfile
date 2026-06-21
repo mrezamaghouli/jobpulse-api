@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir \
     --retries 10 \
     -r requirements.txt
 
+RUN python -m playwright install --with-deps chromium chrome
+
 COPY app ./app
 COPY scripts ./scripts
 COPY config ./config
