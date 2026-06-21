@@ -59,8 +59,9 @@ jobs:
           ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<EOF
           set -e
 
-          mkdir -p /opt/jobpulse_backups/releases
-          mkdir -p /opt/jobpulse_backups/db
+          sudo mkdir -p /opt/jobpulse_backups/releases
+          sudo mkdir -p /opt/jobpulse_backups/db
+          sudo chown -R mrezamaghouli:mrezamaghouli /opt/jobpulse_backups
 
           if [ -d /opt/jobpulse ]; then
             tar \
