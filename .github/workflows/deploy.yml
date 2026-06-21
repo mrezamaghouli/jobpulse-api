@@ -29,9 +29,31 @@ jobs:
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
+
+          if [ -z "${{ secrets.VM_HOST }}" ]; then
+            echo "VM_HOST secret is missing"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.VM_USER }}" ]; then
+            echo "VM_USER secret is missing"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.VM_SSH_KEY }}" ]; then
+            echo "VM_SSH_KEY secret is missing"
+            exit 1
+          fi
+
+          VM_PORT="${{ secrets.VM_PORT }}"
+          if [ -z "$VM_PORT" ]; then
+            VM_PORT="22"
+          fi
+          echo "VM_PORT=$VM_PORT" >> "$GITHUB_ENV"
+
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/jobpulse_deploy_key
           chmod 600 ~/.ssh/jobpulse_deploy_key
-          ssh-keyscan -p "${{ secrets.VM_PORT }}" -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$VM_PORT" -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Sync repository to VM
         run: |
@@ -45,12 +67,12 @@ jobs:
             --exclude='*.pyc' \
             --exclude='*.dump' \
             --exclude='*.sql' \
-            -e "ssh -i ~/.ssh/jobpulse_deploy_key -p ${{ secrets.VM_PORT }}" \
+            -e "ssh -i ~/.ssh/jobpulse_deploy_key -p $VM_PORT" \
             ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/jobpulse/
 
       - name: Deploy containers on VM
         run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "${{ secrets.VM_PORT }}" \
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" \
             ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
           set -e
 
