@@ -1,0 +1,70 @@
+name: Deploy Production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    name: Deploy to GCP VM
+    runs-on: ubuntu-latest
+
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install SSH and rsync tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/jobpulse_deploy_key
+          chmod 600 ~/.ssh/jobpulse_deploy_key
+          ssh-keyscan -p "${{ secrets.VM_PORT }}" -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync repository to VM
+        run: |
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='.auth' \
+            --exclude='logs' \
+            --exclude='sample_output' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='*.dump' \
+            --exclude='*.sql' \
+            -e "ssh -i ~/.ssh/jobpulse_deploy_key -p ${{ secrets.VM_PORT }}" \
+            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/jobpulse/
+
+      - name: Deploy containers on VM
+        run: |
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "${{ secrets.VM_PORT }}" \
+            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+          set -e
+
+          cd /opt/jobpulse
+
+          docker compose -f docker-compose.prod.yml exec -T db psql -U jobpulse_user -d jobpulse -c "
+          ALTER TABLE jobs
+          ADD COLUMN IF NOT EXISTS company_logo_url TEXT;
+          "
+
+          docker compose -f docker-compose.prod.yml build
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+          sleep 5
+
+          curl -fsS http://localhost/api/health
+          EOF
