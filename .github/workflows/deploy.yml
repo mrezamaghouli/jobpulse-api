@@ -15,6 +15,11 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main'
 
+    env:
+      VM_HOST: "35.192.251.190"
+      VM_USER: "mrezamaghouli"
+      VM_PORT: "22"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,30 +35,20 @@ jobs:
         run: |
           mkdir -p ~/.ssh
 
-          if [ -z "${{ secrets.VM_HOST }}" ]; then
-            echo "VM_HOST secret is missing"
-            exit 1
-          fi
-
-          if [ -z "${{ secrets.VM_USER }}" ]; then
-            echo "VM_USER secret is missing"
-            exit 1
-          fi
-
           if [ -z "${{ secrets.VM_SSH_KEY }}" ]; then
             echo "VM_SSH_KEY secret is missing"
             exit 1
           fi
 
-          VM_PORT="${{ secrets.VM_PORT }}"
-          if [ -z "$VM_PORT" ]; then
-            VM_PORT="22"
-          fi
-          echo "VM_PORT=$VM_PORT" >> "$GITHUB_ENV"
-
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/jobpulse_deploy_key
           chmod 600 ~/.ssh/jobpulse_deploy_key
-          ssh-keyscan -p "$VM_PORT" -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" \
+            "$VM_USER@$VM_HOST" "echo 'SSH connection OK' && hostname"
 
       - name: Sync repository to VM
         run: |
@@ -63,17 +58,17 @@ jobs:
             --exclude='.auth' \
             --exclude='logs' \
             --exclude='sample_output' \
+            --exclude='scripts/__pycache__' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='*.dump' \
             --exclude='*.sql' \
             -e "ssh -i ~/.ssh/jobpulse_deploy_key -p $VM_PORT" \
-            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/jobpulse/
+            ./ "$VM_USER@$VM_HOST:/opt/jobpulse/"
 
       - name: Deploy containers on VM
         run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'EOF'
           set -e
 
           cd /opt/jobpulse
