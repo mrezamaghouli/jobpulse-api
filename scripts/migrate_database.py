@@ -181,6 +181,51 @@ MIGRATIONS = [
             ON collection_cycles(status);
         """,
     ),
+    (
+        "007_jobs_performance_indexes",
+        """
+        CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+        DO $$
+        BEGIN
+            IF to_regclass('public.jobs') IS NOT NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_jobs_active_last_seen
+                    ON jobs(is_active, last_seen_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_active_date_posted_at
+                    ON jobs(is_active, date_posted_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_work_mode
+                    ON jobs(work_mode);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_remote
+                    ON jobs(remote);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_source
+                    ON jobs(source);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_title_trgm
+                    ON jobs USING GIN (title gin_trgm_ops);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_company_trgm
+                    ON jobs USING GIN (company gin_trgm_ops);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_location_trgm
+                    ON jobs USING GIN (location gin_trgm_ops);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_description_trgm
+                    ON jobs USING GIN (job_description gin_trgm_ops);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_about_trgm
+                    ON jobs USING GIN (job_about gin_trgm_ops);
+
+                CREATE INDEX IF NOT EXISTS idx_jobs_active_remote_recent
+                    ON jobs(last_seen_at DESC)
+                    WHERE is_active = TRUE AND (remote = TRUE OR LOWER(COALESCE(work_mode, '')) = 'remote');
+            END IF;
+        END $$;
+        """,
+    ),
 ]
 
 

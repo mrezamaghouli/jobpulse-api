@@ -604,3 +604,8 @@ def get_recent_collector_runs(limit: int = 10):
 from app.api_guard import ApiGuardMiddleware
 app.add_middleware(ApiGuardMiddleware)
 
+
+# Internal short-lived cache for repeated public job search queries.
+from app.api_cache import SimpleApiCacheMiddleware
+app.add_middleware(SimpleApiCacheMiddleware)
+
