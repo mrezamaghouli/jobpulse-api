@@ -598,3 +598,9 @@ def get_recent_collector_runs(limit: int = 10):
     return {
         "results": serialize_data(collector_runs),
     }
+
+
+# Production API guard: request validation, rate limiting, and safe error responses.
+from app.api_guard import ApiGuardMiddleware
+app.add_middleware(ApiGuardMiddleware)
+
