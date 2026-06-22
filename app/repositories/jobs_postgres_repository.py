@@ -14,6 +14,7 @@ from app.postgres_database import get_postgres_connection
 
 
 from app.search_intelligence import record_job_search_event
+from app.search_quality import rerank_jobs
 JOB_SELECT_COLUMNS = """
     id,
     linkedin_job_id,
@@ -239,11 +240,15 @@ def get_safe_sort_clause(sort_by=None, sort_order=None):
 
 
 def get_jobs_from_db(**kwargs):
-    return get_all_jobs_from_db(**kwargs)
+    result = get_all_jobs_from_db(**kwargs)
+    query = kwargs.get("query") or kwargs.get("q") or kwargs.get("keywords")
+    return rerank_jobs(result, query)
 
 
 def search_jobs_from_db(**kwargs):
     result = get_all_jobs_from_db(**kwargs)
+    query = kwargs.get("query") or kwargs.get("q") or kwargs.get("keywords")
+    result = rerank_jobs(result, query)
 
     if isinstance(result, dict) and "results" in result:
         return result["results"]
