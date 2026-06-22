@@ -67,6 +67,7 @@ jobs:
           python -m py_compile scripts/process_search_demand_queue.py
           python -m py_compile scripts/seed_autonomous_search_queue.py
           python -m py_compile scripts/build_linkedin_collection_targets.py
+          python -m py_compile scripts/migrate_database.py
 
       - name: Validate Docker Compose config
         run: |
