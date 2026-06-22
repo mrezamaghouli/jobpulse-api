@@ -1,3 +1,4 @@
+from app.admin_api import router as admin_router
 import logging
 import os
 import time
@@ -609,3 +610,5 @@ app.add_middleware(ApiGuardMiddleware)
 from app.api_cache import SimpleApiCacheMiddleware
 app.add_middleware(SimpleApiCacheMiddleware)
 
+# Private admin endpoints protected by X-Admin-Key.
+app.include_router(admin_router)
