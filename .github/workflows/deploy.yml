@@ -121,7 +121,19 @@ jobs:
             if [ -f "\$BACKUP_FILE" ]; then
               tar -xzf "\$BACKUP_FILE" -C /opt
               cd /opt/jobpulse
-              docker compose -f docker-compose.prod.yml build
+              for attempt in 1 2 3; do
+                echo "Docker build attempt ${attempt}/3"
+                docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull python:3.12-slim || true
+                if docker compose -f docker-compose.prod.yml build; then
+                  break
+                fi
+                if [ "$attempt" = "3" ]; then
+                  echo "Docker build failed after 3 attempts"
+                  exit 1
+                fi
+                echo "Docker build failed, retrying after $((attempt * 20)) seconds..."
+                sleep $((attempt * 20))
+              done
               docker compose -f docker-compose.prod.yml up -d --remove-orphans
               echo "Rollback finished."
             else
@@ -133,7 +145,19 @@ jobs:
 
           cd /opt/jobpulse
 
-          docker compose -f docker-compose.prod.yml build
+          for attempt in 1 2 3; do
+            echo "Docker build attempt ${attempt}/3"
+            docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull python:3.12-slim || true
+            if docker compose -f docker-compose.prod.yml build; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              echo "Docker build failed after 3 attempts"
+              exit 1
+            fi
+            echo "Docker build failed, retrying after $((attempt * 20)) seconds..."
+            sleep $((attempt * 20))
+          done
 
           docker compose -f docker-compose.prod.yml run --rm api python -m scripts.migrate_database
 
