@@ -239,15 +239,26 @@ def get_safe_sort_clause(sort_by=None, sort_order=None):
     return f"{sort_field} {direction}"
 
 
+
+def extract_search_query_from_kwargs(kwargs):
+    return (
+        kwargs.get("query")
+        or kwargs.get("search")
+        or kwargs.get("search_query")
+        or kwargs.get("q")
+        or kwargs.get("keywords")
+        or kwargs.get("title")
+    )
+
 def get_jobs_from_db(**kwargs):
     result = get_all_jobs_from_db(**kwargs)
-    query = kwargs.get("query") or kwargs.get("q") or kwargs.get("keywords")
+    query = extract_search_query_from_kwargs(kwargs)
     return rerank_jobs(result, query)
 
 
 def search_jobs_from_db(**kwargs):
     result = get_all_jobs_from_db(**kwargs)
-    query = kwargs.get("query") or kwargs.get("q") or kwargs.get("keywords")
+    query = extract_search_query_from_kwargs(kwargs)
     result = rerank_jobs(result, query)
 
     if isinstance(result, dict) and "results" in result:

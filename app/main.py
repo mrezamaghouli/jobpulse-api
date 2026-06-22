@@ -17,6 +17,7 @@ from app.repositories.collector_runs_repository import (
 )
 from app.repositories.jobs_postgres_repository import (
     get_all_jobs_from_db,
+    get_jobs_from_db,
     get_job_by_id_from_db,
     get_jobs_stats_from_db,
     search_jobs_from_db,
@@ -160,6 +161,8 @@ class Job(BaseModel):
     archived_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     search_score: Optional[float] = None
+    quality_score: float | None = None
+    quality_reasons: list[str] | None = None
 
 
 class JobSearchResponse(BaseModel):
@@ -349,7 +352,7 @@ def get_jobs(
     sort_by: str = "last_seen_at",
     sort_order: str = "desc",
 ):
-    data = get_all_jobs_from_db(
+    data = get_jobs_from_db(
         query=query,
         title=title,
         company=company,

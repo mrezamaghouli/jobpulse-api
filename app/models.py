@@ -36,6 +36,8 @@ class Job(BaseModel):
     archived_at: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     search_score: Optional[float] = None
+    quality_score: float | None = None
+    quality_reasons: list[str] | None = None
 
 
 class JobSearchResponse(BaseModel):
