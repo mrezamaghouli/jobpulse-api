@@ -149,6 +149,38 @@ MIGRATIONS = [
             ON linkedin_collection_targets(status, priority_score DESC);
         """,
     ),
+    (
+        "006_collection_cycles_reporting",
+        """
+        CREATE TABLE IF NOT EXISTS collection_cycles (
+            id BIGSERIAL PRIMARY KEY,
+            cycle_id TEXT UNIQUE NOT NULL,
+            trigger_name TEXT DEFAULT 'manual',
+            status TEXT NOT NULL DEFAULT 'running',
+            seed_limit INTEGER DEFAULT 0,
+            process_limit INTEGER DEFAULT 0,
+            workers INTEGER DEFAULT 1,
+            skip_company_enrichment BOOLEAN DEFAULT TRUE,
+            jobs_count_before INTEGER,
+            jobs_count_after INTEGER,
+            jobs_delta INTEGER,
+            pending_before INTEGER,
+            pending_after INTEGER,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at TIMESTAMPTZ,
+            duration_seconds DOUBLE PRECISION,
+            stdout_tail TEXT,
+            stderr_tail TEXT,
+            error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_collection_cycles_started_at
+            ON collection_cycles(started_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_collection_cycles_status
+            ON collection_cycles(status);
+        """,
+    ),
 ]
 
 
