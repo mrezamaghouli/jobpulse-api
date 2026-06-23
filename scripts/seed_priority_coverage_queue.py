@@ -95,6 +95,7 @@ def enqueue_task(cursor, task, before_count: int):
         "catalog_category": category,
         "linkedin_keywords": title,
         "linkedin_location": country,
+        "location": country,
         "country": country,
         "country_priority": priority,
         "source": "priority_coverage",

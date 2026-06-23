@@ -101,7 +101,12 @@ def build_linkedin_queries(rows):
     for row in rows:
         filters = row.get("filters_json") or {}
 
-        location = filters.get("location") or ""
+        location = (
+            filters.get("linkedin_location")
+            or filters.get("location")
+            or filters.get("country")
+            or ""
+        )
         work_mode = filters.get("work_mode") or "any"
 
         queries.append(

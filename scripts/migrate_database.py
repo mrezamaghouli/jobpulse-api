@@ -226,6 +226,62 @@ MIGRATIONS = [
         END $$;
         """,
     ),
+    (
+        "008_priority_job_country_catalog",
+        """
+        CREATE TABLE IF NOT EXISTS job_catalog_titles (
+            id BIGSERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            normalized_title TEXT UNIQUE NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ
+        );
+
+        CREATE TABLE IF NOT EXISTS job_catalog_countries (
+            id BIGSERIAL PRIMARY KEY,
+            country_name TEXT NOT NULL,
+            normalized_country TEXT UNIQUE NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 99,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ
+        );
+
+        CREATE TABLE IF NOT EXISTS job_collection_coverage (
+            id BIGSERIAL PRIMARY KEY,
+            job_title_id BIGINT NOT NULL REFERENCES job_catalog_titles(id) ON DELETE CASCADE,
+            country_id BIGINT NOT NULL REFERENCES job_catalog_countries(id) ON DELETE CASCADE,
+            search_query TEXT NOT NULL,
+            linkedin_location TEXT NOT NULL,
+            country_priority INTEGER NOT NULL DEFAULT 99,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_queued_at TIMESTAMPTZ,
+            last_collected_at TIMESTAMPTZ,
+            jobs_count_before INTEGER,
+            jobs_count_after INTEGER,
+            jobs_delta INTEGER,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ,
+            UNIQUE(job_title_id, country_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_job_collection_coverage_status_priority
+            ON job_collection_coverage(status, country_priority, id);
+
+        CREATE INDEX IF NOT EXISTS idx_job_collection_coverage_country_priority
+            ON job_collection_coverage(country_priority);
+
+        CREATE INDEX IF NOT EXISTS idx_job_catalog_titles_category
+            ON job_catalog_titles(category);
+
+        CREATE INDEX IF NOT EXISTS idx_job_catalog_countries_priority
+            ON job_catalog_countries(priority);
+        """,
+    ),
 ]
 
 
