@@ -9,6 +9,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from app.config import get_postgres_config
+from scripts.linkedin_auth_preflight import preflight_linkedin_auth
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -143,6 +144,7 @@ def run_module(module_name, extra_env=None):
 
 
 def main():
+    preflight_linkedin_auth()
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--workers", type=int, default=1)

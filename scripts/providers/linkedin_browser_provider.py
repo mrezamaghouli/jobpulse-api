@@ -13,6 +13,8 @@ from playwright.sync_api import (
 )
 
 from app.config import (
+
+
     get_linkedin_browser,
     get_linkedin_keywords,
     get_linkedin_limit,
@@ -25,6 +27,66 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 AUTH_FILE = BASE_DIR / ".auth" / "linkedin_storage_state.json"
 OUTPUT_DIR = BASE_DIR / "sample_output"
 OUTPUT_FILE = OUTPUT_DIR / "linkedin_browser_provider_last_run.json"
+
+
+
+def detect_linkedin_auth_state(page):
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+
+    try:
+        body = (page.locator("body").inner_text(timeout=5000) or "").lower()
+    except Exception:
+        body = ""
+
+    bad_url = any(x in url for x in [
+        "linkedin.com/login",
+        "/checkpoint/",
+        "checkpoint",
+        "challenge",
+    ])
+
+    bad_title = "linkedin login" in title or "sign in" in title
+
+    bad_body = (
+        ("sign in" in body and "join now" in body)
+        or "sign in to view" in body
+        or "join linkedin" in body
+        or "sign in to linkedin" in body
+    )
+
+    if bad_url or bad_title or bad_body:
+        return "logged_out_or_checkpoint"
+
+    return "probably_authenticated"
+
+
+def assert_linkedin_authenticated(page, stage="linkedin"):
+    state = detect_linkedin_auth_state(page)
+
+    if state != "probably_authenticated":
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+
+        try:
+            title = page.title()
+        except Exception:
+            title = ""
+
+        raise RuntimeError(
+            "LinkedIn authentication failed "
+            f"stage={stage} url={url!r} title={title!r}. "
+            "Refresh /app/.auth/linkedin_storage_state.json before running the collector."
+        )
 
 
 class LinkedInBrowserProvider:
@@ -662,7 +724,7 @@ class LinkedInBrowserProvider:
             click_selectors = [
                 f'li[data-occludable-job-id="{job_id}"]',
                 f'div[data-job-id="{job_id}"]',
-                f'a[href*="/jobs/view/{job_id}"]',
+                f'a[href*="{job_id}"]',
                 f'a[href*="currentJobId={job_id}"]',
                 f'a[href*="jobId={job_id}"]',
             ]
@@ -1202,7 +1264,10 @@ class LinkedInBrowserProvider:
             return ""
 
         patterns = [
-            r"/jobs/view/(\d+)",
+            r"/jobs/view/(?:[^/?#]+-)?(\d+)(?:[/?#]|$)",
+            r"/jobs/view/(\d+)(?:[/?#]|$)",
+            r"currentJobId=(\d+)",
+            r"jobId=(\d+)",
             r"currentJobId=(\d+)",
             r"jobId=(\d+)",
         ]
