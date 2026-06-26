@@ -7,6 +7,48 @@ from app.config import get_postgres_config
 from scripts.providers.provider_factory import get_job_provider
 
 
+def extract_linkedin_job_id_from_url(value):
+    import re
+
+    if not value:
+        return None
+
+    text = str(value)
+
+    patterns = [
+        r"/jobs/view/(?:[^/?#]+-)?(\d+)",
+        r"currentJobId=(\d+)",
+        r"jobId=(\d+)",
+        r"jobs/view/(\d+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def ensure_linkedin_job_id(job):
+    if not isinstance(job, dict):
+        return job
+
+    current = job.get("linkedin_job_id") or job.get("job_id")
+    if current:
+        job["linkedin_job_id"] = str(current)
+        return job
+
+    for key in ("job_url", "url", "apply_url", "linkedin_url"):
+        recovered = extract_linkedin_job_id_from_url(job.get(key))
+        if recovered:
+            job["linkedin_job_id"] = recovered
+            return job
+
+    return job
+
+
+
 def ensure_jobs_runtime_columns(cursor):
     cursor.execute(
         """
@@ -188,8 +230,49 @@ def is_linkedin_job(job):
     return source == "linkedin" or "linkedin.com/jobs/view" in job_url
 
 
+
+def is_invalid_linkedin_search_header_job(job):
+    import re
+
+    title = str(job.get("title") or "").strip()
+    location = str(job.get("location") or "").strip()
+    description = str(job.get("job_description") or job.get("job_about") or "").strip()
+
+    if re.match(r"^\d+\s+.+\s+Jobs\s+in\s+.+$", title, re.IGNORECASE):
+        return True
+
+    if title.lower().endswith(" jobs in australia"):
+        return True
+
+    if title.lower().endswith(" jobs in united states"):
+        return True
+
+    if title.lower().endswith(" jobs in canada"):
+        return True
+
+    if title.lower().endswith(" jobs in germany"):
+        return True
+
+    if title.lower().endswith(" jobs in united kingdom"):
+        return True
+
+    if location.lower() == "unknown location" and not description:
+        return True
+
+    return False
+
+
 def insert_job(cursor, job):
     # LinkedIn jobs must have a stable linkedin_job_id.
+    if is_invalid_linkedin_search_header_job(job):
+        print(
+            "Skipping invalid LinkedIn search header job:",
+            job.get("title"),
+            "|",
+            job.get("company"),
+        )
+        return
+
     # If provider returns an empty ID, try to recover it from job_url/apply_url.
     # If it still cannot be recovered, skip it to avoid unique constraint errors on "".
     import re as _re
@@ -197,12 +280,22 @@ def insert_job(cursor, job):
     linkedin_job_id = str(job.get("linkedin_job_id") or "").strip()
 
     if not linkedin_job_id:
-        for _url_key in ("job_url", "apply_url"):
+        for _url_key in ("job_url", "apply_url", "url", "linkedin_url"):
             _url = str(job.get(_url_key) or "")
-            _match = _re.search(r"/jobs/view/(\d+)", _url)
-            if _match:
-                linkedin_job_id = _match.group(1)
-                job["linkedin_job_id"] = linkedin_job_id
+
+            for _pattern in (
+                r"/jobs/view/(?:[^/?#]+-)?(\d+)(?:[/?#]|$)",
+                r"/jobs/view/(\d+)(?:[/?#]|$)",
+                r"currentJobId=(\d+)",
+                r"jobId=(\d+)",
+            ):
+                _match = _re.search(_pattern, _url)
+                if _match:
+                    linkedin_job_id = _match.group(1)
+                    job["linkedin_job_id"] = linkedin_job_id
+                    break
+
+            if linkedin_job_id:
                 break
 
     if not linkedin_job_id:

@@ -378,10 +378,16 @@ def get_jobs(
 
 @app.get("/jobs/search", response_model=JobSearchResponse)
 def search_jobs(
+    query: Optional[str] = None,
+    search: Optional[str] = None,
+    search_query: Optional[str] = None,
+    q: Optional[str] = None,
+    keywords: Optional[str] = None,
     title: Optional[str] = None,
     company: Optional[str] = None,
     location: Optional[str] = None,
     remote: Optional[bool] = None,
+    work_mode: Optional[str] = None,
     seniority: Optional[str] = None,
     job_type: Optional[str] = None,
     min_salary: Optional[float] = None,
@@ -389,17 +395,21 @@ def search_jobs(
     source: Optional[str] = None,
     apply_type: Optional[str] = None,
     is_active: Optional[bool] = None,
-    active_only: Optional[bool] = None,
+    active_only: Optional[bool] = True,
     page: int = 1,
     limit: int = 10,
     sort_by: str = "last_seen_at",
     sort_order: str = "desc",
 ):
+    resolved_query = query or search or search_query or q or keywords
+
     data = search_jobs_from_db(
+        query=resolved_query,
         title=title,
         company=company,
         location=location,
         remote=remote,
+        work_mode=work_mode,
         seniority=seniority,
         job_type=job_type,
         min_salary=min_salary,

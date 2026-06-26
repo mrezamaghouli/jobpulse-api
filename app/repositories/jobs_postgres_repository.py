@@ -257,14 +257,41 @@ def get_jobs_from_db(**kwargs):
 
 
 def search_jobs_from_db(**kwargs):
-    result = get_all_jobs_from_db(**kwargs)
-    query = extract_search_query_from_kwargs(kwargs)
-    result = rerank_jobs(result, query)
+    data = get_jobs_from_db(**kwargs)
 
-    if isinstance(result, dict) and "results" in result:
-        return result["results"]
+    if isinstance(data, dict):
+        results = data.get("results", [])
+        total = data.get("total")
+        if total is None:
+            total = len(results)
 
-    return result
+        return {
+            "results": results,
+            "count": int(total or 0),
+            "page": int(data.get("page") or kwargs.get("page") or 1),
+            "limit": int(data.get("limit") or kwargs.get("limit") or 10),
+            "total_pages": int(data.get("total_pages") or 0),
+        }
+
+    if isinstance(data, list):
+        page = int(kwargs.get("page") or 1)
+        limit = int(kwargs.get("limit") or 10)
+
+        return {
+            "results": data,
+            "count": len(data),
+            "page": page,
+            "limit": limit,
+            "total_pages": 1 if data else 0,
+        }
+
+    return {
+        "results": [],
+        "count": 0,
+        "page": int(kwargs.get("page") or 1),
+        "limit": int(kwargs.get("limit") or 10),
+        "total_pages": 0,
+    }
 
 
 
@@ -300,6 +327,34 @@ def normalize_search_terms(query):
 
 def text_value(value):
     return "" if value is None else str(value).lower()
+
+
+
+def calculate_title_match_score(row, query):
+    query_text = str(query or "").strip().lower()
+    title = text_value(row.get("title"))
+
+    if not query_text or not title:
+        return 0.0
+
+    terms = normalize_search_terms(query_text)
+    if not terms:
+        return 0.0
+
+    # Exact phrase in title should always beat description/semantic matches.
+    if query_text in title:
+        return 1.0
+
+    # All query words in title, even if separated by punctuation/order.
+    if all(term in title for term in terms):
+        return 0.92
+
+    # Strong partial title match.
+    matched = sum(1 for term in terms if term in title)
+    if matched > 0:
+        return 0.30 + (0.20 * matched / max(len(terms), 1))
+
+    return 0.0
 
 
 def calculate_keyword_score(row, query):
@@ -716,12 +771,18 @@ def get_all_jobs_from_db(
                 if keyword_score <= 0:
                     continue
 
+            title_match_score = calculate_title_match_score(row, query)
+
             final_score = (
-                keyword_score * 0.45
-                + semantic_score * 0.45
+                keyword_score * 0.35
+                + semantic_score * 0.35
                 + freshness_score * 0.05
                 + quality_score * 0.05
+                + title_match_score * 0.20
             )
+
+            # Hard guard: exact/all-word title matches must survive relevance filtering.
+            final_score = max(final_score, title_match_score)
 
             ranked.append((final_score, row))
 
