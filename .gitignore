@@ -88,3 +88,5 @@ debug/
 *.b64
 check_scripts.py
 linkedin_session.b64
+*.bak_*
+export_targets_*.csv
