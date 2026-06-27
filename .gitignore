@@ -81,3 +81,10 @@ sample_output/
 *.dump
 *.sql
 jobpulse_local_backup*
+exports/
+imports/
+debug/
+*.bak
+*.b64
+check_scripts.py
+linkedin_session.b64
