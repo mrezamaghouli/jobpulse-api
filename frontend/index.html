@@ -577,6 +577,12 @@
     }
 
 
+  
+    .link-btn.apply[href=""],
+    .link-btn.apply:not([href]) {
+      display: none !important;
+    }
+
   </style>
 </head>
 
@@ -821,39 +827,58 @@
       return clean[0].toUpperCase();
     }
 
-    function getApplyTag(job) {
-      const applyType = job.apply_type || 'unknown';
+      function isRealExternalApplyUrl(url) {
+        if (!url || typeof url !== 'string') return false;
+        const clean = url.trim().toLowerCase();
 
-      if (applyType === 'easy_apply') {
-        return '<span class="tag green">Easy Apply</span>';
+        return (
+          clean.startsWith('http') &&
+          !clean.includes('linkedin.com') &&
+          !clean.includes('lnkd.in')
+        );
       }
 
-      if (applyType === 'external') {
-        return '<span class="tag blue">External Apply</span>';
+      function hasRealExternalApply(job) {
+        return (
+          job &&
+          job.apply_type === 'external' &&
+          isRealExternalApplyUrl(job.apply_url)
+        );
       }
 
-      return '<span class="tag orange">Unknown Apply</span>';
-    }
+      function getApplyTag(job) {
+        if (hasRealExternalApply(job)) {
+          return '<span class="tag blue">External Apply</span>';
+        }
 
-    function getApplyButtonText(job) {
-      if (job.apply_label) {
-        return job.apply_label;
+        if (job.apply_type === 'easy_apply') {
+          return '<span class="tag green">Easy Apply</span>';
+        }
+
+        return '';
       }
 
-      if (job.apply_type === 'easy_apply') {
-        return 'Easy Apply';
+
+
+      function getApplyButtonText(job) {
+        if (hasRealExternalApply(job)) {
+          return 'Apply';
+        }
+
+        return 'Apply on LinkedIn';
       }
 
-      if (job.apply_type === 'external') {
-        return 'Apply';
+
+
+      function getApplyUrl(job) {
+        if (hasRealExternalApply(job)) {
+          return job.apply_url;
+        }
+
+        return job.job_url || '';
       }
 
-      return 'Open Job';
-    }
 
-    function getApplyUrl(job) {
-      return job.apply_url || job.job_url;
-    }
 
     function renderCompanyLogo(job) {
       if (job.company_logo_url) {
@@ -1031,7 +1056,7 @@
             target="_blank"
             rel="noopener noreferrer"
           >
-            Open LinkedIn Job
+            Open Job
           </a>
 
           ${job.company_linkedin_url ? `

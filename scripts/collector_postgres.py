@@ -262,7 +262,102 @@ def is_invalid_linkedin_search_header_job(job):
     return False
 
 
+
+def truncate_job_varchar_fields(job):
+    if not isinstance(job, dict):
+        return job
+
+    limits = {
+        "source": 100,
+        "work_mode": 100,
+        "seniority": 100,
+        "job_type": 100,
+        "apply_type": 100,
+        "currency": 20,
+    }
+
+    for key, max_len in limits.items():
+        value = job.get(key)
+        if value is None:
+            continue
+
+        value = str(value).strip()
+        if len(value) > max_len:
+            print("Truncating long field:", key, "len=", len(value), "max=", max_len)
+            value = value[:max_len]
+
+        job[key] = value
+
+    return job
+
+
+
+def sanitize_linkedin_apply_fields(job):
+    if not isinstance(job, dict):
+        return job
+
+    apply_type = str(job.get("apply_type") or "").strip().lower()
+    apply_label = str(job.get("apply_label") or "").strip()
+    apply_url = str(job.get("apply_url") or "").strip()
+
+    label_clean = apply_label.lower().replace("\n", " ").strip()
+    url_clean = apply_url.lower()
+
+    label_is_exact_easy_apply = label_clean == "easy apply"
+
+    has_external_apply_url = (
+        apply_url.startswith("http")
+        and "linkedin.com" not in url_clean
+        and "lnkd.in" not in url_clean
+    )
+
+    bad_fragments = [
+        "promoted",
+        "applicant",
+        "people clicked",
+        "actively reviewing",
+        "responses managed",
+        "company review time",
+        "be an early applicant",
+        "over 100",
+        "·",
+    ]
+
+    label_is_bad = False
+    if apply_label:
+        if len(apply_label) > 40:
+            label_is_bad = True
+        if any(fragment in label_clean for fragment in bad_fragments):
+            label_is_bad = True
+
+    # External apply is valid ONLY when we have a real non-LinkedIn apply_url.
+    if has_external_apply_url:
+        job["apply_type"] = "external"
+        job["apply_label"] = "Apply"
+        job["apply_url"] = apply_url
+        return job
+
+    # Easy Apply is valid ONLY when LinkedIn explicitly says exactly Easy Apply.
+    if label_is_exact_easy_apply:
+        job["apply_type"] = "easy_apply"
+        job["apply_label"] = "Easy Apply"
+        job["apply_url"] = None
+        return job
+
+    # Everything else is unknown. Do not invent apply state from polluted text.
+    job["apply_type"] = "unknown"
+    job["apply_label"] = None
+
+    if not has_external_apply_url:
+        job["apply_url"] = None
+
+    return job
+
+
 def insert_job(cursor, job):
+    job = sanitize_linkedin_apply_fields(job)
+    job = truncate_job_varchar_fields(job)
+
     # LinkedIn jobs must have a stable linkedin_job_id.
     if is_invalid_linkedin_search_header_job(job):
         print(
