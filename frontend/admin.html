@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JobPulse Admin Status</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #111827;
+      --card2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --blue: #38bdf8;
+      --border: rgba(255,255,255,.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #1e293b, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-top: 6px;
+      font-size: 14px;
+    }
+
+    .token-box {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    input {
+      background: var(--card);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      min-width: 320px;
+      outline: none;
+    }
+
+    button {
+      background: var(--blue);
+      color: #001018;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: var(--card2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .status-line {
+      margin: 14px 0 22px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .card {
+      background: rgba(17, 24, 39, .92);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,.18);
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .value {
+      font-size: 28px;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+
+    .good { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--yellow); }
+    .blue { color: var(--blue); }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+      background: rgba(17, 24, 39, .92);
+      border: 1px solid var(--border);
+    }
+
+    th, td {
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+    }
+
+    th {
+      color: var(--muted);
+      background: rgba(255,255,255,.03);
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    pre {
+      background: #020617;
+      border: 1px solid var(--border);
+      padding: 14px;
+      border-radius: 14px;
+      overflow: auto;
+      color: #cbd5e1;
+      max-height: 280px;
+    }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      input { min-width: 100%; }
+    }
+
+    @media (max-width: 520px) {
+      .grid { grid-template-columns: 1fr; }
+      body { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>JobPulse Admin Status</h1>
+        <div class="subtitle">Production monitoring dashboard</div>
+      </div>
+
+      <div class="token-box">
+        <input id="token" type="password" placeholder="X-Admin-Token" />
+        <button onclick="saveToken()">Save Token</button>
+        <button class="secondary" onclick="loadStatus()">Refresh</button>
+      </div>
+    </div>
+
+    <div id="statusLine" class="status-line">Waiting for token...</div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">API / DB</div>
+        <div id="apiStatus" class="value">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Total Jobs</div>
+        <div id="totalJobs" class="value">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Jobs Added 1h</div>
+        <div id="added1h" class="value blue">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Bad Apply</div>
+        <div id="badApply" class="value">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Jobs Seen 1h</div>
+        <div id="seen1h" class="value blue">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Jobs Added 24h</div>
+        <div id="added24h" class="value">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Jobs Seen 24h</div>
+        <div id="seen24h" class="value">-</div>
+      </div>
+      <div class="card">
+        <div class="label">Latest Backup</div>
+        <div id="backup" class="value" style="font-size:18px;">-</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Coverage</h2>
+      <table>
+        <thead>
+          <tr><th>Status</th><th>Count</th></tr>
+        </thead>
+        <tbody id="coverageRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>Demand Queue</h2>
+      <table>
+        <thead>
+          <tr><th>Status</th><th>Count</th></tr>
+        </thead>
+        <tbody id="queueRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>Raw JSON</h2>
+      <pre id="rawJson">-</pre>
+    </div>
+  </div>
+
+  <script>
+    const tokenInput = document.getElementById('token');
+
+    function fmt(value) {
+      if (value === null || value === undefined) return '-';
+      if (typeof value === 'number') return value.toLocaleString();
+      return String(value);
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = fmt(value);
+    }
+
+    function saveToken() {
+      const token = tokenInput.value.trim();
+      if (!token) {
+        alert('Token is empty');
+        return;
+      }
+      localStorage.setItem('jobpulse_admin_token', token);
+      loadStatus();
+    }
+
+    function rowsHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="2">No data</td></tr>';
+      }
+
+      return items.map(item => `
+        <tr>
+          <td>${item.status || '-'}</td>
+          <td>${fmt(item.count)}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadStatus() {
+      const token = localStorage.getItem('jobpulse_admin_token') || tokenInput.value.trim();
+      if (!token) {
+        document.getElementById('statusLine').textContent = 'Enter admin token first.';
+        return;
+      }
+
+      tokenInput.value = token;
+      document.getElementById('statusLine').textContent = 'Loading...';
+
+      try {
+        const res = await fetch('/api/admin/status', {
+          headers: { 'X-Admin-Token': token },
+          cache: 'no-store'
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+
+        setText('apiStatus', `${data.status} / ${data.database}`);
+        document.getElementById('apiStatus').className = 'value good';
+
+        setText('totalJobs', data.jobs.total_jobs);
+        setText('added1h', data.jobs.jobs_added_last_hour);
+        setText('seen1h', data.jobs.jobs_seen_last_hour);
+        setText('added24h', data.jobs.jobs_added_last_24h);
+        setText('seen24h', data.jobs.jobs_seen_last_24h);
+
+        const bad = data.bad_apply.bad_external_apply_count || 0;
+        setText('badApply', bad);
+        document.getElementById('badApply').className = bad === 0 ? 'value good' : 'value bad';
+
+        const backupText = data.backups.latest
+          ? `${data.backups.latest} (${data.backups.latest_size_mb} MB)`
+          : 'No backup';
+        setText('backup', backupText);
+
+        document.getElementById('coverageRows').innerHTML = rowsHtml(data.coverage);
+        document.getElementById('queueRows').innerHTML = rowsHtml(data.demand_queue);
+        document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
+
+        document.getElementById('statusLine').textContent =
+          `Last refresh: ${new Date().toLocaleString()}`;
+
+      } catch (err) {
+        document.getElementById('statusLine').textContent = `Error: ${err.message}`;
+        document.getElementById('apiStatus').textContent = 'error';
+        document.getElementById('apiStatus').className = 'value bad';
+      }
+    }
+
+    tokenInput.value = localStorage.getItem('jobpulse_admin_token') || '';
+    if (tokenInput.value) loadStatus();
+
+    setInterval(loadStatus, 60000);
+  </script>
+</body>
+</html>
