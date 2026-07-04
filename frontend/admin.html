@@ -302,6 +302,37 @@
     </div>
 
     <div class="section">
+      <h2>Coverage by Country - Priority 1</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Country</th>
+            <th>Status</th>
+            <th>Count</th>
+          </tr>
+        </thead>
+        <tbody id="coverageCountryRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>Recent Collection Tasks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Query</th>
+            <th>Country</th>
+            <th>Family</th>
+            <th>Status</th>
+            <th>Results</th>
+            <th>Collected At</th>
+          </tr>
+        </thead>
+        <tbody id="collectionTaskRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Raw JSON</h2>
       <pre id="rawJson">-</pre>
     </div>
@@ -364,6 +395,49 @@
       }
 
       return '<span class="pill unknown">LinkedIn</span>';
+    }
+
+    function coverageCountryHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="3">No coverage data</td></tr>';
+      }
+
+      return items.map(item => `
+        <tr>
+          <td>${escapeHtml(item.country || '-')}</td>
+          <td>${escapeHtml(item.status || '-')}</td>
+          <td>${fmt(item.count)}</td>
+        </tr>
+      `).join('');
+    }
+
+    function collectionTasksHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="6">No collection tasks</td></tr>';
+      }
+
+      return items.map(item => {
+        const filters = item.filters_json || {};
+        const country = filters.country || filters.location || '-';
+        const collectedAt = item.last_collected_at
+          ? new Date(item.last_collected_at).toLocaleString()
+          : '-';
+
+        const statusClass = item.status === 'done' ? 'good' :
+          item.status === 'failed' ? 'bad' :
+          item.status === 'running' ? 'warn' : '';
+
+        return `
+          <tr>
+            <td>${escapeHtml(item.raw_query || '-')}</td>
+            <td>${escapeHtml(country)}</td>
+            <td>${escapeHtml(item.job_family || '-')}</td>
+            <td class="${statusClass}">${escapeHtml(item.status || '-')}</td>
+            <td>${fmt(item.last_result_count)}</td>
+            <td>${escapeHtml(collectedAt)}</td>
+          </tr>
+        `;
+      }).join('');
     }
 
     function recentJobsHtml(items) {
@@ -474,6 +548,8 @@
         document.getElementById('coverageRows').innerHTML = rowsHtml(data.coverage);
         document.getElementById('queueRows').innerHTML = rowsHtml(data.demand_queue);
         document.getElementById('recentJobsRows').innerHTML = recentJobsHtml(data.recent_jobs);
+        document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
+        document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
         renderAlerts(data);
 
         document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);

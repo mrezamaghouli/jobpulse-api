@@ -103,6 +103,39 @@ def register_admin_status_routes(app):
                 """)
                 recent_jobs = [dict(row) for row in cur.fetchall()]
 
+                cur.execute("""
+                    SELECT
+                      c.country_name AS country,
+                      cov.status,
+                      COUNT(*) AS count
+                    FROM job_collection_coverage cov
+                    JOIN job_catalog_countries c ON c.id = cov.country_id
+                    WHERE cov.country_priority = 1
+                    GROUP BY c.country_name, cov.status
+                    ORDER BY c.country_name, cov.status;
+                """)
+                coverage_by_country = [dict(row) for row in cur.fetchall()]
+
+                cur.execute("""
+                    SELECT
+                      id,
+                      raw_query,
+                      job_family,
+                      filters_json,
+                      status,
+                      last_result_count,
+                      priority_score,
+                      fail_count,
+                      last_error,
+                      first_seen_at,
+                      last_seen_at,
+                      last_collected_at
+                    FROM job_search_demand_queue
+                    ORDER BY last_collected_at DESC NULLS LAST, id DESC
+                    LIMIT 20;
+                """)
+                recent_collection_tasks = [dict(row) for row in cur.fetchall()]
+
             backups_dir = Path("/opt/jobpulse/backups")
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
@@ -115,6 +148,8 @@ def register_admin_status_routes(app):
                 "demand_queue": demand_queue,
                 "coverage": coverage,
                 "recent_jobs": recent_jobs,
+                "coverage_by_country": coverage_by_country,
+                "recent_collection_tasks": recent_collection_tasks,
                 "backups": {
                     "count": len(backups),
                     "latest": latest_backup.name if latest_backup else None,
