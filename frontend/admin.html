@@ -30,7 +30,7 @@
     }
 
     .wrap {
-      max-width: 1200px;
+      max-width: 1300px;
       margin: 0 auto;
     }
 
@@ -46,6 +46,11 @@
     h1 {
       margin: 0;
       font-size: 28px;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 20px;
     }
 
     .subtitle {
@@ -87,7 +92,7 @@
     }
 
     .status-line {
-      margin: 14px 0 22px;
+      margin: 14px 0 18px;
       color: var(--muted);
       font-size: 14px;
     }
@@ -117,6 +122,7 @@
       font-size: 28px;
       font-weight: 800;
       line-height: 1.1;
+      word-break: break-word;
     }
 
     .good { color: var(--green); }
@@ -142,6 +148,7 @@
       padding: 12px 14px;
       border-bottom: 1px solid var(--border);
       font-size: 14px;
+      vertical-align: top;
     }
 
     th {
@@ -153,6 +160,31 @@
       border-bottom: 0;
     }
 
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: var(--card2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .pill.external { color: var(--blue); }
+    .pill.easy { color: var(--green); }
+    .pill.unknown { color: var(--yellow); }
+
     pre {
       background: #020617;
       border: 1px solid var(--border);
@@ -160,12 +192,18 @@
       border-radius: 14px;
       overflow: auto;
       color: #cbd5e1;
-      max-height: 280px;
+      max-height: 300px;
+    }
+
+    .alert-list {
+      margin: 8px 0 0;
+      padding-left: 20px;
     }
 
     @media (max-width: 900px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       input { min-width: 100%; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
     }
 
     @media (max-width: 520px) {
@@ -190,6 +228,7 @@
     </div>
 
     <div id="statusLine" class="status-line">Waiting for token...</div>
+    <div id="alertBox" class="card" style="display:none; margin-bottom:18px;"></div>
 
     <div class="grid">
       <div class="card">
@@ -227,6 +266,22 @@
     </div>
 
     <div class="section">
+      <h2>Recent Jobs</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Company</th>
+            <th>Location</th>
+            <th>Apply Type</th>
+            <th>First Seen</th>
+          </tr>
+        </thead>
+        <tbody id="recentJobsRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Coverage</h2>
       <table>
         <thead>
@@ -261,6 +316,15 @@
       return String(value);
     }
 
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
     function setText(id, value) {
       document.getElementById(id).textContent = fmt(value);
     }
@@ -282,14 +346,93 @@
 
       return items.map(item => `
         <tr>
-          <td>${item.status || '-'}</td>
+          <td>${escapeHtml(item.status || '-')}</td>
           <td>${fmt(item.count)}</td>
         </tr>
       `).join('');
     }
 
+    function applyPill(job) {
+      const type = job.apply_type || 'unknown';
+
+      if (type === 'external') {
+        return '<span class="pill external">External</span>';
+      }
+
+      if (type === 'easy_apply') {
+        return '<span class="pill easy">Easy Apply</span>';
+      }
+
+      return '<span class="pill unknown">LinkedIn</span>';
+    }
+
+    function recentJobsHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="5">No recent jobs</td></tr>';
+      }
+
+      return items.map(job => {
+        const firstSeen = job.first_seen_at
+          ? new Date(job.first_seen_at).toLocaleString()
+          : '-';
+
+        return `
+          <tr>
+            <td>
+              <a href="${escapeHtml(job.job_url || '#')}" target="_blank" rel="noopener noreferrer">
+                ${escapeHtml(job.title || '-')}
+              </a>
+            </td>
+            <td>${escapeHtml(job.company || '-')}</td>
+            <td>${escapeHtml(job.location || '-')}</td>
+            <td>${applyPill(job)}</td>
+            <td>${escapeHtml(firstSeen)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderAlerts(data) {
+      const alerts = [];
+
+      const badApply = data.bad_apply?.bad_external_apply_count || 0;
+      const seen1h = data.jobs?.jobs_seen_last_hour || 0;
+      const added24h = data.jobs?.jobs_added_last_24h || 0;
+      const backupCount = data.backups?.count || 0;
+
+      if (badApply > 0) {
+        alerts.push(`Bad external apply detected: ${badApply}`);
+      }
+
+      if (seen1h === 0) {
+        alerts.push('No jobs seen in the last hour');
+      }
+
+      if (added24h === 0) {
+        alerts.push('No jobs added in the last 24 hours');
+      }
+
+      if (backupCount === 0) {
+        alerts.push('No database backups visible');
+      }
+
+      const box = document.getElementById('alertBox');
+
+      if (!alerts.length) {
+        box.style.display = 'block';
+        box.innerHTML = '<strong class="good">All checks passed ✅</strong>';
+        return;
+      }
+
+      box.style.display = 'block';
+      box.innerHTML = '<strong class="bad">Alerts</strong><ul class="alert-list">' +
+        alerts.map(item => `<li>${escapeHtml(item)}</li>`).join('') +
+        '</ul>';
+    }
+
     async function loadStatus() {
       const token = localStorage.getItem('jobpulse_admin_token') || tokenInput.value.trim();
+
       if (!token) {
         document.getElementById('statusLine').textContent = 'Enter admin token first.';
         return;
@@ -330,8 +473,10 @@
 
         document.getElementById('coverageRows').innerHTML = rowsHtml(data.coverage);
         document.getElementById('queueRows').innerHTML = rowsHtml(data.demand_queue);
-        document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('recentJobsRows').innerHTML = recentJobsHtml(data.recent_jobs);
+        renderAlerts(data);
 
+        document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
         document.getElementById('statusLine').textContent =
           `Last refresh: ${new Date().toLocaleString()}`;
 

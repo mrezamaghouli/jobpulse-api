@@ -83,6 +83,26 @@ def register_admin_status_routes(app):
                 )
                 coverage = [dict(row) for row in cur.fetchall()]
 
+                cur.execute("""
+                    SELECT
+                      id,
+                      linkedin_job_id,
+                      title,
+                      company,
+                      location,
+                      apply_type,
+                      apply_label,
+                      apply_url,
+                      job_url,
+                      first_seen_at,
+                      last_seen_at
+                    FROM jobs
+                    WHERE deleted_at IS NULL
+                    ORDER BY first_seen_at DESC NULLS LAST, id DESC
+                    LIMIT 15;
+                """)
+                recent_jobs = [dict(row) for row in cur.fetchall()]
+
             backups_dir = Path("/opt/jobpulse/backups")
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
@@ -94,6 +114,7 @@ def register_admin_status_routes(app):
                 "bad_apply": bad_apply,
                 "demand_queue": demand_queue,
                 "coverage": coverage,
+                "recent_jobs": recent_jobs,
                 "backups": {
                     "count": len(backups),
                     "latest": latest_backup.name if latest_backup else None,
