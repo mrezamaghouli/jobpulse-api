@@ -27,6 +27,7 @@ services:
     container_name: jobpulse-api-prod
     restart: unless-stopped
     env_file:
+      - /opt/jobpulse/.admin.env
       - .env
     environment:
       POSTGRES_HOST: db
@@ -51,6 +52,7 @@ services:
       retries: 10
 
     volumes:
+      - /opt/jobpulse/backups:/opt/jobpulse/backups:ro
       - ./.auth:/app/.auth:ro
       - ./logs:/app/logs
   frontend:

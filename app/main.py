@@ -625,3 +625,8 @@ app.add_middleware(SimpleApiCacheMiddleware)
 
 # Private admin endpoints protected by X-Admin-Key.
 app.include_router(admin_router)
+
+
+# Admin status routes
+from app.admin_status import register_admin_status_routes
+register_admin_status_routes(app)
