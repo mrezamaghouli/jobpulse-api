@@ -1,5 +1,7 @@
 import os
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import psycopg2
 from fastapi import Header, HTTPException
@@ -22,6 +24,31 @@ def require_admin_token(x_admin_token: str | None):
         raise HTTPException(status_code=401, detail="Invalid admin token.")
 
 
+def clean_json(value: Any):
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, list):
+        return [clean_json(item) for item in value]
+
+    if isinstance(value, dict):
+        return {key: clean_json(item) for key, item in value.items()}
+
+    return value
+
+
+def tail_file(path: Path, max_lines: int = 200) -> list[str]:
+    if not path.exists() or not path.is_file():
+        return []
+
+    max_lines = max(1, min(int(max_lines or 200), 1000))
+
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+
+    return [line.rstrip("\n") for line in lines[-max_lines:]]
+
+
 def register_admin_status_routes(app):
     @app.get("/api/admin/status")
     @app.get("/admin/status")
@@ -32,8 +59,7 @@ def register_admin_status_routes(app):
 
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT
                       COUNT(*) AS total_jobs,
                       MAX(first_seen_at) AS newest_first_seen,
@@ -43,12 +69,10 @@ def register_admin_status_routes(app):
                       COUNT(*) FILTER (WHERE first_seen_at >= NOW() - INTERVAL '24 hours') AS jobs_added_last_24h,
                       COUNT(*) FILTER (WHERE last_seen_at >= NOW() - INTERVAL '24 hours') AS jobs_seen_last_24h
                     FROM jobs;
-                    """
-                )
+                """)
                 job_stats = dict(cur.fetchone() or {})
 
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT COUNT(*) AS bad_external_apply_count
                     FROM jobs
                     WHERE last_seen_at >= NOW() - INTERVAL '24 hours'
@@ -59,28 +83,23 @@ def register_admin_status_routes(app):
                         OR apply_url ILIKE '%linkedin.com%'
                         OR apply_url ILIKE '%lnkd.in%'
                       );
-                    """
-                )
+                """)
                 bad_apply = dict(cur.fetchone() or {})
 
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT status, COUNT(*) AS count
                     FROM job_search_demand_queue
                     GROUP BY status
                     ORDER BY status;
-                    """
-                )
+                """)
                 demand_queue = [dict(row) for row in cur.fetchall()]
 
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT status, COUNT(*) AS count
                     FROM job_collection_coverage
                     GROUP BY status
                     ORDER BY status;
-                    """
-                )
+                """)
                 coverage = [dict(row) for row in cur.fetchall()]
 
                 cur.execute("""
@@ -178,7 +197,7 @@ def register_admin_status_routes(app):
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
 
-            return {
+            return clean_json({
                 "status": "ok",
                 "database": "connected",
                 "jobs": job_stats,
@@ -195,7 +214,40 @@ def register_admin_status_routes(app):
                     "latest": latest_backup.name if latest_backup else None,
                     "latest_size_mb": round(latest_backup.stat().st_size / 1024 / 1024, 2) if latest_backup else None,
                 },
-            }
+            })
 
         finally:
             conn.close()
+
+
+def register_admin_logs_routes(app):
+    @app.get("/api/admin/logs")
+    @app.get("/admin/logs")
+    def admin_logs(
+        file: str = "collection",
+        lines: int = 200,
+        x_admin_token: str | None = Header(default=None),
+    ):
+        require_admin_token(x_admin_token)
+
+        allowed = {
+            "collection": Path("/opt/jobpulse/logs/collection_cycle.log"),
+            "alerts": Path("/opt/jobpulse/logs/status_alerts.log"),
+            "monitor": Path("/opt/jobpulse/logs/status_snapshots.log"),
+            "monitor_cron": Path("/opt/jobpulse/logs/monitor_snapshot_cron.log"),
+            "backup": Path("/opt/jobpulse/logs/db_backup.log"),
+            "health": Path("/opt/jobpulse/logs/health_alert_cron.log"),
+            "cleanup": Path("/opt/jobpulse/logs/production_cleanup_cron.log"),
+        }
+
+        if file not in allowed:
+            raise HTTPException(status_code=400, detail="Invalid log file.")
+
+        target = allowed[file]
+
+        return {
+            "status": "ok",
+            "file": file,
+            "path": str(target),
+            "lines": tail_file(target, lines),
+        }

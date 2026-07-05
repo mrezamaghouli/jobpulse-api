@@ -630,3 +630,9 @@ app.include_router(admin_router)
 # Admin status routes
 from app.admin_status import register_admin_status_routes
 register_admin_status_routes(app)
+
+
+# Admin logs routes
+from app.admin_status import register_admin_logs_routes
+register_admin_logs_routes(app)
+
