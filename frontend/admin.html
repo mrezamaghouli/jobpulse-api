@@ -583,29 +583,7 @@
     }
 
     function renderAlerts(data) {
-      const alerts = [];
-
-      const badApply = data.bad_apply?.bad_external_apply_count || 0;
-      const seen1h = data.jobs?.jobs_seen_last_hour || 0;
-      const added24h = data.jobs?.jobs_added_last_24h || 0;
-      const backupCount = data.backups?.count || 0;
-
-      if (badApply > 0) {
-        alerts.push(`Bad external apply detected: ${badApply}`);
-      }
-
-      if (seen1h === 0) {
-        alerts.push('No jobs seen in the last hour');
-      }
-
-      if (added24h === 0) {
-        alerts.push('No jobs added in the last 24 hours');
-      }
-
-      if (backupCount === 0) {
-        alerts.push('No database backups visible');
-      }
-
+      const alerts = data.alerts || [];
       const box = document.getElementById('alertBox');
 
       if (!alerts.length) {
@@ -614,9 +592,16 @@
         return;
       }
 
+      const hasCritical = alerts.some(item => item.level === 'critical');
+      const titleClass = hasCritical ? 'bad' : 'warn';
+      const title = hasCritical ? 'Critical Alerts 🚨' : 'Warnings ⚠️';
+
       box.style.display = 'block';
-      box.innerHTML = '<strong class="bad">Alerts</strong><ul class="alert-list">' +
-        alerts.map(item => `<li>${escapeHtml(item)}</li>`).join('') +
+      box.innerHTML = `<strong class="${titleClass}">${title}</strong><ul class="alert-list">` +
+        alerts.map(item => {
+          const levelClass = item.level === 'critical' ? 'bad' : 'warn';
+          return `<li><strong class="${levelClass}">${escapeHtml(item.code)}</strong>: ${escapeHtml(item.message)}</li>`;
+        }).join('') +
         '</ul>';
     }
 

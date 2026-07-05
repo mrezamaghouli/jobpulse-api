@@ -49,6 +49,91 @@ def tail_file(path: Path, max_lines: int = 200) -> list[str]:
     return [line.rstrip("\n") for line in lines[-max_lines:]]
 
 
+
+def count_status(items: list[dict], status: str) -> int:
+    for item in items or []:
+        if item.get("status") == status:
+            return int(item.get("count") or 0)
+    return 0
+
+
+def build_alerts(
+    job_stats: dict,
+    bad_apply: dict,
+    demand_queue: list[dict],
+    coverage: list[dict],
+    backups: list[Path],
+) -> list[dict]:
+    alerts = []
+
+    bad_apply_count = int(bad_apply.get("bad_external_apply_count") or 0)
+    jobs_seen_1h = int(job_stats.get("jobs_seen_last_hour") or 0)
+    jobs_added_24h = int(job_stats.get("jobs_added_last_24h") or 0)
+
+    demand_failed = count_status(demand_queue, "failed")
+    demand_running = count_status(demand_queue, "running")
+    coverage_failed = count_status(coverage, "failed")
+    coverage_queued = count_status(coverage, "queued")
+
+    if bad_apply_count > 0:
+        alerts.append({
+            "level": "critical",
+            "code": "bad_external_apply",
+            "message": f"{bad_apply_count} bad external apply records found in the last 24h.",
+        })
+
+    if jobs_seen_1h == 0:
+        alerts.append({
+            "level": "warning",
+            "code": "no_jobs_seen_1h",
+            "message": "No jobs were seen in the last hour.",
+        })
+
+    if jobs_added_24h == 0:
+        alerts.append({
+            "level": "warning",
+            "code": "no_jobs_added_24h",
+            "message": "No new jobs were added in the last 24 hours.",
+        })
+
+    if demand_failed > 0:
+        alerts.append({
+            "level": "warning",
+            "code": "demand_queue_failed",
+            "message": f"{demand_failed} demand queue tasks are failed.",
+        })
+
+    if coverage_failed > 0:
+        alerts.append({
+            "level": "warning",
+            "code": "coverage_failed",
+            "message": f"{coverage_failed} coverage tasks are failed.",
+        })
+
+    if coverage_queued > 50:
+        alerts.append({
+            "level": "warning",
+            "code": "coverage_queue_backlog",
+            "message": f"{coverage_queued} coverage tasks are still queued.",
+        })
+
+    if demand_running > 20:
+        alerts.append({
+            "level": "warning",
+            "code": "demand_running_backlog",
+            "message": f"{demand_running} demand queue tasks are still running.",
+        })
+
+    if not backups:
+        alerts.append({
+            "level": "critical",
+            "code": "no_backups",
+            "message": "No database backup files are visible.",
+        })
+
+    return alerts
+
+
 def register_admin_status_routes(app):
     @app.get("/api/admin/status")
     @app.get("/admin/status")
@@ -197,9 +282,19 @@ def register_admin_status_routes(app):
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
 
+
+            alerts = build_alerts(
+                job_stats=job_stats,
+                bad_apply=bad_apply,
+                demand_queue=demand_queue,
+                coverage=coverage,
+                backups=backups,
+            )
+
             return clean_json({
                 "status": "ok",
                 "database": "connected",
+                "alerts": alerts,
                 "jobs": job_stats,
                 "bad_apply": bad_apply,
                 "demand_queue": demand_queue,
