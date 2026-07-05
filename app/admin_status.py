@@ -136,6 +136,44 @@ def register_admin_status_routes(app):
                 """)
                 recent_collection_tasks = [dict(row) for row in cur.fetchall()]
 
+                cur.execute("""
+                    SELECT
+                      cov.country_priority,
+                      COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE cov.status = 'done') AS done,
+                      COUNT(*) FILTER (WHERE cov.status = 'pending') AS pending,
+                      COUNT(*) FILTER (WHERE cov.status = 'queued') AS queued,
+                      COUNT(*) FILTER (WHERE cov.status = 'failed') AS failed,
+                      ROUND(
+                        100.0 * COUNT(*) FILTER (WHERE cov.status = 'done') / NULLIF(COUNT(*), 0),
+                        2
+                      ) AS done_percent
+                    FROM job_collection_coverage cov
+                    GROUP BY cov.country_priority
+                    ORDER BY cov.country_priority;
+                """)
+                coverage_progress = [dict(row) for row in cur.fetchall()]
+
+                cur.execute("""
+                    SELECT
+                      c.country_name AS country,
+                      cov.country_priority,
+                      COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE cov.status = 'done') AS done,
+                      COUNT(*) FILTER (WHERE cov.status = 'pending') AS pending,
+                      COUNT(*) FILTER (WHERE cov.status = 'queued') AS queued,
+                      COUNT(*) FILTER (WHERE cov.status = 'failed') AS failed,
+                      ROUND(
+                        100.0 * COUNT(*) FILTER (WHERE cov.status = 'done') / NULLIF(COUNT(*), 0),
+                        2
+                      ) AS done_percent
+                    FROM job_collection_coverage cov
+                    JOIN job_catalog_countries c ON c.id = cov.country_id
+                    GROUP BY c.country_name, cov.country_priority
+                    ORDER BY cov.country_priority, c.country_name;
+                """)
+                coverage_country_progress = [dict(row) for row in cur.fetchall()]
+
             backups_dir = Path("/opt/jobpulse/backups")
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
@@ -150,6 +188,8 @@ def register_admin_status_routes(app):
                 "recent_jobs": recent_jobs,
                 "coverage_by_country": coverage_by_country,
                 "recent_collection_tasks": recent_collection_tasks,
+                "coverage_progress": coverage_progress,
+                "coverage_country_progress": coverage_country_progress,
                 "backups": {
                     "count": len(backups),
                     "latest": latest_backup.name if latest_backup else None,

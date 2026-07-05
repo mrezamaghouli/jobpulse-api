@@ -200,6 +200,21 @@
       padding-left: 20px;
     }
 
+    .progress-wrap {
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+      height: 10px;
+      overflow: hidden;
+      min-width: 120px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: var(--green);
+      border-radius: 999px;
+    }
+
+
     @media (max-width: 900px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       input { min-width: 100%; }
@@ -302,6 +317,42 @@
     </div>
 
     <div class="section">
+      <h2>Coverage Progress</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Priority</th>
+            <th>Total</th>
+            <th>Done</th>
+            <th>Pending</th>
+            <th>Queued</th>
+            <th>Failed</th>
+            <th>Progress</th>
+          </tr>
+        </thead>
+        <tbody id="coverageProgressRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>Country Progress</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Priority</th>
+            <th>Country</th>
+            <th>Total</th>
+            <th>Done</th>
+            <th>Pending</th>
+            <th>Queued</th>
+            <th>Progress</th>
+          </tr>
+        </thead>
+        <tbody id="countryProgressRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Coverage by Country - Priority 1</h2>
       <table>
         <thead>
@@ -395,6 +446,54 @@
       }
 
       return '<span class="pill unknown">LinkedIn</span>';
+    }
+
+    function progressBar(percent) {
+      const safe = Math.max(0, Math.min(100, Number(percent || 0)));
+      return `
+        <div style="display:flex; align-items:center; gap:10px;">
+          <div class="progress-wrap">
+            <div class="progress-bar" style="width:${safe}%;"></div>
+          </div>
+          <span>${safe.toFixed(2)}%</span>
+        </div>
+      `;
+    }
+
+    function coverageProgressHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="7">No coverage progress data</td></tr>';
+      }
+
+      return items.map(item => `
+        <tr>
+          <td>${escapeHtml(item.country_priority || '-')}</td>
+          <td>${fmt(item.total)}</td>
+          <td class="good">${fmt(item.done)}</td>
+          <td>${fmt(item.pending)}</td>
+          <td class="warn">${fmt(item.queued)}</td>
+          <td class="${Number(item.failed || 0) > 0 ? 'bad' : ''}">${fmt(item.failed)}</td>
+          <td>${progressBar(item.done_percent)}</td>
+        </tr>
+      `).join('');
+    }
+
+    function countryProgressHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="7">No country progress data</td></tr>';
+      }
+
+      return items.map(item => `
+        <tr>
+          <td>${escapeHtml(item.country_priority || '-')}</td>
+          <td>${escapeHtml(item.country || '-')}</td>
+          <td>${fmt(item.total)}</td>
+          <td class="good">${fmt(item.done)}</td>
+          <td>${fmt(item.pending)}</td>
+          <td class="warn">${fmt(item.queued)}</td>
+          <td>${progressBar(item.done_percent)}</td>
+        </tr>
+      `).join('');
     }
 
     function coverageCountryHtml(items) {
@@ -548,6 +647,8 @@
         document.getElementById('coverageRows').innerHTML = rowsHtml(data.coverage);
         document.getElementById('queueRows').innerHTML = rowsHtml(data.demand_queue);
         document.getElementById('recentJobsRows').innerHTML = recentJobsHtml(data.recent_jobs);
+        document.getElementById('coverageProgressRows').innerHTML = coverageProgressHtml(data.coverage_progress);
+        document.getElementById('countryProgressRows').innerHTML = countryProgressHtml(data.coverage_country_progress);
         document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
         document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
         renderAlerts(data);
