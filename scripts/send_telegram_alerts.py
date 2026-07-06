@@ -104,7 +104,9 @@ def main():
             "All checks passed.\n\n"
             f"Total jobs: {data.get('jobs', {}).get('total_jobs', '-')}\n"
             f"Jobs seen 1h: {data.get('jobs', {}).get('jobs_seen_last_hour', '-')}\n"
-            f"Bad apply: {data.get('bad_apply', {}).get('bad_external_apply_count', '-')}"
+            f"Bad apply: {data.get('bad_apply', {}).get('bad_external_apply_count', '-')}\n"
+            f"Disk used: {data.get('disk', {}).get('used_percent', '-')}% "
+            f"Free: {data.get('disk', {}).get('free_gb', '-')} GB"
         )
     else:
         lines = ["🚨 <b>JobPulse Alert</b>", ""]
@@ -120,6 +122,10 @@ def main():
         lines.append(f"Total jobs: {data.get('jobs', {}).get('total_jobs', '-')}")
         lines.append(f"Jobs seen 1h: {data.get('jobs', {}).get('jobs_seen_last_hour', '-')}")
         lines.append(f"Bad apply: {data.get('bad_apply', {}).get('bad_external_apply_count', '-')}")
+        lines.append(
+            f"Disk used: {data.get('disk', {}).get('used_percent', '-')}% "
+            f"Free: {data.get('disk', {}).get('free_gb', '-')} GB"
+        )
 
         message = "\n".join(lines)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import time
 from decimal import Decimal
@@ -40,6 +41,24 @@ def clean_json(value: Any):
     return value
 
 
+
+def get_disk_usage(path: str = "/opt/jobpulse") -> dict:
+    total, used, free = shutil.disk_usage(path)
+
+    total_gb = round(total / 1024 / 1024 / 1024, 2)
+    used_gb = round(used / 1024 / 1024 / 1024, 2)
+    free_gb = round(free / 1024 / 1024 / 1024, 2)
+    used_percent = round((used / total) * 100, 2) if total else 0
+
+    return {
+        "path": path,
+        "total_gb": total_gb,
+        "used_gb": used_gb,
+        "free_gb": free_gb,
+        "used_percent": used_percent,
+    }
+
+
 def tail_file(path: Path, max_lines: int = 200) -> list[str]:
     if not path.exists() or not path.is_file():
         return []
@@ -66,6 +85,7 @@ def build_alerts(
     demand_queue: list[dict],
     coverage: list[dict],
     backups: list[Path],
+    disk_usage: dict | None = None,
 ) -> list[dict]:
     alerts = []
 
@@ -125,6 +145,22 @@ def build_alerts(
             "level": "warning",
             "code": "demand_running_backlog",
             "message": f"{demand_running} demand queue tasks are still running.",
+        })
+
+    disk_used = float((disk_usage or {}).get("used_percent") or 0)
+    disk_free_gb = float((disk_usage or {}).get("free_gb") or 0)
+
+    if disk_used >= 90:
+        alerts.append({
+            "level": "critical",
+            "code": "disk_usage_critical",
+            "message": f"Disk usage is {disk_used:.2f}% with {disk_free_gb:.2f} GB free.",
+        })
+    elif disk_used >= 80:
+        alerts.append({
+            "level": "warning",
+            "code": "disk_usage_high",
+            "message": f"Disk usage is {disk_used:.2f}% with {disk_free_gb:.2f} GB free.",
         })
 
     if not backups:
@@ -303,17 +339,21 @@ def register_admin_status_routes(app):
             latest_backup = backups[-1] if backups else None
 
 
+            disk_usage = get_disk_usage("/opt/jobpulse")
+
             alerts = build_alerts(
                 job_stats=job_stats,
                 bad_apply=bad_apply,
                 demand_queue=demand_queue,
                 coverage=coverage,
                 backups=backups,
+                disk_usage=disk_usage,
             )
 
             return clean_json({
                 "status": "ok",
                 "database": "connected",
+                "disk": disk_usage,
                 "alerts": alerts,
                 "jobs": job_stats,
                 "bad_apply": bad_apply,

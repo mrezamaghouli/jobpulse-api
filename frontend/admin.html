@@ -384,6 +384,22 @@
     </div>
 
     <div class="section">
+      <h2>Disk Usage</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Total</th>
+            <th>Used</th>
+            <th>Free</th>
+            <th>Used %</th>
+          </tr>
+        </thead>
+        <tbody id="diskRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Admin Actions</h2>
       <div class="token-box" style="margin-bottom:12px; flex-wrap:wrap;">
         <button onclick="runAction('run_collection_cycle')">Run Collection Cycle Now</button>
@@ -634,6 +650,25 @@
         '</ul>';
     }
 
+    function diskHtml(disk) {
+      if (!disk) {
+        return '<tr><td colspan="5">No disk data</td></tr>';
+      }
+
+      const pct = Number(disk.used_percent || 0);
+      const pctClass = pct >= 90 ? 'bad' : (pct >= 80 ? 'warn' : 'good');
+
+      return `
+        <tr>
+          <td>${escapeHtml(disk.path || '-')}</td>
+          <td>${escapeHtml(disk.total_gb ?? '-')} GB</td>
+          <td>${escapeHtml(disk.used_gb ?? '-')} GB</td>
+          <td>${escapeHtml(disk.free_gb ?? '-')} GB</td>
+          <td class="${pctClass}">${escapeHtml(disk.used_percent ?? '-')}%</td>
+        </tr>
+      `;
+    }
+
     function adminActionsHtml(items) {
       if (!items || !items.length) {
         return '<tr><td colspan="6">No admin actions yet</td></tr>';
@@ -771,6 +806,11 @@
         document.getElementById('countryProgressRows').innerHTML = countryProgressHtml(data.coverage_country_progress);
         document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
         document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
+
+        const diskRows = document.getElementById('diskRows');
+        if (diskRows) {
+          diskRows.innerHTML = diskHtml(data.disk);
+        }
 
         const adminActionRows = document.getElementById('adminActionRows');
         if (adminActionRows) {
