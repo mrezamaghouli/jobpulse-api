@@ -1,10 +1,12 @@
 import os
+import subprocess
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import psycopg2
-from fastapi import Header, HTTPException
+from fastapi import Body, Header, HTTPException
 from psycopg2.extras import RealDictCursor
 
 from app.config import get_postgres_config
@@ -313,6 +315,101 @@ def register_admin_status_routes(app):
 
         finally:
             conn.close()
+
+
+
+
+def app_workdir() -> Path:
+    if Path("/app/scripts").exists():
+        return Path("/app")
+    return Path.cwd()
+
+
+def run_admin_command(args: list[str], timeout: int = 600) -> dict:
+    started = time.time()
+
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(app_workdir()),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        stdout = result.stdout[-12000:] if result.stdout else ""
+        stderr = result.stderr[-12000:] if result.stderr else ""
+
+        return {
+            "args": args,
+            "returncode": result.returncode,
+            "duration_seconds": round(time.time() - started, 2),
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "args": args,
+            "returncode": 124,
+            "duration_seconds": round(time.time() - started, 2),
+            "stdout": exc.stdout or "",
+            "stderr": f"Command timed out after {timeout} seconds.",
+        }
+
+
+def register_admin_action_routes(app):
+    @app.post("/api/admin/action")
+    @app.post("/admin/action")
+    def admin_action(
+        payload: dict | None = Body(default=None),
+        x_admin_token: str | None = Header(default=None),
+    ):
+        require_admin_token(x_admin_token)
+
+        payload = payload or {}
+        action = str(payload.get("action", "")).strip()
+
+        action_commands = {
+            "seed_priority_queue": [
+                ["python", "-m", "scripts.seed_priority_coverage_queue", "--limit", "10", "--retry-after-hours", "24"],
+            ],
+            "process_queue_once": [
+                ["python", "-m", "scripts.process_search_demand_queue", "--limit", "5", "--workers", "1", "--skip-company-enrichment"],
+            ],
+            "reconcile_coverage": [
+                ["python", "-m", "scripts.reconcile_priority_coverage"],
+            ],
+            "telegram_alert_check": [
+                ["python", "scripts/send_telegram_alerts.py"],
+            ],
+            "run_collection_cycle": [
+                ["python", "-m", "scripts.seed_priority_coverage_queue", "--limit", "10", "--retry-after-hours", "24"],
+                ["python", "-m", "scripts.process_search_demand_queue", "--limit", "5", "--workers", "1", "--skip-company-enrichment"],
+                ["python", "-m", "scripts.reconcile_priority_coverage"],
+            ],
+        }
+
+        if action not in action_commands:
+            raise HTTPException(status_code=400, detail="Invalid admin action.")
+
+        results = []
+        success = True
+
+        for cmd in action_commands[action]:
+            item = run_admin_command(cmd)
+            results.append(item)
+
+            if item["returncode"] != 0:
+                success = False
+                break
+
+        return {
+            "status": "ok" if success else "failed",
+            "action": action,
+            "results": results,
+        }
 
 
 def register_admin_logs_routes(app):

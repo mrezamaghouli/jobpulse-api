@@ -636,3 +636,8 @@ register_admin_status_routes(app)
 from app.admin_status import register_admin_logs_routes
 register_admin_logs_routes(app)
 
+
+# Admin action routes
+from app.admin_status import register_admin_action_routes
+register_admin_action_routes(app)
+
