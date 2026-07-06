@@ -52,6 +52,8 @@ services:
       retries: 10
 
     volumes:
+      - /opt/jobpulse/.admin_token:/opt/jobpulse/.admin_token:ro
+      - /opt/jobpulse/.telegram_alert.env:/opt/jobpulse/.telegram_alert.env:ro
       - /opt/jobpulse/backups:/opt/jobpulse/backups:ro
       - ./.auth:/app/.auth:ro
       - ./logs:/app/logs

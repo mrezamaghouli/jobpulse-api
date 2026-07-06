@@ -396,6 +396,23 @@
     </div>
 
     <div class="section">
+      <h2>Admin Action History</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Action</th>
+            <th>Status</th>
+            <th>Started</th>
+            <th>Duration</th>
+            <th>Return Code</th>
+          </tr>
+        </thead>
+        <tbody id="adminActionRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Logs</h2>
       <div class="token-box" style="margin-bottom:12px;">
         <select id="logFile">
@@ -617,6 +634,26 @@
         '</ul>';
     }
 
+    function adminActionsHtml(items) {
+      if (!items || !items.length) {
+        return '<tr><td colspan="6">No admin actions yet</td></tr>';
+      }
+
+      return items.map(item => {
+        const statusClass = item.status === 'ok' ? 'good' : (item.status === 'running' ? 'warn' : 'bad');
+        return `
+          <tr>
+            <td>${escapeHtml(item.id || '-')}</td>
+            <td>${escapeHtml(item.action || '-')}</td>
+            <td class="${statusClass}">${escapeHtml(item.status || '-')}</td>
+            <td>${escapeHtml(item.started_at || '-')}</td>
+            <td>${escapeHtml(item.duration_seconds || '-')}s</td>
+            <td>${escapeHtml(item.returncode ?? '-')}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     async function runAction(action) {
       const token = localStorage.getItem('jobpulse_admin_token') || tokenInput.value.trim();
 
@@ -734,6 +771,11 @@
         document.getElementById('countryProgressRows').innerHTML = countryProgressHtml(data.coverage_country_progress);
         document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
         document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
+
+        const adminActionRows = document.getElementById('adminActionRows');
+        if (adminActionRows) {
+          adminActionRows.innerHTML = adminActionsHtml(data.recent_admin_actions);
+        }
         renderAlerts(data);
 
         document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);

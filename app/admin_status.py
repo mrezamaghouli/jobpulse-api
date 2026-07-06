@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import time
@@ -7,7 +8,7 @@ from typing import Any
 
 import psycopg2
 from fastapi import Body, Header, HTTPException
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 
 from app.config import get_postgres_config
 
@@ -280,6 +281,23 @@ def register_admin_status_routes(app):
                 """)
                 coverage_country_progress = [dict(row) for row in cur.fetchall()]
 
+                ensure_admin_action_runs_table()
+                cur.execute("""
+                    SELECT
+                      id,
+                      action,
+                      status,
+                      started_at,
+                      finished_at,
+                      duration_seconds,
+                      returncode
+                    FROM admin_action_runs
+                    ORDER BY started_at DESC
+                    LIMIT 20;
+                """)
+                recent_admin_actions = [dict(row) for row in cur.fetchall()]
+
+
             backups_dir = Path("/opt/jobpulse/backups")
             backups = sorted(backups_dir.glob("jobpulse_*.sql")) if backups_dir.exists() else []
             latest_backup = backups[-1] if backups else None
@@ -304,6 +322,7 @@ def register_admin_status_routes(app):
                 "recent_jobs": recent_jobs,
                 "coverage_by_country": coverage_by_country,
                 "recent_collection_tasks": recent_collection_tasks,
+                "recent_admin_actions": recent_admin_actions,
                 "coverage_progress": coverage_progress,
                 "coverage_country_progress": coverage_country_progress,
                 "backups": {
@@ -359,6 +378,114 @@ def run_admin_command(args: list[str], timeout: int = 600) -> dict:
         }
 
 
+
+
+def ensure_admin_action_runs_table():
+    conn = psycopg2.connect(**get_postgres_config())
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_action_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    finished_at TIMESTAMPTZ,
+                    duration_seconds NUMERIC,
+                    returncode INTEGER,
+                    results_json JSONB,
+                    stdout_tail TEXT,
+                    stderr_tail TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS admin_action_runs_one_running_idx
+                ON admin_action_runs ((status))
+                WHERE status = 'running';
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def begin_admin_action_run(action: str) -> int:
+    ensure_admin_action_runs_table()
+
+    conn = psycopg2.connect(**get_postgres_config())
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                DELETE FROM admin_action_runs
+                WHERE status = 'running'
+                  AND started_at < NOW() - INTERVAL '30 minutes';
+            """)
+
+            try:
+                cur.execute("""
+                    INSERT INTO admin_action_runs (action, status)
+                    VALUES (%s, 'running')
+                    RETURNING id;
+                """, (action,))
+            except Exception as exc:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="Another admin action is already running. Wait for it to finish.",
+                ) from exc
+
+            row = cur.fetchone()
+        conn.commit()
+        return int(row["id"])
+    finally:
+        conn.close()
+
+
+def finish_admin_action_run(run_id: int, status: str, results: list[dict], started: float):
+    duration = round(time.time() - started, 2)
+    returncode = 0
+
+    stdout_tail = ""
+    stderr_tail = ""
+
+    for item in results:
+        rc = int(item.get("returncode") or 0)
+        if rc != 0 and returncode == 0:
+            returncode = rc
+
+        if item.get("stdout"):
+            stdout_tail += "\n" + str(item.get("stdout"))[-4000:]
+
+        if item.get("stderr"):
+            stderr_tail += "\n" + str(item.get("stderr"))[-4000:]
+
+    conn = psycopg2.connect(**get_postgres_config())
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE admin_action_runs
+                SET
+                    status = %s,
+                    finished_at = NOW(),
+                    duration_seconds = %s,
+                    returncode = %s,
+                    results_json = %s,
+                    stdout_tail = %s,
+                    stderr_tail = %s
+                WHERE id = %s;
+            """, (
+                status,
+                duration,
+                returncode,
+                Json(results),
+                stdout_tail[-8000:],
+                stderr_tail[-8000:],
+                run_id,
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def register_admin_action_routes(app):
     @app.post("/api/admin/action")
     @app.post("/admin/action")
@@ -394,6 +521,9 @@ def register_admin_action_routes(app):
         if action not in action_commands:
             raise HTTPException(status_code=400, detail="Invalid admin action.")
 
+        started = time.time()
+        run_id = begin_admin_action_run(action)
+
         results = []
         success = True
 
@@ -405,9 +535,13 @@ def register_admin_action_routes(app):
                 success = False
                 break
 
+        final_status = "ok" if success else "failed"
+        finish_admin_action_run(run_id, final_status, results, started)
+
         return {
-            "status": "ok" if success else "failed",
+            "status": final_status,
             "action": action,
+            "run_id": run_id,
             "results": results,
         }
 
