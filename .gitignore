@@ -92,3 +92,4 @@ linkedin_session.b64
 export_targets_*.csv
 .admin_token
 .admin.env
+.telegram_alert.env
