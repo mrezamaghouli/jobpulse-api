@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
@@ -40,6 +41,47 @@ def clean_json(value: Any):
 
     return value
 
+
+
+
+def get_linkedin_auth_state() -> dict:
+    state_path = Path(os.getenv("LINKEDIN_STORAGE_STATE", "/app/.auth/linkedin_storage_state.json"))
+
+    if not state_path.exists():
+        fallback = Path("/opt/jobpulse/.auth/linkedin_storage_state.json")
+        if fallback.exists():
+            state_path = fallback
+
+    if not state_path.exists():
+        return {
+            "exists": False,
+            "path": str(state_path),
+            "size_bytes": 0,
+            "updated_at": None,
+            "age_hours": None,
+            "status": "missing",
+        }
+
+    stat = state_path.stat()
+    updated_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    age_hours = round((now - updated_at).total_seconds() / 3600, 2)
+
+    if age_hours >= 336:
+        status = "critical"
+    elif age_hours >= 168:
+        status = "warning"
+    else:
+        status = "ok"
+
+    return {
+        "exists": True,
+        "path": str(state_path),
+        "size_bytes": stat.st_size,
+        "updated_at": updated_at.isoformat(),
+        "age_hours": age_hours,
+        "status": status,
+    }
 
 
 def get_disk_usage(path: str = "/opt/jobpulse") -> dict:
@@ -86,6 +128,7 @@ def build_alerts(
     coverage: list[dict],
     backups: list[Path],
     disk_usage: dict | None = None,
+    linkedin_auth: dict | None = None,
 ) -> list[dict]:
     alerts = []
 
@@ -145,6 +188,28 @@ def build_alerts(
             "level": "warning",
             "code": "demand_running_backlog",
             "message": f"{demand_running} demand queue tasks are still running.",
+        })
+
+    auth = linkedin_auth or {}
+    auth_age = auth.get("age_hours")
+
+    if not auth.get("exists"):
+        alerts.append({
+            "level": "critical",
+            "code": "linkedin_auth_missing",
+            "message": "LinkedIn auth storage state file is missing.",
+        })
+    elif auth_age is not None and float(auth_age) >= 336:
+        alerts.append({
+            "level": "critical",
+            "code": "linkedin_auth_very_old",
+            "message": f"LinkedIn auth state is {float(auth_age):.1f} hours old. Refresh it soon.",
+        })
+    elif auth_age is not None and float(auth_age) >= 168:
+        alerts.append({
+            "level": "warning",
+            "code": "linkedin_auth_old",
+            "message": f"LinkedIn auth state is {float(auth_age):.1f} hours old. Consider refreshing it.",
         })
 
     disk_used = float((disk_usage or {}).get("used_percent") or 0)
@@ -339,6 +404,7 @@ def register_admin_status_routes(app):
             latest_backup = backups[-1] if backups else None
 
 
+            linkedin_auth = get_linkedin_auth_state()
             disk_usage = get_disk_usage("/opt/jobpulse")
 
             alerts = build_alerts(
@@ -348,12 +414,14 @@ def register_admin_status_routes(app):
                 coverage=coverage,
                 backups=backups,
                 disk_usage=disk_usage,
+                linkedin_auth=linkedin_auth,
             )
 
             return clean_json({
                 "status": "ok",
                 "database": "connected",
                 "disk": disk_usage,
+                "linkedin_auth": linkedin_auth,
                 "alerts": alerts,
                 "jobs": job_stats,
                 "bad_apply": bad_apply,
@@ -550,6 +618,9 @@ def register_admin_action_routes(app):
             ],
             "telegram_alert_check": [
                 ["python", "scripts/send_telegram_alerts.py"],
+            ],
+            "linkedin_auth_preflight": [
+                ["python", "-m", "scripts.linkedin_auth_preflight"],
             ],
             "run_collection_cycle": [
                 ["python", "-m", "scripts.seed_priority_coverage_queue", "--limit", "10", "--retry-after-hours", "24"],

@@ -384,6 +384,22 @@
     </div>
 
     <div class="section">
+      <h2>LinkedIn Auth</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Exists</th>
+            <th>Age</th>
+            <th>Updated At</th>
+            <th>Size</th>
+          </tr>
+        </thead>
+        <tbody id="linkedinAuthRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>Disk Usage</h2>
       <table>
         <thead>
@@ -407,6 +423,7 @@
         <button class="secondary" onclick="runAction('process_queue_once')">Process Queue Once</button>
         <button class="secondary" onclick="runAction('reconcile_coverage')">Reconcile Coverage</button>
         <button class="secondary" onclick="runAction('telegram_alert_check')">Test Telegram Alert</button>
+        <button class="secondary" onclick="runAction('linkedin_auth_preflight')">Check LinkedIn Auth</button>
       </div>
       <pre id="actionOutput">-</pre>
     </div>
@@ -650,6 +667,25 @@
         '</ul>';
     }
 
+    function linkedinAuthHtml(auth) {
+      if (!auth) {
+        return '<tr><td colspan="5">No LinkedIn auth data</td></tr>';
+      }
+
+      const status = auth.status || 'unknown';
+      const statusClass = status === 'ok' ? 'good' : (status === 'warning' ? 'warn' : 'bad');
+
+      return `
+        <tr>
+          <td class="${statusClass}">${escapeHtml(status)}</td>
+          <td>${auth.exists ? 'yes' : 'no'}</td>
+          <td>${auth.age_hours ?? '-'} hours</td>
+          <td>${escapeHtml(auth.updated_at || '-')}</td>
+          <td>${escapeHtml(auth.size_bytes ?? '-')} bytes</td>
+        </tr>
+      `;
+    }
+
     function diskHtml(disk) {
       if (!disk) {
         return '<tr><td colspan="5">No disk data</td></tr>';
@@ -806,6 +842,11 @@
         document.getElementById('countryProgressRows').innerHTML = countryProgressHtml(data.coverage_country_progress);
         document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
         document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
+
+        const linkedinAuthRows = document.getElementById('linkedinAuthRows');
+        if (linkedinAuthRows) {
+          linkedinAuthRows.innerHTML = linkedinAuthHtml(data.linkedin_auth);
+        }
 
         const diskRows = document.getElementById('diskRows');
         if (diskRows) {
