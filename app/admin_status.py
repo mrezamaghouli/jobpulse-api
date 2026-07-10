@@ -710,9 +710,7 @@ def register_admin_action_routes(app):
                 ["python", "-m", "scripts.linkedin_auth_preflight"],
             ],
             "run_collection_cycle": [
-                ["python", "-m", "scripts.seed_priority_coverage_queue", "--limit", "10", "--retry-after-hours", "24"],
-                ["python", "-m", "scripts.process_search_demand_queue", "--limit", "5", "--workers", "1", "--skip-company-enrichment"],
-                ["python", "-m", "scripts.reconcile_priority_coverage"],
+                ["bash", "-lc", 'cd /opt/jobpulse && mkdir -p /opt/jobpulse/logs && if flock -n /tmp/jobpulse_collection_cycle.lock nohup ./scripts/run_collection_cycle_safe.sh >> /opt/jobpulse/logs/admin_collection_cycle_now.log 2>&1 & then echo collection_cycle_started; else echo collection_cycle_already_running; fi'],
             ],
         }
 

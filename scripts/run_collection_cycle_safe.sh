@@ -3,12 +3,18 @@ set -u
 
 cd /opt/jobpulse
 
+if [ -f /opt/jobpulse/.collection.env ]; then
+  set -a
+  . /opt/jobpulse/.collection.env
+  set +a
+fi
+
 COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"
 LOG_FILE="/opt/jobpulse/logs/collection_cycle.log"
 HEARTBEAT_FILE="/opt/jobpulse/logs/collection_heartbeat.json"
 
 SEED_LIMIT="${SEED_LIMIT:-10}"
-PROCESS_LIMIT="${PROCESS_LIMIT:-10}"
+PROCESS_LIMIT="${PROCESS_LIMIT:-5}"
 BACKLOG_LIMIT="${BACKLOG_LIMIT:-50}"
 
 mkdir -p /opt/jobpulse/logs
@@ -80,6 +86,29 @@ queue_count() {
     " 2>/dev/null | tr -d '[:space:]'
 }
 
+reset_recent_running() {
+  local since_sql="$1"
+  local reason="$2"
+
+  log "Resetting recent running queue rows after failure. since=${since_sql}, reason=${reason}"
+
+  docker compose -f "$COMPOSE_FILE" exec -T db \
+    psql -U jobpulse_user -d jobpulse -c "
+      UPDATE job_search_demand_queue
+      SET
+        status = 'pending',
+        locked_at = NULL,
+        fail_count = COALESCE(fail_count, 0) + 1,
+        last_error = CONCAT_WS(' | ', NULLIF(last_error, ''), '${reason}')
+      WHERE status = 'running'
+        AND (
+          locked_at IS NULL
+          OR locked_at >= TIMESTAMP '${since_sql}'
+        )
+      RETURNING id, raw_query, status, locked_at;
+    " >> "$LOG_FILE" 2>&1 || true
+}
+
 log ""
 log "===== SAFE COLLECTION CYCLE $(date -Is) ====="
 write_heartbeat "running" "Collection cycle started. Running LinkedIn auth preflight."
@@ -89,9 +118,7 @@ log "Running LinkedIn auth preflight..."
 if ! docker compose -f "$COMPOSE_FILE" exec -T api python -m scripts.linkedin_auth_preflight >> "$LOG_FILE" 2>&1; then
   log "SAFE_CYCLE_ABORTED: LinkedIn auth preflight failed. Skipping seed/process/reconcile."
   write_heartbeat "aborted_auth" "LinkedIn auth preflight failed. Collection skipped."
-
   python3 scripts/send_telegram_alerts.py >> /opt/jobpulse/logs/telegram_alerts.log 2>&1 || true
-
   exit 0
 fi
 
@@ -105,7 +132,7 @@ RUNNING_COUNT="${RUNNING_COUNT:-0}"
 
 write_heartbeat "running" "LinkedIn auth passed. Checking backlog." "$PENDING_COUNT" "$RUNNING_COUNT"
 
-log "Queue status before cycle: pending=${PENDING_COUNT}, running=${RUNNING_COUNT}, backlog_limit=${BACKLOG_LIMIT}"
+log "Queue status before cycle: pending=${PENDING_COUNT}, running=${RUNNING_COUNT}, backlog_limit=${BACKLOG_LIMIT}, process_limit=${PROCESS_LIMIT}"
 
 if [ "$RUNNING_COUNT" -gt 0 ]; then
   log "SAFE_CYCLE_ABORTED: ${RUNNING_COUNT} queue tasks are still running. Skipping this cycle."
@@ -129,10 +156,15 @@ fi
 
 log "Processing demand queue."
 
+PROCESS_STARTED_AT_SQL="$(date -u '+%Y-%m-%d %H:%M:%S')"
+
 if ! docker compose -f "$COMPOSE_FILE" exec -T api \
   python -m scripts.process_search_demand_queue --limit "$PROCESS_LIMIT" --workers 1 --skip-company-enrichment >> "$LOG_FILE" 2>&1; then
   log "SAFE_CYCLE_FAILED: process_search_demand_queue failed."
-  write_heartbeat "failed" "Process search demand queue failed." "$PENDING_COUNT" "$RUNNING_COUNT"
+  reset_recent_running "$PROCESS_STARTED_AT_SQL" "reset after process_search_demand_queue failed"
+  PENDING_AFTER="$(queue_count pending)"
+  PENDING_AFTER="${PENDING_AFTER:-0}"
+  write_heartbeat "failed" "Process search demand queue failed; recent running rows were reset." "$PENDING_COUNT" "$RUNNING_COUNT" "$PENDING_AFTER"
   python3 scripts/send_telegram_alerts.py >> /opt/jobpulse/logs/telegram_alerts.log 2>&1 || true
   exit 0
 fi
