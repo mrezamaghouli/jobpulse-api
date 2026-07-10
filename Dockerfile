@@ -3,13 +3,17 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
+COPY requirements.prod.txt .
+
+ARG TORCH_VERSION=2.5.1
 
 RUN pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ \
-    --trusted-host mirrors.aliyun.com \
-    --default-timeout=120 \
-    --retries 10 \
-    -r requirements.txt
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torch==${TORCH_VERSION}+cpu"
+
+RUN pip install --no-cache-dir \
+    -i https://mirrors.aliyun.com/pypi/simple \
+    -r requirements.prod.txt
 
 RUN python -m playwright install --with-deps chromium chrome
 

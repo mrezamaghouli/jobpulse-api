@@ -44,6 +44,60 @@ def clean_json(value: Any):
 
 
 
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def get_collection_heartbeat() -> dict:
+    path = Path(os.getenv("JOBPULSE_COLLECTION_HEARTBEAT", "/app/logs/collection_heartbeat.json"))
+    if not path.exists():
+        fallback = Path("/opt/jobpulse/logs/collection_heartbeat.json")
+        if fallback.exists():
+            path = fallback
+
+    if not path.exists():
+        return {
+            "exists": False,
+            "path": str(path),
+            "last_status": "missing",
+            "age_minutes": None,
+        }
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "exists": True,
+            "path": str(path),
+            "last_status": "unreadable",
+            "last_message": str(exc),
+            "age_minutes": None,
+        }
+
+    updated_at = parse_iso_datetime(data.get("updated_at"))
+    now = datetime.now(timezone.utc)
+
+    age_minutes = None
+    if updated_at:
+        age_minutes = round((now - updated_at).total_seconds() / 60, 2)
+
+    data["exists"] = True
+    data["path"] = str(path)
+    data["age_minutes"] = age_minutes
+
+    return data
+
+
 def get_linkedin_auth_state() -> dict:
     state_path = Path(os.getenv("LINKEDIN_STORAGE_STATE", "/app/.auth/linkedin_storage_state.json"))
 
@@ -129,6 +183,7 @@ def build_alerts(
     backups: list[Path],
     disk_usage: dict | None = None,
     linkedin_auth: dict | None = None,
+    collection_heartbeat: dict | None = None,
 ) -> list[dict]:
     alerts = []
 
@@ -188,6 +243,35 @@ def build_alerts(
             "level": "warning",
             "code": "demand_running_backlog",
             "message": f"{demand_running} demand queue tasks are still running.",
+        })
+
+    heartbeat = collection_heartbeat or {}
+    heartbeat_status = heartbeat.get("last_status")
+    heartbeat_age = heartbeat.get("age_minutes")
+
+    if not heartbeat.get("exists"):
+        alerts.append({
+            "level": "warning",
+            "code": "collection_heartbeat_missing",
+            "message": "Collection heartbeat file is missing. The safe collection cycle may not have run yet.",
+        })
+    elif heartbeat_status == "running" and heartbeat_age is not None and float(heartbeat_age) >= 60:
+        alerts.append({
+            "level": "critical",
+            "code": "collection_cycle_stuck",
+            "message": f"Collection cycle appears stuck. Last heartbeat is {float(heartbeat_age):.1f} minutes old.",
+        })
+    elif heartbeat_age is not None and float(heartbeat_age) >= 90:
+        alerts.append({
+            "level": "critical",
+            "code": "collection_cron_stale",
+            "message": f"Collection cron appears stale. Last heartbeat is {float(heartbeat_age):.1f} minutes old.",
+        })
+    elif heartbeat_status in ("failed", "aborted_auth"):
+        alerts.append({
+            "level": "critical" if heartbeat_status == "aborted_auth" else "warning",
+            "code": f"collection_{heartbeat_status}",
+            "message": heartbeat.get("last_message") or "Collection cycle did not complete successfully.",
         })
 
     auth = linkedin_auth or {}
@@ -405,6 +489,7 @@ def register_admin_status_routes(app):
 
 
             linkedin_auth = get_linkedin_auth_state()
+            collection_heartbeat = get_collection_heartbeat()
             disk_usage = get_disk_usage("/opt/jobpulse")
 
             alerts = build_alerts(
@@ -415,6 +500,7 @@ def register_admin_status_routes(app):
                 backups=backups,
                 disk_usage=disk_usage,
                 linkedin_auth=linkedin_auth,
+                collection_heartbeat=collection_heartbeat,
             )
 
             return clean_json({
@@ -422,6 +508,7 @@ def register_admin_status_routes(app):
                 "database": "connected",
                 "disk": disk_usage,
                 "linkedin_auth": linkedin_auth,
+                "collection_heartbeat": collection_heartbeat,
                 "alerts": alerts,
                 "jobs": job_stats,
                 "bad_apply": bad_apply,
