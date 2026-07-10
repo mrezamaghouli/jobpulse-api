@@ -149,6 +149,7 @@ def main():
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--skip-company-enrichment", action="store_true")
+    parser.add_argument("--skip-post-processing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -207,19 +208,22 @@ def main():
         if code != 0:
             raise RuntimeError(f"linkedin_plan_collect failed with code {code}")
 
-        run_module("scripts.backfill_companies_from_jobs")
+        if not args.skip_post_processing:
+            run_module("scripts.backfill_companies_from_jobs")
 
-        if not args.skip_company_enrichment:
-            run_module(
-                "scripts.enrich_companies_from_linkedin",
-                extra_env={
-                    "COMPANY_ENRICH_LIMIT": os.getenv("SEARCH_DEMAND_COMPANY_ENRICH_LIMIT", "50"),
-                    "COMPANY_ENRICH_STALE_DAYS": "30",
-                },
-            )
+            if not args.skip_company_enrichment:
+                run_module(
+                    "scripts.enrich_companies_from_linkedin",
+                    extra_env={
+                        "COMPANY_ENRICH_LIMIT": os.getenv("SEARCH_DEMAND_COMPANY_ENRICH_LIMIT", "50"),
+                        "COMPANY_ENRICH_STALE_DAYS": "30",
+                    },
+                )
 
-        run_module("scripts.sync_job_company_logos")
-        run_module("scripts.build_job_search_embeddings")
+            run_module("scripts.sync_job_company_logos")
+            run_module("scripts.build_job_search_embeddings")
+        else:
+            print("Skipping post-processing: company backfill, logo sync, embeddings.")
 
         mark_targets(ids, "done")
         print("Search demand queue processed successfully.")

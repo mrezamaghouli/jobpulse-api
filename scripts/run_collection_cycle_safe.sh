@@ -159,7 +159,7 @@ log "Processing demand queue."
 PROCESS_STARTED_AT_SQL="$(date -u '+%Y-%m-%d %H:%M:%S')"
 
 if ! docker compose -f "$COMPOSE_FILE" exec -T api \
-  python -m scripts.process_search_demand_queue --limit "$PROCESS_LIMIT" --workers 1 --skip-company-enrichment >> "$LOG_FILE" 2>&1; then
+  python -m scripts.process_search_demand_queue --limit "$PROCESS_LIMIT" --workers 1 --skip-company-enrichment --skip-post-processing >> "$LOG_FILE" 2>&1; then
   log "SAFE_CYCLE_FAILED: process_search_demand_queue failed."
   reset_recent_running "$PROCESS_STARTED_AT_SQL" "reset after process_search_demand_queue failed"
   PENDING_AFTER="$(queue_count pending)"
