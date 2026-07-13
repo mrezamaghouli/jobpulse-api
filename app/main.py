@@ -6,6 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
+from app.api_security import public_api_security_middleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -62,6 +63,8 @@ def get_cors_origins() -> list[str]:
 
     return origins
 
+
+app.middleware("http")(public_api_security_middleware)
 
 app.add_middleware(
     CORSMiddleware,

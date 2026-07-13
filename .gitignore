@@ -95,3 +95,4 @@ export_targets_*.csv
 .telegram_alert.env
 .admin_htpasswd
 .collection.env
+.api_keys.env
