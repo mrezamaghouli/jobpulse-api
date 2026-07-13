@@ -72,6 +72,36 @@ if pending_after != "":
     data["pending_after"] = int(pending_after)
 
 path.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+if status != "running":
+    history_path = path.with_name("collection_history.jsonl")
+
+    started_at = data.get("last_started_at")
+    finished_at = data.get("last_finished_at") or now
+
+    duration_seconds = None
+    try:
+        start_dt = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        finish_dt = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+        duration_seconds = round((finish_dt - start_dt).total_seconds(), 2)
+    except Exception:
+        pass
+
+    event = {
+        "timestamp": now,
+        "status": status,
+        "message": message,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+        "pending_before": int(pending_before) if pending_before != "" else None,
+        "running_before": int(running_before) if running_before != "" else None,
+        "pending_after": int(pending_after) if pending_after != "" else None,
+    }
+
+    with history_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, sort_keys=True) + "\n")
+
 PY
 }
 

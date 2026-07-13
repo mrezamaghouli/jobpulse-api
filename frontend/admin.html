@@ -384,6 +384,36 @@
     </div>
 
     <div class="section">
+      <h2>Collection Performance</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Avg Drain / Cycle</th>
+            <th>Avg Duration</th>
+            <th>Pending Now</th>
+            <th>ETA</th>
+            <th>Success / Failure</th>
+          </tr>
+        </thead>
+        <tbody id="collectionPerformanceRows"></tbody>
+      </table>
+
+      <h3>Recent Collection Runs</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Status</th>
+            <th>Duration</th>
+            <th>Pending Before/After</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="collectionHistoryRows"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
       <h2>LinkedIn Auth</h2>
       <table>
         <thead>
@@ -667,6 +697,67 @@
         '</ul>';
     }
 
+    function getPendingQueueCount(data) {
+      const rows = data?.demand_queue || [];
+      const found = rows.find((row) => row.status === 'pending');
+      return Number(found?.count || 0);
+    }
+
+    function collectionPerformanceHtml(perf, data) {
+      if (!perf || !perf.exists) {
+        return '<tr><td colspan="5">No collection performance data yet</td></tr>';
+      }
+
+      const pending = getPendingQueueCount(data);
+      const avgDrain = Number(perf.avg_drain_per_success || 0);
+
+      let eta = '-';
+      if (pending > 0 && avgDrain > 0) {
+        const cycles = Math.ceil(pending / avgDrain);
+        const hours = (cycles * 0.5).toFixed(1);
+        eta = `${cycles} cycles / ~${hours}h`;
+      }
+
+      return `
+        <tr>
+          <td>${escapeHtml(perf.avg_drain_per_success ?? '-')}</td>
+          <td>${escapeHtml(perf.avg_duration_minutes ?? '-')} min</td>
+          <td>${escapeHtml(pending)}</td>
+          <td>${escapeHtml(eta)}</td>
+          <td>${escapeHtml(perf.success_count ?? 0)} / ${escapeHtml(perf.failure_count ?? 0)}</td>
+        </tr>
+      `;
+    }
+
+    function collectionHistoryHtml(perf) {
+      const rows = perf?.recent || [];
+      if (!rows.length) {
+        return '<tr><td colspan="5">No recent collection runs</td></tr>';
+      }
+
+      return rows.slice().reverse().map((row) => {
+        const status = row.status || 'unknown';
+        const statusClass = status === 'success' ? 'good' :
+          (status === 'skipped_running' ? 'warn' : 'bad');
+
+        const duration = row.duration_seconds
+          ? `${Math.round(row.duration_seconds)}s`
+          : '-';
+
+        const pending = `${row.pending_before ?? '-'} / ${row.pending_after ?? '-'}`;
+
+        return `
+          <tr>
+            <td>${escapeHtml(row.timestamp || '-')}</td>
+            <td class="${statusClass}">${escapeHtml(status)}</td>
+            <td>${escapeHtml(duration)}</td>
+            <td>${escapeHtml(pending)}</td>
+            <td>${escapeHtml(row.message || '-')}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
     function linkedinAuthHtml(auth) {
       if (!auth) {
         return '<tr><td colspan="5">No LinkedIn auth data</td></tr>';
@@ -842,6 +933,16 @@
         document.getElementById('countryProgressRows').innerHTML = countryProgressHtml(data.coverage_country_progress);
         document.getElementById('coverageCountryRows').innerHTML = coverageCountryHtml(data.coverage_by_country);
         document.getElementById('collectionTaskRows').innerHTML = collectionTasksHtml(data.recent_collection_tasks);
+
+        const collectionPerformanceRows = document.getElementById('collectionPerformanceRows');
+        if (collectionPerformanceRows) {
+          collectionPerformanceRows.innerHTML = collectionPerformanceHtml(data.collection_performance, data);
+        }
+
+        const collectionHistoryRows = document.getElementById('collectionHistoryRows');
+        if (collectionHistoryRows) {
+          collectionHistoryRows.innerHTML = collectionHistoryHtml(data.collection_performance);
+        }
 
         const linkedinAuthRows = document.getElementById('linkedinAuthRows');
         if (linkedinAuthRows) {

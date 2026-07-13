@@ -58,6 +58,77 @@ def parse_iso_datetime(value):
         return None
 
 
+
+def get_collection_performance() -> dict:
+    path = Path(os.getenv("JOBPULSE_COLLECTION_HISTORY", "/app/logs/collection_history.jsonl"))
+
+    if not path.exists():
+        fallback = Path("/opt/jobpulse/logs/collection_history.jsonl")
+        if fallback.exists():
+            path = fallback
+
+    if not path.exists():
+        return {
+            "exists": False,
+            "path": str(path),
+            "recent": [],
+            "avg_drain_per_success": None,
+            "avg_duration_minutes": None,
+            "success_count": 0,
+            "failure_count": 0,
+        }
+
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines()[-30:]:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    except Exception as exc:
+        return {
+            "exists": True,
+            "path": str(path),
+            "error": str(exc),
+            "recent": [],
+            "avg_drain_per_success": None,
+            "avg_duration_minutes": None,
+            "success_count": 0,
+            "failure_count": 0,
+        }
+
+    successes = [r for r in rows if r.get("status") == "success"]
+    failures = [r for r in rows if r.get("status") in ("failed", "aborted_auth")]
+
+    drains = []
+    durations = []
+
+    for row in successes[-10:]:
+        before = row.get("pending_before")
+        after = row.get("pending_after")
+        if isinstance(before, int) and isinstance(after, int):
+            drain = before - after
+            if drain > 0:
+                drains.append(drain)
+
+        duration = row.get("duration_seconds")
+        if isinstance(duration, (int, float)) and duration > 0:
+            durations.append(duration / 60)
+
+    avg_drain = round(sum(drains) / len(drains), 2) if drains else None
+    avg_duration = round(sum(durations) / len(durations), 2) if durations else None
+
+    return {
+        "exists": True,
+        "path": str(path),
+        "recent": rows[-10:],
+        "avg_drain_per_success": avg_drain,
+        "avg_duration_minutes": avg_duration,
+        "success_count": len(successes),
+        "failure_count": len(failures),
+    }
+
+
 def get_collection_heartbeat() -> dict:
     path = Path(os.getenv("JOBPULSE_COLLECTION_HEARTBEAT", "/app/logs/collection_heartbeat.json"))
     if not path.exists():
@@ -490,6 +561,7 @@ def register_admin_status_routes(app):
 
             linkedin_auth = get_linkedin_auth_state()
             collection_heartbeat = get_collection_heartbeat()
+            collection_performance = get_collection_performance()
             disk_usage = get_disk_usage("/opt/jobpulse")
 
             alerts = build_alerts(
@@ -509,6 +581,7 @@ def register_admin_status_routes(app):
                 "disk": disk_usage,
                 "linkedin_auth": linkedin_auth,
                 "collection_heartbeat": collection_heartbeat,
+                "collection_performance": collection_performance,
                 "alerts": alerts,
                 "jobs": job_stats,
                 "bad_apply": bad_apply,
