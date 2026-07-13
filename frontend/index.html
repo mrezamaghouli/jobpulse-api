@@ -1132,6 +1132,33 @@
       renderDetails(job);
     }
 
+
+    function getApiHeaders(extra = {}) {
+      const key = localStorage.getItem('JOBPULSE_API_KEY') || '';
+      const headers = { ...extra };
+
+      if (key) {
+        headers['X-API-Key'] = key;
+      }
+
+      return headers;
+    }
+
+    function ensureApiKeyConfigured() {
+      let key = localStorage.getItem('JOBPULSE_API_KEY');
+
+      if (!key) {
+        key = window.prompt('Enter JobPulse API key:');
+
+        if (key) {
+          localStorage.setItem('JOBPULSE_API_KEY', key.trim());
+        }
+      }
+
+      return localStorage.getItem('JOBPULSE_API_KEY') || '';
+    }
+
+
     async function applyFilters() {
       const container = document.getElementById('jobsContainer');
       const button = document.getElementById('loadMoreButton');
@@ -1184,7 +1211,15 @@
     }
 
     async function fetchJson(path) {
-      const response = await fetch(`${API_BASE_URL}${path}`);
+      ensureApiKeyConfigured();
+
+      const response = await fetch(`${API_BASE_URL}${path}`, { headers: getApiHeaders() });
+
+      if (response.status === 401) {
+        localStorage.removeItem('JOBPULSE_API_KEY');
+        ensureApiKeyConfigured();
+        throw new Error('API key is missing or invalid. Please refresh and enter the correct key.');
+      }
 
       if (!response.ok) {
         throw new Error(`API request failed: ${response.status} ${response.statusText}`);
