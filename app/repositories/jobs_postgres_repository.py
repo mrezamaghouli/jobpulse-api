@@ -341,18 +341,39 @@ def calculate_title_match_score(row, query):
     if not terms:
         return 0.0
 
-    # Exact phrase in title should always beat description/semantic matches.
+    # Exact role phrase in title should dominate ranking.
     if query_text in title:
-        return 1.0
+        if title.startswith(query_text):
+            return 1.0
+        return 0.96
 
-    # All query words in title, even if separated by punctuation/order.
-    if all(term in title for term in terms):
-        return 0.92
+    matched_terms = [term for term in terms if term in title]
+    matched = len(matched_terms)
 
-    # Strong partial title match.
-    matched = sum(1 for term in terms if term in title)
+    if matched == len(terms):
+        positions = []
+        for term in terms:
+            pos = title.find(term)
+            if pos >= 0:
+                positions.append(pos)
+
+        # All words exist and are reasonably close together.
+        if len(positions) == len(terms):
+            span = max(positions) - min(positions)
+            if span <= max(len(query_text) + 8, 18):
+                return 0.86
+
+        # All words exist, but scattered.
+        return 0.72
+
     if matched > 0:
-        return 0.30 + (0.20 * matched / max(len(terms), 1))
+        coverage = matched / max(len(terms), 1)
+
+        # For multi-word searches, one generic title word should not rank high.
+        if len(terms) >= 2:
+            return 0.08 + (0.22 * coverage)
+
+        return 0.30 + (0.20 * coverage)
 
     return 0.0
 
@@ -760,9 +781,11 @@ def get_all_jobs_from_db(
 
         for row in candidate_rows:
             keyword_score = calculate_keyword_score(row, query)
+            title_match_score = calculate_title_match_score(row, query)
             semantic_score = calculate_semantic_score(query_vector, row.get("search_embedding"))
             freshness_score = calculate_freshness_score(row)
             quality_score = calculate_quality_score(row)
+            query_terms = normalize_search_terms(query)
 
             if query_vector:
                 if keyword_score <= 0 and semantic_score < semantic_threshold:
@@ -771,18 +794,38 @@ def get_all_jobs_from_db(
                 if keyword_score <= 0:
                     continue
 
-            title_match_score = calculate_title_match_score(row, query)
+            # For multi-word role searches, avoid broad matches that only hit
+            # generic words like "engineer" in title/description.
+            if len(query_terms) >= 2:
+                if title_match_score < 0.20 and keyword_score < 0.35 and semantic_score < 0.45:
+                    continue
+
+                # If only one query term is in the title, force the result down
+                # unless semantic relevance is clearly strong.
+                title_text = text_value(row.get("title"))
+                title_term_hits = sum(1 for term in query_terms if term in title_text)
+                if title_term_hits <= 1 and title_match_score < 0.35 and semantic_score < 0.55:
+                    final_score = (
+                        title_match_score * 0.45
+                        + keyword_score * 0.25
+                        + semantic_score * 0.18
+                        + freshness_score * 0.08
+                        + quality_score * 0.04
+                    )
+                    final_score = min(final_score, 0.34)
+                    ranked.append((final_score, row))
+                    continue
 
             final_score = (
-                keyword_score * 0.35
-                + semantic_score * 0.35
-                + freshness_score * 0.05
-                + quality_score * 0.05
-                + title_match_score * 0.20
+                title_match_score * 0.36
+                + keyword_score * 0.30
+                + semantic_score * 0.22
+                + freshness_score * 0.08
+                + quality_score * 0.04
             )
 
-            # Hard guard: exact/all-word title matches must survive relevance filtering.
-            final_score = max(final_score, title_match_score)
+            # Exact/strong title match should never be buried by semantic noise.
+            final_score = max(final_score, title_match_score * 0.95)
 
             ranked.append((final_score, row))
 
