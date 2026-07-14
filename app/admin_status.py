@@ -818,6 +818,12 @@ def register_admin_action_routes(app):
             "linkedin_auth_preflight": [
                 ["python", "-m", "scripts.linkedin_auth_preflight"],
             ],
+            "run_postgres_backup": [
+                ["bash", "-lc", "mkdir -p /app/logs/admin_requests && date -u +%Y-%m-%dT%H:%M:%SZ > /app/logs/admin_requests/postgres_backup_now.request && echo postgres_backup_requested"],
+            ],
+            "run_postgres_restore_verify": [
+                ["bash", "-lc", "mkdir -p /app/logs/admin_requests && date -u +%Y-%m-%dT%H:%M:%SZ > /app/logs/admin_requests/postgres_restore_verify_now.request && echo postgres_restore_verify_requested"],
+            ],
             "run_collection_cycle": [
                 ["bash", "-lc", 'cd /opt/jobpulse && mkdir -p /opt/jobpulse/logs && if flock -n /tmp/jobpulse_collection_cycle.lock nohup ./scripts/run_collection_cycle_safe.sh >> /opt/jobpulse/logs/admin_collection_cycle_now.log 2>&1 & then echo collection_cycle_started; else echo collection_cycle_already_running; fi'],
             ],
