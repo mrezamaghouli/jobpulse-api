@@ -341,8 +341,67 @@ def sort_results_by_backend_relevance(results, sort_order="desc"):
     )
 
 
+
+def build_search_response_metadata(kwargs, data=None):
+    data = data if isinstance(data, dict) else {}
+
+    filter_keys = [
+        "query",
+        "title",
+        "company",
+        "location",
+        "remote",
+        "work_mode",
+        "seniority",
+        "job_type",
+        "min_salary",
+        "max_salary",
+        "source",
+        "apply_type",
+        "has_apply_url",
+        "has_logo",
+        "posted_within_days",
+        "is_active",
+        "active_only",
+    ]
+
+    filters_applied = {}
+
+    for key in filter_keys:
+        value = kwargs.get(key)
+
+        if value is None:
+            continue
+
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        filters_applied[key] = value
+
+    query = extract_search_query_from_kwargs(kwargs)
+    sort_by = str(kwargs.get("sort_by") or "last_seen_at").lower()
+    sort_order = str(kwargs.get("sort_order") or "desc").lower()
+
+    if sort_order not in ["asc", "desc"]:
+        sort_order = "desc"
+
+    search_mode = data.get("search_mode")
+    if not search_mode:
+        search_mode = "hybrid" if query else "filters"
+
+    return {
+        "search_mode": search_mode,
+        "sort_mode": "relevance" if sort_by == "relevance" else sort_by,
+        "sort_order": sort_order,
+        "filters_applied": filters_applied,
+        "explain_enabled": True,
+        "has_query": bool(query),
+    }
+
+
 def search_jobs_from_db(**kwargs):
     data = get_jobs_from_db(**kwargs)
+    response_meta = build_search_response_metadata(kwargs, data)
 
     if isinstance(data, dict):
         results = data.get("results", [])
@@ -357,13 +416,26 @@ def search_jobs_from_db(**kwargs):
         if total is None:
             total = len(results)
 
-        return {
+        page = int(data.get("page") or kwargs.get("page") or 1)
+        limit = int(data.get("limit") or kwargs.get("limit") or 10)
+
+        total_pages = data.get("total_pages")
+        if total_pages is None:
+            total_pages = 0
+            if limit > 0:
+                total_pages = (int(total or 0) + limit - 1) // limit
+
+        response = {
             "results": results,
             "count": int(total or 0),
-            "page": int(data.get("page") or kwargs.get("page") or 1),
-            "limit": int(data.get("limit") or kwargs.get("limit") or 10),
-            "total_pages": int(data.get("total_pages") or 0),
+            "page": page,
+            "limit": limit,
+            "total_pages": int(total_pages or 0),
         }
+
+        response.update(response_meta)
+        response["metadata"] = response_meta
+        return response
 
     if isinstance(data, list):
         if str(kwargs.get("sort_by") or "").lower() == "relevance":
@@ -375,15 +447,23 @@ def search_jobs_from_db(**kwargs):
         page = int(kwargs.get("page") or 1)
         limit = int(kwargs.get("limit") or 10)
 
-        return {
+        total_pages = 0
+        if limit > 0:
+            total_pages = (len(data) + limit - 1) // limit
+
+        response = {
             "results": data,
             "count": len(data),
             "page": page,
             "limit": limit,
-            "total_pages": 1 if data else 0,
+            "total_pages": total_pages,
         }
 
-    return {
+        response.update(response_meta)
+        response["metadata"] = response_meta
+        return response
+
+    response = {
         "results": [],
         "count": 0,
         "page": int(kwargs.get("page") or 1),
@@ -391,9 +471,10 @@ def search_jobs_from_db(**kwargs):
         "total_pages": 0,
     }
 
+    response.update(response_meta)
+    response["metadata"] = response_meta
+    return response
 
-
-_JOB_SEARCH_MODEL = None
 
 
 def get_job_search_model():
