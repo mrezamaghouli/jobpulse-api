@@ -1380,7 +1380,36 @@
       return params.toString();
     }
 
-    async function loadJobs(page = 1, limit = pageSize) {
+    
+    function canLoadImage(url) {
+      return new Promise((resolve) => {
+        if (!url || !String(url).trim()) {
+          resolve(false);
+          return;
+        }
+
+        const img = new Image();
+        img.onload = () => resolve(true);
+        img.onerror = () => resolve(false);
+        img.referrerPolicy = 'no-referrer';
+        img.src = url;
+
+        setTimeout(() => resolve(false), 3000);
+      });
+    }
+
+    async function filterLoadableLogos(jobs) {
+      const checks = await Promise.all(
+        jobs.map(async (job) => ({
+          job,
+          ok: await canLoadImage(job.company_logo_url),
+        }))
+      );
+
+      return checks.filter((item) => item.ok).map((item) => item.job);
+    }
+
+async function loadJobs(page = 1, limit = pageSize) {
       const queryString = buildJobsQueryParams(page, limit);
       const queryParams = new URLSearchParams(queryString);
 
@@ -1403,6 +1432,7 @@
       const logoFilter = queryParams.get('has_logo');
       if (logoFilter === 'true') {
         jobs = jobs.filter((job) => Boolean(String(job.company_logo_url || '').trim()));
+        jobs = await filterLoadableLogos(jobs);
       } else if (logoFilter === 'false') {
         jobs = jobs.filter((job) => !String(job.company_logo_url || '').trim());
       }
