@@ -19,6 +19,7 @@ STATUS_FILE = Path(os.getenv("JOBPULSE_BACKUP_STATUS_FILE", ROOT / "logs/postgre
 
 MAX_BACKUP_AGE_HOURS = float(os.getenv("JOBPULSE_MAX_BACKUP_AGE_HOURS", "30"))
 MAX_VERIFY_AGE_HOURS = float(os.getenv("JOBPULSE_MAX_VERIFY_AGE_HOURS", "190"))
+MAX_TOTAL_BACKUP_SIZE_GB = float(os.getenv("JOBPULSE_MAX_TOTAL_BACKUP_SIZE_GB", "5"))
 
 
 def load_env_file(path: Path) -> None:
@@ -52,6 +53,35 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def backup_inventory() -> dict:
+    dumps = sorted(BACKUP_DIR.glob("*.dump"), key=lambda p: p.stat().st_mtime)
+    total_size = sum(p.stat().st_size for p in dumps)
+
+    latest_files = []
+    for p in reversed(dumps[-5:]):
+        latest_files.append({
+            "name": p.name,
+            "path": str(p),
+            "size_bytes": p.stat().st_size,
+            "age_hours": round(file_age_hours(p), 2),
+            "mtime_utc": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+            "sha256_exists": Path(str(p) + ".sha256").exists(),
+            "list_exists": Path(str(p) + ".list").exists(),
+            "manifest_exists": Path(str(p) + ".json").exists(),
+        })
+
+    return {
+        "backup_count": len(dumps),
+        "total_backup_size_bytes": total_size,
+        "total_backup_size_gb": round(total_size / 1024 / 1024 / 1024, 3),
+        "oldest_backup": dumps[0].name if dumps else None,
+        "newest_backup": dumps[-1].name if dumps else None,
+        "oldest_backup_age_hours": round(file_age_hours(dumps[0]), 2) if dumps else None,
+        "newest_backup_age_hours": round(file_age_hours(dumps[-1]), 2) if dumps else None,
+        "latest_files": latest_files,
+    }
 
 
 def latest_dump() -> Path | None:
@@ -114,12 +144,19 @@ def main() -> int:
     errors = []
     warnings = []
 
+    inventory = backup_inventory()
     dump = latest_dump()
 
     status = {
         "checked_at_utc": utc_now().isoformat(),
         "ok": False,
         "backup_dir": str(BACKUP_DIR),
+        "inventory": inventory,
+        "backup_count": inventory["backup_count"],
+        "total_backup_size_bytes": inventory["total_backup_size_bytes"],
+        "total_backup_size_gb": inventory["total_backup_size_gb"],
+        "oldest_backup": inventory["oldest_backup"],
+        "newest_backup": inventory["newest_backup"],
         "latest_backup": None,
         "latest_backup_age_hours": None,
         "latest_backup_size_bytes": None,
@@ -128,9 +165,15 @@ def main() -> int:
         "last_restore_verify_ok_at": read_last_ok_time(VERIFY_LOG, "restore_verify_ok"),
         "max_backup_age_hours": MAX_BACKUP_AGE_HOURS,
         "max_verify_age_hours": MAX_VERIFY_AGE_HOURS,
+        "max_total_backup_size_gb": MAX_TOTAL_BACKUP_SIZE_GB,
         "warnings": warnings,
         "errors": errors,
     }
+
+    if inventory["total_backup_size_gb"] > MAX_TOTAL_BACKUP_SIZE_GB:
+        warnings.append(
+            f"Total backup size is high: {inventory['total_backup_size_gb']}GB > {MAX_TOTAL_BACKUP_SIZE_GB}GB"
+        )
 
     if not dump:
         errors.append(f"No .dump backup found in {BACKUP_DIR}")

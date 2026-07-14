@@ -464,6 +464,24 @@
         </table>
       </div>
 
+
+      <div class="section">
+        <h2>PostgreSQL Backup Inventory</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Age</th>
+              <th>Size</th>
+              <th>SHA</th>
+              <th>List</th>
+              <th>Manifest</th>
+            </tr>
+          </thead>
+          <tbody id="postgresBackupInventoryRows"></tbody>
+        </table>
+      </div>
+
 <div class="section">
       <h2>Admin Actions</h2>
       <div class="token-box" style="margin-bottom:12px; flex-wrap:wrap;">
@@ -803,7 +821,31 @@
         return (value / 1024 / 1024).toFixed(2) + ' MB';
       }
 
-      function postgresBackupHtml(backup) {
+      
+      function yesNo(value) {
+        return value ? 'OK' : '-';
+      }
+
+      function backupInventoryHtml(backup) {
+        const files = backup?.inventory?.latest_files || backup?.latest_files || [];
+
+        if (!files.length) {
+          return '<tr><td colspan="6">No backup files found</td></tr>';
+        }
+
+        return files.map((file) => `
+          <tr>
+            <td>${escapeHtml(file.name || '-')}</td>
+            <td>${escapeHtml(file.age_hours ?? '-')}h</td>
+            <td>${escapeHtml(formatMbFromBytes(file.size_bytes))}</td>
+            <td class="${file.sha256_exists ? 'good' : 'warn'}">${escapeHtml(yesNo(file.sha256_exists))}</td>
+            <td class="${file.list_exists ? 'good' : 'warn'}">${escapeHtml(yesNo(file.list_exists))}</td>
+            <td class="${file.manifest_exists ? 'good' : 'warn'}">${escapeHtml(yesNo(file.manifest_exists))}</td>
+          </tr>
+        `).join('');
+      }
+
+function postgresBackupHtml(backup) {
         if (!backup) {
           return '<tr><td colspan="7">No PostgreSQL backup data</td></tr>';
         }
@@ -856,7 +898,15 @@
           : '-';
 
         const size = formatMbFromBytes(backup.latest_backup_size_bytes);
-        return ok + ' · ' + age + ' · ' + size;
+        const count = backup.backup_count !== null && backup.backup_count !== undefined
+          ? backup.backup_count + ' files'
+          : '- files';
+
+        const total = backup.total_backup_size_gb !== null && backup.total_backup_size_gb !== undefined
+          ? backup.total_backup_size_gb + ' GB total'
+          : '- GB total';
+
+        return ok + ' · ' + age + ' · ' + size + ' · ' + count + ' · ' + total;
       }
 
 function diskHtml(disk) {
@@ -1036,6 +1086,11 @@ function diskHtml(disk) {
         const postgresBackupRows = document.getElementById('postgresBackupRows');
         if (postgresBackupRows) {
           postgresBackupRows.innerHTML = postgresBackupHtml(data.postgres_backup);
+        }
+
+        const postgresBackupInventoryRows = document.getElementById('postgresBackupInventoryRows');
+        if (postgresBackupInventoryRows) {
+          postgresBackupInventoryRows.innerHTML = backupInventoryHtml(data.postgres_backup);
         }
 
         const adminActionRows = document.getElementById('adminActionRows');
