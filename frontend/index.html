@@ -721,6 +721,36 @@
             <option value="hybrid">Hybrid</option>
             <option value="onsite">On-site</option>
           </select>
+
+        <label>
+          Posted Within
+          <select id="postedWithinInput">
+            <option value="">Any time</option>
+            <option value="1">Last 24 hours</option>
+            <option value="2">Last 2 days</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </label>
+
+        <label>
+          Apply URL
+          <select id="hasApplyUrlInput">
+            <option value="">Any</option>
+            <option value="true">Has apply link</option>
+            <option value="false">No apply link</option>
+          </select>
+        </label>
+
+        <label>
+          Company Logo
+          <select id="hasLogoInput">
+            <option value="">Any</option>
+            <option value="true">Has logo</option>
+            <option value="false">No logo</option>
+          </select>
+        </label>
+
         </div>
 
         <button class="btn" onclick="applyFilters()">Search</button>
@@ -1302,6 +1332,9 @@
 
       const search = document.getElementById('searchInput').value.trim();
       const location = document.getElementById('locationInput').value.trim();
+      const postedWithinDays = document.getElementById('postedWithinInput')?.value || '';
+      const hasApplyUrl = document.getElementById('hasApplyUrlInput')?.value || '';
+      const hasLogo = document.getElementById('hasLogoInput')?.value || '';
       const company = document.getElementById('companyInput').value.trim();
       const applyType = document.getElementById('applyTypeInput').value.trim();
       const workMode = document.getElementById('workModeInput').value.trim();
@@ -1332,30 +1365,56 @@
         params.set('work_mode', workMode);
       }
 
+      if (postedWithinDays) {
+        params.set('posted_within_days', postedWithinDays);
+      }
+
+      if (hasApplyUrl) {
+        params.set('has_apply_url', hasApplyUrl);
+      }
+
+      if (hasLogo) {
+        params.set('has_logo', hasLogo);
+      }
+
       return params.toString();
     }
 
     async function loadJobs(page = 1, limit = pageSize) {
       const queryString = buildJobsQueryParams(page, limit);
-      const jobs = await fetchJson(`/jobs?${queryString}`);
+      const queryParams = new URLSearchParams(queryString);
 
-      if (Array.isArray(jobs)) {
-        return jobs;
+      const hasSearchFilters = [
+        'query',
+        'location',
+        'company',
+        'apply_type',
+        'work_mode',
+        'posted_within_days',
+        'has_apply_url',
+        'has_logo',
+      ].some((key) => queryParams.has(key));
+
+      const endpoint = hasSearchFilters ? '/jobs/search' : '/jobs';
+      const data = await fetchJson(`${endpoint}?${queryString}`);
+
+      let jobs = Array.isArray(data) ? data : (data.results || data.jobs || []);
+
+      const logoFilter = queryParams.get('has_logo');
+      if (logoFilter === 'true') {
+        jobs = jobs.filter((job) => Boolean(String(job.company_logo_url || '').trim()));
+      } else if (logoFilter === 'false') {
+        jobs = jobs.filter((job) => !String(job.company_logo_url || '').trim());
       }
 
-      if (jobs && Array.isArray(jobs.value)) {
-        return jobs.value;
+      const applyUrlFilter = queryParams.get('has_apply_url');
+      if (applyUrlFilter === 'true') {
+        jobs = jobs.filter((job) => Boolean(String(job.apply_url || '').trim()));
+      } else if (applyUrlFilter === 'false') {
+        jobs = jobs.filter((job) => !String(job.apply_url || '').trim());
       }
 
-      if (jobs && Array.isArray(jobs.jobs)) {
-        return jobs.jobs;
-      }
-
-      if (jobs && Array.isArray(jobs.results)) {
-        return jobs.results;
-      }
-
-      return [];
+      return jobs;
     }
 
     async function loadMoreJobs() {
