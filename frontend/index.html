@@ -749,6 +749,24 @@
             <option value="true">Has logo</option>
             <option value="false">No logo</option>
           </select>
+
+        <label>
+          Sort By
+          <select id="sortByInput">
+            <option value="last_seen_at">Last seen</option>
+            <option value="first_seen_at">First seen</option>
+            <option value="date_posted_at">Date posted</option>
+          </select>
+        </label>
+
+        <label>
+          Sort Order
+          <select id="sortOrderInput">
+            <option value="desc">Newest first</option>
+            <option value="asc">Oldest first</option>
+          </select>
+        </label>
+
         </label>
 
         </div>
@@ -1338,12 +1356,14 @@
       const company = document.getElementById('companyInput').value.trim();
       const applyType = document.getElementById('applyTypeInput').value.trim();
       const workMode = document.getElementById('workModeInput').value.trim();
+      const sortBy = document.getElementById('sortByInput')?.value || 'last_seen_at';
+      const sortOrder = document.getElementById('sortOrderInput')?.value || 'desc';
 
       params.set('page', page);
       params.set('limit', limit);
       params.set('active_only', 'true');
-      params.set('sort_by', 'last_seen_at');
-      params.set('sort_order', 'desc');
+      params.set('sort_by', sortBy);
+      params.set('sort_order', sortOrder);
 
       if (search) {
         params.set('query', search);
