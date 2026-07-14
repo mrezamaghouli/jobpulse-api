@@ -70,13 +70,15 @@ jobs:
           python -m py_compile scripts/migrate_database.py
 
       - name: Create dummy prod env files for compose validation
+        shell: bash
         run: |
-          touch .env
-          echo "JOBPULSE_PUBLIC_API_KEYS=dummy-ci-key" > .api_keys.env
+          set -euo pipefail
+          : > .env
+          printf '%s\n' 'JOBPULSE_PUBLIC_API_KEYS=dummy-ci-key' > .api_keys.env
           sudo mkdir -p /opt/jobpulse
-          echo "JOBPULSE_ADMIN_TOKEN=dummy-ci-admin-token" | sudo tee /opt/jobpulse/.admin.env >/dev/null
-          echo "dummy" | sudo tee /opt/jobpulse/.admin_token >/dev/null
-          echo "TELEGRAM_BOT_TOKEN=dummy"          echo "TE | sudo tee /opt/jobpulse/.telegram_alert.env >/dev/null
+          printf '%s\n' 'JOBPULSE_ADMIN_TOKEN=dummy-ci-admin-token' | sudo tee /opt/jobpulse/.admin.env >/dev/null
+          printf '%s\n' 'dummy-ci-admin-token' | sudo tee /opt/jobpulse/.admin_token >/dev/null
+          printf '%s\n' 'TELEGRAM_BOT_TOKEN=dummy' | sudo tee /opt/jobpulse/.telegram_alert.env >/dev/null
 
       - name: Validate Docker Compose config
         run: |
