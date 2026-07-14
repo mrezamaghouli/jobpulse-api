@@ -588,6 +588,9 @@ def get_all_jobs_from_db(
     max_salary=None,
     source=None,
     apply_type=None,
+    has_apply_url=None,
+    has_logo=None,
+    posted_within_days=None,
     is_active=None,
     active_only=None,
     page: int = 1,
@@ -621,6 +624,9 @@ def get_all_jobs_from_db(
             "max_salary": max_salary,
             "source": source,
             "apply_type": apply_type,
+            "has_apply_url": has_apply_url,
+            "has_logo": has_logo,
+            "posted_within_days": posted_within_days,
             "is_active": is_active,
             "active_only": active_only,
         }
@@ -672,6 +678,28 @@ def get_all_jobs_from_db(
         if is_active is not None:
             where_clauses.append("j.is_active = %s")
             params.append(is_active)
+
+        if has_apply_url is not None:
+            if has_apply_url:
+                where_clauses.append("j.apply_url IS NOT NULL AND j.apply_url != ''")
+            else:
+                where_clauses.append("(j.apply_url IS NULL OR j.apply_url = '')")
+
+        if has_logo is not None:
+            if has_logo:
+                where_clauses.append("j.company_logo_url IS NOT NULL AND j.company_logo_url != ''")
+            else:
+                where_clauses.append("(j.company_logo_url IS NULL OR j.company_logo_url = '')")
+
+        if posted_within_days is not None:
+            try:
+                safe_posted_days = max(1, min(int(posted_within_days), 365))
+                where_clauses.append(
+                    "COALESCE(j.date_posted_at, j.first_seen_at, j.last_seen_at) >= NOW() - (%s::int * INTERVAL '1 day')"
+                )
+                params.append(safe_posted_days)
+            except Exception:
+                pass
 
         if active_only:
             where_clauses.append(
