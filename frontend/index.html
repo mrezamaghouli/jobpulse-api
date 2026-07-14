@@ -753,6 +753,7 @@
         <label>
           Sort By
           <select id="sortByInput">
+            <option value="relevance">Relevance</option>
             <option value="last_seen_at">Last seen</option>
             <option value="first_seen_at">First seen</option>
             <option value="date_posted_at">Date posted</option>
@@ -1429,6 +1430,71 @@
       return checks.filter((item) => item.ok).map((item) => item.job);
     }
 
+
+      function freshnessBoostForSort(job) {
+        const value = job.date_posted_at || job.first_seen_at || job.last_seen_at;
+        if (!value) {
+          return 0;
+        }
+
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+          return 0;
+        }
+
+        const ageHours = Math.max(0, (Date.now() - date.getTime()) / 3600000);
+
+        if (ageHours <= 24) {
+          return 0.10;
+        }
+
+        if (ageHours <= 72) {
+          return 0.06;
+        }
+
+        if (ageHours <= 168) {
+          return 0.03;
+        }
+
+        return 0;
+      }
+
+      function relevanceSortValue(job) {
+        const matchScore = Number(job.search_score || 0);
+        const qualityScore = Number(job.quality_score || 0);
+        const freshnessScore = freshnessBoostForSort(job);
+
+        return (matchScore * 0.75) + (qualityScore * 0.15) + freshnessScore;
+      }
+
+      function sortJobsClientSide(jobs, queryParams) {
+        const sortBy = queryParams.get('sort_by') || 'last_seen_at';
+        const sortOrder = queryParams.get('sort_order') || 'desc';
+        const direction = sortOrder === 'asc' ? 1 : -1;
+
+        const sorted = [...jobs];
+
+        if (sortBy === 'relevance') {
+          sorted.sort((a, b) => {
+            const diff = relevanceSortValue(b) - relevanceSortValue(a);
+            if (diff !== 0) {
+              return diff;
+            }
+
+            return String(b.last_seen_at || '').localeCompare(String(a.last_seen_at || ''));
+          });
+
+          return sorted;
+        }
+
+        return sorted.sort((a, b) => {
+          const av = a[sortBy] || '';
+          const bv = b[sortBy] || '';
+
+          return direction * String(bv).localeCompare(String(av));
+        });
+      }
+
 async function loadJobs(page = 1, limit = pageSize) {
       const queryString = buildJobsQueryParams(page, limit);
       const queryParams = new URLSearchParams(queryString);
@@ -1463,6 +1529,8 @@ async function loadJobs(page = 1, limit = pageSize) {
       } else if (applyUrlFilter === 'false') {
         jobs = jobs.filter((job) => !String(job.apply_url || '').trim());
       }
+
+      jobs = sortJobsClientSide(jobs, queryParams);
 
       return jobs;
     }
