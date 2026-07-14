@@ -133,6 +133,9 @@ def build_jobs_filters(
     max_salary=None,
     source=None,
     apply_type=None,
+    has_apply_url=None,
+    has_logo=None,
+    posted_within_days=None,
     is_active=None,
     active_only=None,
 ):
