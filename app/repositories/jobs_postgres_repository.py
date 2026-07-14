@@ -259,11 +259,100 @@ def get_jobs_from_db(**kwargs):
     return rerank_jobs(result, query)
 
 
+
+def normalize_relevance_score(value):
+    if value is None or value == "":
+        return 0.0
+
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if score > 1:
+        score = score / 100.0
+
+    return max(0.0, min(score, 1.0))
+
+
+def parse_job_datetime(value):
+    if not value:
+        return None
+
+    try:
+        text_value_dt = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text_value_dt)
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def freshness_boost_for_relevance(job):
+    value = (
+        job.get("date_posted_at")
+        or job.get("first_seen_at")
+        or job.get("last_seen_at")
+    )
+
+    parsed = parse_job_datetime(value)
+    if not parsed:
+        return 0.0
+
+    age_hours = max(
+        0.0,
+        (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0,
+    )
+
+    if age_hours <= 24:
+        return 0.10
+
+    if age_hours <= 72:
+        return 0.06
+
+    if age_hours <= 168:
+        return 0.03
+
+    return 0.0
+
+
+def backend_relevance_value(job):
+    match_score = normalize_relevance_score(job.get("search_score"))
+    quality_score = normalize_relevance_score(job.get("quality_score"))
+    freshness_score = freshness_boost_for_relevance(job)
+
+    return (match_score * 0.75) + (quality_score * 0.15) + freshness_score
+
+
+def sort_results_by_backend_relevance(results, sort_order="desc"):
+    reverse = str(sort_order or "desc").lower() != "asc"
+
+    return sorted(
+        list(results or []),
+        key=lambda job: (
+            backend_relevance_value(job),
+            str(job.get("last_seen_at") or ""),
+            int(job.get("id") or 0),
+        ),
+        reverse=reverse,
+    )
+
+
 def search_jobs_from_db(**kwargs):
     data = get_jobs_from_db(**kwargs)
 
     if isinstance(data, dict):
         results = data.get("results", [])
+
+        if str(kwargs.get("sort_by") or "").lower() == "relevance":
+            results = sort_results_by_backend_relevance(
+                results,
+                kwargs.get("sort_order") or "desc",
+            )
+
         total = data.get("total")
         if total is None:
             total = len(results)
@@ -277,6 +366,12 @@ def search_jobs_from_db(**kwargs):
         }
 
     if isinstance(data, list):
+        if str(kwargs.get("sort_by") or "").lower() == "relevance":
+            data = sort_results_by_backend_relevance(
+                data,
+                kwargs.get("sort_order") or "desc",
+            )
+
         page = int(kwargs.get("page") or 1)
         limit = int(kwargs.get("limit") or 10)
 
