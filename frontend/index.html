@@ -583,6 +583,35 @@
       display: none !important;
     }
 
+  
+    .search-explain {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.42);
+    }
+
+    .search-explain-title {
+      font-size: 12px;
+      font-weight: 800;
+      color: #e2e8f0;
+      margin-bottom: 8px;
+      letter-spacing: 0.02em;
+    }
+
+    .search-explain-list {
+      margin: 0;
+      padding-left: 18px;
+      color: #cbd5e1;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    .search-explain-list li {
+      margin: 2px 0;
+    }
+
   </style>
 </head>
 
@@ -949,7 +978,108 @@
       `;
     }
 
-    function renderTags(job) {
+    
+      function explainScorePercent(value) {
+        if (value === null || value === undefined || value === '') {
+          return null;
+        }
+
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+          return null;
+        }
+
+        if (numeric <= 1) {
+          return Math.round(numeric * 100);
+        }
+
+        return Math.round(Math.min(numeric, 100));
+      }
+
+      function explainFreshnessText(job) {
+        const value = job.date_posted_at || job.first_seen_at || job.last_seen_at;
+        if (!value) {
+          return '';
+        }
+
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+          return '';
+        }
+
+        const diffMinutes = Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000));
+
+        if (diffMinutes < 1) {
+          return 'seen just now';
+        }
+
+        if (diffMinutes < 60) {
+          return 'seen ' + diffMinutes + 'm ago';
+        }
+
+        const diffHours = Math.floor(diffMinutes / 60);
+        if (diffHours < 24) {
+          return 'seen ' + diffHours + 'h ago';
+        }
+
+        const diffDays = Math.floor(diffHours / 24);
+        if (diffDays < 30) {
+          return 'seen ' + diffDays + 'd ago';
+        }
+
+        const diffMonths = Math.floor(diffDays / 30);
+        return 'seen ' + diffMonths + 'mo ago';
+      }
+
+      function renderSearchExplain(job) {
+        const items = [];
+
+        const matchPercent = explainScorePercent(job.search_score);
+        if (matchPercent !== null) {
+          items.push('Search relevance score: ' + matchPercent + '%');
+        }
+
+        const qualityPercent = explainScorePercent(job.quality_score);
+        if (qualityPercent !== null) {
+          items.push('Data quality score: ' + qualityPercent + '%');
+        }
+
+        const freshness = explainFreshnessText(job);
+        if (freshness) {
+          items.push('Freshness signal: ' + freshness);
+        }
+
+        if (job.company_logo_url) {
+          items.push('Company logo is available and passed the logo filter');
+        }
+
+        if (job.apply_url) {
+          items.push('Apply URL is available');
+        }
+
+        if (job.apply_type) {
+          items.push('Apply type: ' + job.apply_type);
+        }
+
+        if (job.work_mode) {
+          items.push('Work mode: ' + job.work_mode);
+        }
+
+        if (!items.length) {
+          return '';
+        }
+
+        return `
+          <div class="search-explain">
+            <div class="search-explain-title">Why this result?</div>
+            <ul class="search-explain-list">
+              ${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+            </ul>
+          </div>
+        `;
+      }
+
+function renderTags(job) {
       const tags = [];
 
       tags.push(getApplyTag(job));
@@ -1088,6 +1218,8 @@
         <div class="tags">
           ${renderTags(job)}
         </div>
+
+          ${renderSearchExplain(job)}
 
         <div class="job-actions">
           <a
