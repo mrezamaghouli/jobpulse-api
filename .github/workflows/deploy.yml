@@ -49,10 +49,35 @@ jobs:
         run: |
           echo "DEPLOY_TS=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_ENV"
 
-      - name: Test SSH connection
+      - name: Deploy from GHCR to production VM
+        shell: bash
         run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" \
-            "$VM_USER@$VM_HOST" "echo 'SSH connection OK' && hostname"
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$VM_SSH_KEY" > ~/.ssh/jobpulse_deploy_key
+          chmod 600 ~/.ssh/jobpulse_deploy_key
+
+          ssh-keyscan -p "$VM_PORT" "$VM_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'REMOTE'
+          set -euo pipefail
+
+          cd /opt/jobpulse
+
+          git fetch origin main
+          git reset --hard origin/main
+
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u mrezamaghouli --password-stdin
+          fi
+
+          ./scripts/deploy_prod_from_ghcr.sh
+
+          docker compose -f docker-compose.prod.yml ps
+          curl -fsS http://localhost/api/health
+          REMOTE
 
       - name: Pre-deploy backup on VM
         run: |
