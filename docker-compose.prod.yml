@@ -21,9 +21,7 @@ services:
       retries: 10
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/mrezamaghouli/jobpulse-api:main
     container_name: jobpulse-api-prod
     restart: unless-stopped
     env_file:

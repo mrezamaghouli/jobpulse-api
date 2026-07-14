@@ -1,25 +1,25 @@
 .git
-.gitignore
-
-venv
-.venv
+.github
 __pycache__
 *.pyc
 .pytest_cache
+.venv
+venv
+env
 
 .env
-.env.*
-!.env.example
-!.env.prod.example
+*.env
+.api_keys.env
+.admin.env
+.admin_token
+.admin_htpasswd
+.telegram_alert.env
 
 .auth
 logs
 backups
+*.bak*
+*.backup*
 *.dump
 *.sql
-*.sqlite
-*.db
-
-node_modules
 .DS_Store
-Thumbs.db
