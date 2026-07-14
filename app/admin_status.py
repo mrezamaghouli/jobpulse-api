@@ -239,6 +239,40 @@ def tail_file(path: Path, max_lines: int = 200) -> list[str]:
 
 
 
+
+def get_postgres_backup_status() -> dict:
+    path = Path(os.getenv("JOBPULSE_BACKUP_STATUS_FILE", "/app/logs/postgres_backup_status.json"))
+
+    if not path.exists():
+        fallback = Path("/opt/jobpulse/logs/postgres_backup_status.json")
+        if fallback.exists():
+            path = fallback
+
+    if not path.exists():
+        return {
+            "exists": False,
+            "ok": False,
+            "path": str(path),
+            "errors": ["PostgreSQL backup status file is missing."],
+            "warnings": [],
+        }
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "exists": True,
+            "ok": False,
+            "path": str(path),
+            "errors": [f"PostgreSQL backup status file is unreadable: {exc}"],
+            "warnings": [],
+        }
+
+    data["exists"] = True
+    data["path"] = str(path)
+    return data
+
+
 def count_status(items: list[dict], status: str) -> int:
     for item in items or []:
         if item.get("status") == status:
@@ -563,6 +597,7 @@ def register_admin_status_routes(app):
             collection_heartbeat = get_collection_heartbeat()
             collection_performance = get_collection_performance()
             disk_usage = get_disk_usage("/opt/jobpulse")
+            postgres_backup = get_postgres_backup_status()
 
             alerts = build_alerts(
                 job_stats=job_stats,
@@ -579,6 +614,7 @@ def register_admin_status_routes(app):
                 "status": "ok",
                 "database": "connected",
                 "disk": disk_usage,
+                "postgres_backup": postgres_backup,
                 "linkedin_auth": linkedin_auth,
                 "collection_heartbeat": collection_heartbeat,
                 "collection_performance": collection_performance,
