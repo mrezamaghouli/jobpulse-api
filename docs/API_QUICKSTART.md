@@ -51,6 +51,48 @@ X-API-Key: YOUR_API_KEY
 curl -fsS http://35.192.251.190/api/health
 ```
 
+
+---
+
+## Metadata Endpoints
+
+These endpoints are public and do not require an API key.
+
+### Version
+
+```bash
+curl -fsS http://35.192.251.190/api/version | python3 -m json.tool
+```
+
+Example response fields:
+
+```text
+name
+status
+environment
+version
+image
+server_time_utc
+docs
+```
+
+### Docs Info
+
+```bash
+curl -fsS http://35.192.251.190/api/docs-info | python3 -m json.tool
+```
+
+Example response fields:
+
+```text
+name
+base_url
+authentication
+endpoints
+sort_fields
+docs_files
+```
+
 ---
 
 ## Search Jobs

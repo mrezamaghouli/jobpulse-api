@@ -212,6 +212,50 @@ See:
 docs/API_QUICKSTART.md
 ```
 
+
+---
+
+## API Metadata Endpoints
+
+These public endpoints do not require an API key.
+
+### Version
+
+```bash
+curl -fsS http://35.192.251.190/api/version | python3 -m json.tool
+```
+
+Example response fields:
+
+```text
+name
+status
+environment
+version
+image
+server_time_utc
+docs
+```
+
+### Docs Info
+
+```bash
+curl -fsS http://35.192.251.190/api/docs-info | python3 -m json.tool
+```
+
+Example response fields:
+
+```text
+name
+base_url
+authentication
+endpoints
+sort_fields
+docs_files
+```
+
+These endpoints expose runtime metadata, API authentication information, available public endpoints, and documentation references.
+
 ---
 
 ## Backup
