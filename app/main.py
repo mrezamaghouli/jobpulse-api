@@ -656,3 +656,89 @@ register_admin_logs_routes(app)
 from app.admin_status import register_admin_action_routes
 register_admin_action_routes(app)
 
+# ---------------------------------------------------------------------------
+# JobPulse public metadata endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/version")
+@app.get("/api/version")
+async def api_version():
+    import os
+    from datetime import datetime, timezone
+
+    return {
+        "name": "JobPulse API",
+        "status": "ok",
+        "environment": os.getenv("JOBPULSE_ENV", "production"),
+        "version": os.getenv("JOBPULSE_VERSION", "main"),
+        "image": os.getenv("JOBPULSE_API_IMAGE", "ghcr.io/mrezamaghouli/jobpulse-api:main"),
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        "docs": {
+            "api_quickstart": "docs/API_QUICKSTART.md",
+            "production_runbook": "docs/PRODUCTION_RUNBOOK.md",
+        },
+    }
+
+
+@app.get("/docs-info")
+@app.get("/api/docs-info")
+async def api_docs_info():
+    return {
+        "name": "JobPulse Public API",
+        "base_url": "http://35.192.251.190/api",
+        "authentication": {
+            "type": "api_key",
+            "header": "X-API-Key",
+        },
+        "endpoints": [
+            {
+                "path": "/api/health",
+                "method": "GET",
+                "auth_required": False,
+                "description": "API health check.",
+            },
+            {
+                "path": "/api/version",
+                "method": "GET",
+                "auth_required": False,
+                "description": "API version and runtime metadata.",
+            },
+            {
+                "path": "/api/docs-info",
+                "method": "GET",
+                "auth_required": False,
+                "description": "Quick API documentation metadata.",
+            },
+            {
+                "path": "/api/jobs/search",
+                "method": "GET",
+                "auth_required": True,
+                "description": "Search jobs with filters, ranking, and pagination.",
+                "common_query_params": [
+                    "query",
+                    "location",
+                    "company",
+                    "work_mode",
+                    "apply_type",
+                    "posted_within_days",
+                    "has_apply_url",
+                    "has_logo",
+                    "sort_by",
+                    "sort_order",
+                    "page",
+                    "limit",
+                ],
+            },
+        ],
+        "sort_fields": [
+            "relevance",
+            "last_seen_at",
+            "first_seen_at",
+            "date_posted_at",
+        ],
+        "docs_files": [
+            "docs/API_QUICKSTART.md",
+            "docs/PRODUCTION_RUNBOOK.md",
+        ],
+    }
+
