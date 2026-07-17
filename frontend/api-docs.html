@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JobPulse API Docs</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: rgba(255,255,255,0.10);
+      --green: #22c55e;
+      --blue: #60a5fa;
+      --yellow: #facc15;
+      --red: #f87171;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(96,165,250,0.18), transparent 32%),
+        radial-gradient(circle at top right, rgba(34,197,94,0.12), transparent 28%),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .wrap {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 64px;
+    }
+
+    .hero {
+      padding: 32px;
+      border: 1px solid var(--border);
+      background: rgba(17,24,39,0.72);
+      border-radius: 24px;
+      box-shadow: 0 20px 80px rgba(0,0,0,0.24);
+      backdrop-filter: blur(14px);
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(34,197,94,0.12);
+      color: #86efac;
+      border: 1px solid rgba(34,197,94,0.25);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 18px 0 8px;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+
+    h2 {
+      margin: 0 0 16px;
+      font-size: 24px;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      color: #f9fafb;
+    }
+
+    .subtitle {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 18px;
+      margin: 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .card {
+      grid-column: span 12;
+      border: 1px solid var(--border);
+      background: rgba(17,24,39,0.78);
+      border-radius: 20px;
+      padding: 22px;
+      overflow: hidden;
+    }
+
+    @media (min-width: 780px) {
+      .half { grid-column: span 6; }
+      .third { grid-column: span 4; }
+      .wide { grid-column: span 8; }
+    }
+
+    .meta {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid var(--border);
+      padding: 10px 0;
+    }
+
+    .row:last-child {
+      border-bottom: 0;
+    }
+
+    .key {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .value {
+      text-align: right;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 16px;
+      background: #020617;
+      color: #d1d5db;
+      border-radius: 14px;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      font-size: 13px;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .endpoint {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(31,41,55,0.62);
+      margin-top: 10px;
+    }
+
+    .method {
+      padding: 4px 8px;
+      border-radius: 8px;
+      color: #bbf7d0;
+      background: rgba(34,197,94,0.12);
+      border: 1px solid rgba(34,197,94,0.25);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .auth {
+      padding: 4px 8px;
+      border-radius: 8px;
+      color: #fde68a;
+      background: rgba(250,204,21,0.10);
+      border: 1px solid rgba(250,204,21,0.22);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .public {
+      color: #bfdbfe;
+      background: rgba(96,165,250,0.10);
+      border-color: rgba(96,165,250,0.22);
+    }
+
+    .path {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight: 800;
+    }
+
+    .desc {
+      width: 100%;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .ok { color: var(--green); }
+    .warn { color: var(--yellow); }
+    .bad { color: var(--red); }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 20px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(31,41,55,0.76);
+      color: var(--text);
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .button:hover {
+      text-decoration: none;
+      background: rgba(55,65,81,0.9);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <span class="pill">● JobPulse Public API</span>
+      <h1>JobPulse API Docs</h1>
+      <p class="subtitle">
+        Public documentation for the JobPulse job search API, metadata endpoints, authentication, filters, and example requests.
+      </p>
+
+      <div class="button-row">
+        <a class="button" href="/api/version" target="_blank">Open /api/version</a>
+        <a class="button" href="/api/docs-info" target="_blank">Open /api/docs-info</a>
+        <a class="button" href="/api/health" target="_blank">Open /api/health</a>
+        <a class="button" href="/admin.html">Admin Dashboard</a>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card half">
+        <h2>Runtime Status</h2>
+        <div id="runtime" class="meta">
+          <div class="row"><span class="key">Status</span><span class="value warn">Loading...</span></div>
+        </div>
+      </div>
+
+      <div class="card half">
+        <h2>Authentication</h2>
+        <p>Public job search endpoints require an API key.</p>
+        <pre><code>X-API-Key: YOUR_API_KEY</code></pre>
+        <p style="color: var(--muted); margin-bottom: 0;">
+          Metadata and health endpoints are public and do not require an API key.
+        </p>
+      </div>
+
+      <div class="card wide">
+        <h2>Search Jobs</h2>
+        <p>Use <code>/api/jobs/search</code> for ranked job search with filters and pagination.</p>
+        <pre><code>curl -sS \
+  -H "X-API-Key: YOUR_API_KEY" \
+  "http://35.192.251.190/api/jobs/search?query=data%20analyst&location=Germany&sort_by=relevance&sort_order=desc&limit=10"</code></pre>
+      </div>
+
+      <div class="card third">
+        <h2>Base URL</h2>
+        <pre><code>http://35.192.251.190/api</code></pre>
+      </div>
+
+      <div class="card">
+        <h2>Endpoints</h2>
+        <div id="endpoints"></div>
+      </div>
+
+      <div class="card half">
+        <h2>Common Search Parameters</h2>
+        <pre><code>query
+location
+company
+work_mode
+apply_type
+posted_within_days
+has_apply_url
+has_logo
+sort_by
+sort_order
+page
+limit</code></pre>
+      </div>
+
+      <div class="card half">
+        <h2>Sort Fields</h2>
+        <pre><code>relevance
+last_seen_at
+first_seen_at
+date_posted_at</code></pre>
+      </div>
+
+      <div class="card">
+        <h2>Example: Fresh Remote Jobs</h2>
+        <pre><code>curl -sS \
+  -H "X-API-Key: YOUR_API_KEY" \
+  "http://35.192.251.190/api/jobs/search?query=data%20analyst&work_mode=remote&posted_within_days=7&limit=10"</code></pre>
+      </div>
+    </section>
+
+    <div class="footer">
+      JobPulse API Docs · Generated from live metadata endpoints
+    </div>
+  </main>
+
+  <script>
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039Html(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>',;');
+    }
+
+    function runtimeRow(key, value, cls = '') {
+      return `
+        <div class="row">
+          <span class="key">${escapeHtml(key)}</span>
+          <span class="value ${cls}">${escapeHtml(value || '-')}</span>
+        </div>
+      `;
+    }
+
+    function endpointHtml(endpoint) {
+      const authRequired = endpoint.auth_required === true;
+      return `
+        <div class="endpoint">
+          <span class="method">${escapeHtml(endpoint.method || 'GET')}</span>
+          <span class="path">${escapeHtml(endpoint.path || '-')}</span>
+          <span class="auth ${authRequired ? '' : 'public'}">${authRequired ? 'API KEY' : 'PUBLIC'}</span>
+          <div class="desc">${escapeHtml(endpoint.description || '')}</div>
+        </div>
+      `;
+    }
+
+    async function loadDocs() {
+      const runtimeEl = document.getElementById('runtime');
+      const endpointsEl = document.getElementById('endpoints');
+
+      try {
+        const [versionRes, docsRes] = await Promise.all([
+          fetch('/api/version'),
+          fetch('/api/docs-info'),
+        ]);
+
+        const version = await versionRes.json();
+        const docs = await docsRes.json();
+
+        runtimeEl.innerHTML = [
+          runtimeRow('Name', version.name),
+          runtimeRow('Status', version.status, version.status === 'ok' ? 'ok' : 'bad'),
+          runtimeRow('Environment', version.environment),
+          runtimeRow('Version', version.version),
+          runtimeRow('Image', version.image),
+          runtimeRow('Server Time UTC', version.server_time_utc),
+          runtimeRow('Base URL', docs.base_url),
+        ].join('');
+
+        const endpoints = Array.isArray(docs.endpoints) ? docs.endpoints : [];
+        endpointsEl.innerHTML = endpoints.map(endpointHtml).join('') || '<p>No endpoint metadata found.</p>';
+      } catch (error) {
+        runtimeEl.innerHTML = runtimeRow('Status', 'Failed to load metadata', 'bad');
+        endpointsEl.innerHTML = `<p class="bad">${escapeHtml(error.message || error)}</p>`;
+      }
+    }
+
+    loadDocs();
+  </script>
+</body>
+</html>
