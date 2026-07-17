@@ -178,3 +178,40 @@ API deploy must use ./scripts/deploy_prod_from_ghcr.sh.
 Frontend-only changes use docker compose -f docker-compose.prod.yml restart frontend.
 Check /api/health after every deploy.
 Check Admin Dashboard after important changes.
+
+
+---
+
+## Public API Smoke Test
+
+Run this after production deploys or public API changes.
+
+### Local Nginx Test
+
+```bash
+cd /opt/jobpulse
+
+./scripts/smoke_test_public_api.sh http://localhost
+```
+
+### Public IP Test
+
+```bash
+cd /opt/jobpulse
+
+./scripts/smoke_test_public_api.sh http://35.192.251.190
+```
+
+The smoke test checks:
+
+```text
+/api/health
+/api/version
+/api/docs-info
+/api-docs.html
+/jobs/search without API key must return 401
+/jobs/search with API key must return 200
+JSON response validity
+rate-limit headers when available
+```
+

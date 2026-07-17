@@ -410,3 +410,40 @@ For production operations, follow:
 ```text
 docs/PRODUCTION_RUNBOOK.md
 ```
+
+
+---
+
+## Public API Smoke Test
+
+Run this after production deploys or public API changes.
+
+### Local Nginx Test
+
+```bash
+cd /opt/jobpulse
+
+./scripts/smoke_test_public_api.sh http://localhost
+```
+
+### Public IP Test
+
+```bash
+cd /opt/jobpulse
+
+./scripts/smoke_test_public_api.sh http://35.192.251.190
+```
+
+The smoke test checks:
+
+```text
+/api/health
+/api/version
+/api/docs-info
+/api-docs.html
+/jobs/search without API key must return 401
+/jobs/search with API key must return 200
+JSON response validity
+rate-limit headers when available
+```
+
