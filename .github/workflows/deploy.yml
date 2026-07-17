@@ -2,72 +2,55 @@ name: Deploy Production
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows:
+      - Build JobPulse API Image
     types:
       - completed
+  workflow_dispatch:
+
+concurrency:
+  group: jobpulse-production-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy to GCP VM
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
 
     env:
       VM_HOST: "35.192.251.190"
       VM_USER: "mrezamaghouli"
       VM_PORT: "22"
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Install SSH and rsync tools
+      - name: Validate secrets
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rsync openssh-client
+          set -euo pipefail
 
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-
-          if [ -z "${{ secrets.VM_SSH_KEY }}" ]; then
+          if [ -z "${VM_SSH_KEY:-}" ]; then
             echo "VM_SSH_KEY secret is missing"
             exit 1
           fi
 
-          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/jobpulse_deploy_key
-          chmod 600 ~/.ssh/jobpulse_deploy_key
-
-          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
-
-      - name: Prepare deploy timestamp
-        run: |
-          echo "DEPLOY_TS=$(date -u +%Y%m%d_%H%M%S)" >> "$GITHUB_ENV"
-
       - name: Deploy from GHCR to production VM
         shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          VM_PORT: ${{ secrets.VM_PORT }}
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "$VM_SSH_KEY" > ~/.ssh/jobpulse_deploy_key
+
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_deploy_key
           chmod 600 ~/.ssh/jobpulse_deploy_key
 
-          ssh-keyscan -p "$VM_PORT" "$VM_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
 
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'REMOTE'
+          GHCR_TOKEN_B64="$(printf '%s' "${GHCR_TOKEN:-}" | base64 -w 0)"
+
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" "GHCR_TOKEN_B64='$GHCR_TOKEN_B64' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /opt/jobpulse
@@ -75,8 +58,8 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
-          if [ -n "${GHCR_TOKEN:-}" ]; then
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u mrezamaghouli --password-stdin
+          if [ -n "${GHCR_TOKEN_B64:-}" ]; then
+            echo "$GHCR_TOKEN_B64" | base64 -d | docker login ghcr.io -u mrezamaghouli --password-stdin
           fi
 
           ./scripts/deploy_prod_from_ghcr.sh
@@ -84,139 +67,3 @@ jobs:
           docker compose -f docker-compose.prod.yml ps
           curl -fsS http://localhost/api/health
           REMOTE
-
-      - name: Pre-deploy backup on VM
-        run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<EOF
-          set -e
-
-          sudo mkdir -p /opt/jobpulse_backups/releases
-          sudo mkdir -p /opt/jobpulse_backups/db
-          sudo chown -R mrezamaghouli:mrezamaghouli /opt/jobpulse_backups
-
-          if [ -d /opt/jobpulse ]; then
-            tar \
-              --exclude='/opt/jobpulse/.auth' \
-              --exclude='/opt/jobpulse/.env' \
-              --exclude='/opt/jobpulse/logs' \
-              --exclude='/opt/jobpulse/sample_output' \
-              --exclude='/opt/jobpulse/scripts/__pycache__' \
-              --exclude='/opt/jobpulse/jobpulse_local_backup.dump' \
-              -czf /opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz \
-              -C /opt jobpulse
-          fi
-
-          cd /opt/jobpulse
-
-          docker compose -f docker-compose.prod.yml exec -T db pg_dump \
-            -U jobpulse_user \
-            -d jobpulse \
-            -Fc \
-            -f /tmp/jobpulse_pre_deploy_${DEPLOY_TS}.dump
-
-          docker compose -f docker-compose.prod.yml cp \
-            db:/tmp/jobpulse_pre_deploy_${DEPLOY_TS}.dump \
-            /opt/jobpulse_backups/db/jobpulse_pre_deploy_${DEPLOY_TS}.dump
-
-          echo "Backup created:"
-          echo "/opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz"
-          echo "/opt/jobpulse_backups/db/jobpulse_pre_deploy_${DEPLOY_TS}.dump"
-          EOF
-
-      - name: Sync repository to VM
-        run: |
-          rsync -az --delete \
-            --exclude='.git' \
-            --exclude='.env' \
-            --exclude='.auth' \
-            --exclude='logs' \
-            --exclude='sample_output' \
-            --exclude='scripts/__pycache__' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='*.dump' \
-            --exclude='*.sql' \
-            -e "ssh -i ~/.ssh/jobpulse_deploy_key -p $VM_PORT" \
-            ./ "$VM_USER@$VM_HOST:/opt/jobpulse/"
-
-      - name: Deploy containers with rollback
-        run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<EOF
-          set -e
-
-          BACKUP_FILE="/opt/jobpulse_backups/releases/jobpulse_${DEPLOY_TS}.tgz"
-
-          rollback() {
-            echo "Deploy failed. Rolling back..."
-
-            if [ -f "\$BACKUP_FILE" ]; then
-              tar -xzf "\$BACKUP_FILE" -C /opt
-              cd /opt/jobpulse
-              for attempt in 1 2 3; do
-                echo "Docker build attempt ${attempt}/3"
-                docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull python:3.12-slim || true
-                if docker compose -f docker-compose.prod.yml build; then
-                  break
-                fi
-                if [ "$attempt" = "3" ]; then
-                  echo "Docker build failed after 3 attempts"
-                  exit 1
-                fi
-                echo "Docker build failed, retrying after $((attempt * 20)) seconds..."
-                sleep $((attempt * 20))
-              done
-              docker compose -f docker-compose.prod.yml up -d --remove-orphans
-              echo "Rollback finished."
-            else
-              echo "No backup file found for rollback: \$BACKUP_FILE"
-            fi
-          }
-
-          trap rollback ERR
-
-          cd /opt/jobpulse
-
-          for attempt in 1 2 3; do
-            echo "Docker build attempt ${attempt}/3"
-            docker image inspect python:3.12-slim >/dev/null 2>&1 || docker pull python:3.12-slim || true
-            if docker compose -f docker-compose.prod.yml build; then
-              break
-            fi
-            if [ "$attempt" = "3" ]; then
-              echo "Docker build failed after 3 attempts"
-              exit 1
-            fi
-            echo "Docker build failed, retrying after $((attempt * 20)) seconds..."
-            sleep $((attempt * 20))
-          done
-
-          docker compose -f docker-compose.prod.yml run --rm api python -m scripts.migrate_database
-
-          docker compose -f docker-compose.prod.yml up -d --remove-orphans
-
-          echo "Waiting for API health..."
-          for i in \$(seq 1 20); do
-            if curl -fsS http://localhost/api/health; then
-              echo "Health check passed."
-              trap - ERR
-              exit 0
-            fi
-
-            echo "Health check attempt \$i failed. Retrying..."
-            sleep 5
-          done
-
-          echo "Health check failed after retries."
-          exit 1
-          EOF
-
-      - name: Cleanup old backups
-        run: |
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" <<'EOF'
-          set -e
-
-          find /opt/jobpulse_backups/releases -type f -name "jobpulse_*.tgz" -mtime +14 -delete || true
-          find /opt/jobpulse_backups/db -type f -name "jobpulse_pre_deploy_*.dump" -mtime +14 -delete || true
-
-          echo "Old backup cleanup finished."
-          EOF
