@@ -482,6 +482,24 @@
         </table>
       </div>
 
+
+      <div class="section">
+        <h2>Production Deploy</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Message</th>
+              <th>Image</th>
+              <th>Previous Image</th>
+              <th>Current Image</th>
+              <th>Updated At</th>
+            </tr>
+          </thead>
+          <tbody id="deployRows"></tbody>
+        </table>
+      </div>
+
 <div class="section">
       <h2>Admin Actions</h2>
       <div class="token-box" style="margin-bottom:12px; flex-wrap:wrap;">
@@ -603,6 +621,11 @@
           </div>
           <span>${safe.toFixed(2)}%</span>
         </div>
+        <div class="card">
+          <div class="label">Latest Deploy</div>
+          <div id="deployStatus" class="value" style="font-size:18px;">-</div>
+        </div>
+
       `;
     }
 
@@ -845,6 +868,44 @@
         `).join('');
       }
 
+
+      function shortImageId(value) {
+        if (!value) return '-';
+        const clean = String(value).replace('sha256:', '');
+        return clean.length > 18 ? clean.slice(0, 18) + '…' : clean;
+      }
+
+      function deployStatusHtml(deploy) {
+        if (!deploy) {
+          return '<tr><td colspan="6">No deploy data</td></tr>';
+        }
+
+        const status = deploy.status || 'unknown';
+        const statusClass = status === 'success'
+          ? 'good'
+          : (status === 'rolled_back' ? 'warn' : 'bad');
+
+        return `
+          <tr>
+            <td class="${statusClass}">${escapeHtml(status)}</td>
+            <td>${escapeHtml(deploy.message || '-')}</td>
+            <td>${escapeHtml(deploy.image || '-')}</td>
+            <td title="${escapeHtml(deploy.previous_image_id || '')}">${escapeHtml(shortImageId(deploy.previous_image_id))}</td>
+            <td title="${escapeHtml(deploy.current_image_id || '')}">${escapeHtml(shortImageId(deploy.current_image_id))}</td>
+            <td>${escapeHtml(deploy.updated_at_utc || '-')}</td>
+          </tr>
+        `;
+      }
+
+      function deployStatusSummary(deploy) {
+        if (!deploy) return 'No deploy data';
+
+        const status = deploy.status || 'unknown';
+        const updated = deploy.updated_at_utc || '-';
+
+        return status + ' · ' + updated;
+      }
+
 function postgresBackupHtml(backup) {
         if (!backup) {
           return '<tr><td colspan="7">No PostgreSQL backup data</td></tr>';
@@ -1054,6 +1115,7 @@ function diskHtml(disk) {
         document.getElementById('badApply').className = bad === 0 ? 'value good' : 'value bad';
 
                 setText('backup', postgresBackupSummary(data.postgres_backup));
+        setText('deployStatus', deployStatusSummary(data.deploy));
 
         document.getElementById('coverageRows').innerHTML = rowsHtml(data.coverage);
         document.getElementById('queueRows').innerHTML = rowsHtml(data.demand_queue);
@@ -1086,6 +1148,11 @@ function diskHtml(disk) {
         const postgresBackupRows = document.getElementById('postgresBackupRows');
         if (postgresBackupRows) {
           postgresBackupRows.innerHTML = postgresBackupHtml(data.postgres_backup);
+        }
+
+        const deployRows = document.getElementById('deployRows');
+        if (deployRows) {
+          deployRows.innerHTML = deployStatusHtml(data.deploy);
         }
 
         const postgresBackupInventoryRows = document.getElementById('postgresBackupInventoryRows');
