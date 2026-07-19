@@ -75,10 +75,12 @@ Security Rules
  .api_keys.env is not committed.
  .admin.env is not committed.
  .admin_token is not committed.
+ .admin_htpasswd is not committed.
  .telegram_alert.env is not committed.
  .auth/ is not committed.
  logs/ is not committed.
  backups/ is not committed.
+ .collection.env is not committed.
 Final Validation Commands
 cd /opt/jobpulse
 
