@@ -15,6 +15,7 @@ mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
 
 ts="$(date -u +"%Y%m%dT%H%M%SZ")"
 tmp_file="$BACKUP_DIR/.${DB_NAME}_${ts}.dump.tmp"
+tmp_list_file="$BACKUP_DIR/.${DB_NAME}_${ts}.dump.list.tmp"
 dump_file="$BACKUP_DIR/${DB_NAME}_${ts}.dump"
 sha_file="$dump_file.sha256"
 list_file="$dump_file.list"
@@ -25,7 +26,7 @@ log() {
 }
 
 cleanup_on_error() {
-  rm -f "$tmp_file"
+  rm -f "$tmp_file" "$tmp_list_file"
 }
 trap cleanup_on_error ERR
 
@@ -42,12 +43,17 @@ docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
 
 test -s "$tmp_file"
 
+# Validate the dump BEFORE it is promoted to its final name/checksum, so a
+# corrupt dump never gets published as a trusted backup.
+cat "$tmp_file" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+  pg_restore -l > "$tmp_list_file"
+
+test -s "$tmp_list_file"
+
 mv "$tmp_file" "$dump_file"
+mv "$tmp_list_file" "$list_file"
 
 sha256sum "$dump_file" > "$sha_file"
-
-cat "$dump_file" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  pg_restore -l > "$list_file"
 
 bytes="$(stat -c%s "$dump_file")"
 sha="$(cut -d' ' -f1 "$sha_file")"
