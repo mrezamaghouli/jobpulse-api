@@ -128,13 +128,20 @@ Safety rules
 
 ## Public API Usage
 
-Public API endpoints are protected by API key.
+Public API endpoints (`/jobs`, `/jobs/search`, `/jobs/stats`, `/jobs/{id}`, ...) are protected by API key.
 
 Send the API key using this header:
 
 ```http
 X-API-Key: YOUR_API_KEY
 ```
+
+Before deploying, set `JOBPULSE_PUBLIC_API_KEYS` to one or more comma-separated
+keys (production convention: `/opt/jobpulse/.api_keys.env`, see
+`docs/PRODUCTION_RUNBOOK.md`). If it is left unset, the app still starts and
+`/health` still passes, but every `/jobs*` request fails closed with `503
+api_key_not_configured`. Run `./scripts/check_production_readiness.py` before
+deploying to catch this.
 
 ---
 

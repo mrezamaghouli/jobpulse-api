@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from app.api_cache import SimpleApiCacheMiddleware
-from app.api_security import public_api_security_middleware
+from app.api_security import get_configured_public_api_keys, public_api_security_middleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -42,6 +42,12 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("jobpulse")
+
+if APP_ENV == "production" and not get_configured_public_api_keys():
+    logger.warning(
+        "JOBPULSE_PUBLIC_API_KEYS is not set. Every /jobs* request will return "
+        "503 until at least one key is configured (see docs/PRODUCTION_RUNBOOK.md)."
+    )
 
 
 app = FastAPI(

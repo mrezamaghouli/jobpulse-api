@@ -4,6 +4,7 @@ from pathlib import Path
 
 import psycopg2
 
+from app.api_security import get_configured_public_api_keys
 from app.config import get_postgres_config
 
 
@@ -133,6 +134,26 @@ def check_env() -> bool:
     return success
 
 
+def check_public_api_key() -> bool:
+    print("")
+    print("=" * 100)
+    print("Checking public API key configuration")
+    print("=" * 100)
+
+    configured_keys = get_configured_public_api_keys()
+
+    if not configured_keys:
+        print_fail(
+            "JOBPULSE_PUBLIC_API_KEYS is not set (or has no usable keys after "
+            "trimming whitespace/empty entries). Every /jobs* request will "
+            "return 503 until this is fixed. See docs/PRODUCTION_RUNBOOK.md."
+        )
+        return False
+
+    print_ok(f"JOBPULSE_PUBLIC_API_KEYS configured ({len(configured_keys)} key(s))")
+    return True
+
+
 def check_database() -> bool:
     print("")
     print("=" * 100)
@@ -254,6 +275,7 @@ def main():
     checks = [
         check_files(),
         check_env(),
+        check_public_api_key(),
         check_python_imports(),
         check_database(),
     ]

@@ -20,7 +20,21 @@
 /opt/jobpulse/.telegram_alert.env
 /opt/jobpulse/logs/
 /opt/jobpulse/backups/postgres/
+```
+
 Do not commit production secrets.
+
+`.api_keys.env` must contain:
+
+```text
+JOBPULSE_PUBLIC_API_KEYS=<comma-separated-strong-random-keys>
+```
+
+This protects /jobs* endpoints. If it is missing or empty, the API container
+still starts and /health still passes, but every /jobs* request fails closed
+with 503 api_key_not_configured. Run
+./scripts/check_production_readiness.py before every deploy to catch this
+ahead of time.
 
 Normal API Deploy
 
