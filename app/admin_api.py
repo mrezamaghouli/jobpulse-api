@@ -8,7 +8,9 @@ from psycopg2.extras import RealDictCursor
 from app.postgres_database import get_postgres_connection
 
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+# No prefix here: app/main.py mounts this router under /api/admin, the
+# canonical convention that nginx proxies to the backend.
+router = APIRouter(tags=["admin"])
 
 
 def serialize_value(value: Any):

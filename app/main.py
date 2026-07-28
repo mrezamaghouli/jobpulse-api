@@ -646,7 +646,9 @@ from app.api_guard import ApiGuardMiddleware
 app.add_middleware(ApiGuardMiddleware)
 
 # Private admin endpoints protected by X-Admin-Key.
-app.include_router(admin_router)
+# /api/admin is the canonical route convention: it's the only admin prefix
+# nginx proxies to the backend.
+app.include_router(admin_router, prefix="/api/admin")
 
 
 # Admin status routes

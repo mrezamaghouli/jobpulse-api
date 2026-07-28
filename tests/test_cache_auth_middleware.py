@@ -150,8 +150,8 @@ def test_admin_endpoints_are_never_cached(client, monkeypatch):
 
     # No ADMIN_API_KEY / JOBPULSE_ADMIN_TOKEN configured -> fails closed with
     # 503 before ever touching the database, so this is safe to call directly.
-    first = client.get("/admin/summary")
-    second = client.get("/admin/summary")
+    first = client.get("/api/admin/summary")
+    second = client.get("/api/admin/summary")
 
     assert first.status_code == 503
     assert second.status_code == 503
