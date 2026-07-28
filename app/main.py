@@ -6,6 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
+from app.api_cache import SimpleApiCacheMiddleware
 from app.api_security import public_api_security_middleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +64,17 @@ def get_cors_origins() -> list[str]:
 
     return origins
 
+
+# Cache middleware must be registered first so that Starlette builds it as the
+# INNERMOST layer (closest to the router). Starlette's add_middleware() prepends
+# to the middleware list and build_middleware_stack() wraps in reverse order, so
+# the last-registered middleware ends up outermost and the first-registered ends
+# up innermost. Registering the cache here (before auth/rate-limit/guard) ensures
+# every request passes public_api_security_middleware, api_key_auth, rate_limit,
+# and ApiGuardMiddleware BEFORE a cache hit can short-circuit the request -
+# otherwise a cached response could be served to unauthenticated/unlimited
+# clients without ever reaching those checks.
+app.add_middleware(SimpleApiCacheMiddleware)
 
 app.middleware("http")(public_api_security_middleware)
 
@@ -632,11 +644,6 @@ def get_recent_collector_runs(limit: int = 10):
 # Production API guard: request validation, rate limiting, and safe error responses.
 from app.api_guard import ApiGuardMiddleware
 app.add_middleware(ApiGuardMiddleware)
-
-
-# Internal short-lived cache for repeated public job search queries.
-from app.api_cache import SimpleApiCacheMiddleware
-app.add_middleware(SimpleApiCacheMiddleware)
 
 # Private admin endpoints protected by X-Admin-Key.
 app.include_router(admin_router)
