@@ -199,6 +199,10 @@ first_seen_at
 date_posted_at
 ```
 
+`date_posted_at` is the canonical posted-time sort field -- the real timestamp captured from the listing. `date_posted` is accepted as a compatibility alias and always resolves to the identical `date_posted_at` ordering; it never sorts by the legacy `date_posted` text column. Jobs with no posted timestamp sort last for both `asc` and `desc`. Any unrecognized `sort_by` value falls back to `last_seen_at` rather than erroring.
+
+When a free-text `query` is supplied, sorting and `count`/`total_pages` are computed over the bounded, already-evaluated candidate pool (ranked, relevance-thresholded, and quality-filtered) -- not the entire `jobs` table.
+
 ---
 
 ## Example: Relevance Search
@@ -207,6 +211,20 @@ date_posted_at
 curl -sS \
   -H "X-API-Key: YOUR_API_KEY" \
   "http://35.192.251.190/api/jobs/search?query=data%20analyst&location=Germany&has_logo=true&sort_by=relevance&sort_order=desc&limit=10"
+```
+
+---
+
+## Example: Sort by Posted Date (ascending / descending)
+
+```bash
+curl -sS \
+  -H "X-API-Key: YOUR_API_KEY" \
+  "http://35.192.251.190/api/jobs/search?query=data%20analyst&sort_by=date_posted_at&sort_order=desc&limit=10"
+
+curl -sS \
+  -H "X-API-Key: YOUR_API_KEY" \
+  "http://35.192.251.190/api/jobs/search?query=data%20analyst&sort_by=date_posted&sort_order=asc&limit=10"
 ```
 
 ---
