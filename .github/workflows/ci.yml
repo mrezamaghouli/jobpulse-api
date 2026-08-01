@@ -87,6 +87,7 @@ jobs:
       - name: Check production shell scripts
         run: |
           bash -n scripts/production_health_alert.sh
+          bash -n scripts/run_production_alert_checks.sh
           bash -n scripts/production_cleanup.sh
           bash -n scripts/production_smoke_test.sh
 
