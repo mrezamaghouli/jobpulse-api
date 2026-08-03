@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import psycopg2
@@ -10,6 +11,12 @@ from psycopg2.extras import RealDictCursor
 
 from app.config import get_postgres_config
 from scripts.linkedin_auth_preflight import preflight_linkedin_auth
+from scripts import linkedin_plan_collect as lpc
+from scripts.process_summary import (
+    RESULT_PATH_ENV_VAR as PROCESS_SUMMARY_RESULT_PATH_ENV_VAR,
+    build_summary,
+    write_summary_atomic,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -143,6 +150,21 @@ def run_module(module_name, extra_env=None):
     ).returncode
 
 
+def write_process_summary_if_configured(batch_report, had_pending_targets: bool):
+    """No-op if JOBPULSE_PROCESS_SUMMARY_RESULT_PATH isn't set (e.g. this
+    script run standalone by an operator, outside the wrapper). When it
+    IS set, a write failure is NOT swallowed -- the caller must let this
+    propagate, since an unrecorded summary cannot be trusted by
+    scripts/run_collection_cycle_safe.sh reading the same path back out
+    on the host side."""
+    result_path = os.getenv(PROCESS_SUMMARY_RESULT_PATH_ENV_VAR)
+    if not result_path:
+        return
+
+    summary = build_summary(batch_report, had_pending_targets=had_pending_targets)
+    write_summary_atomic(result_path, summary)
+
+
 def main():
     preflight_linkedin_auth()
     parser = argparse.ArgumentParser()
@@ -157,6 +179,13 @@ def main():
 
     if not rows:
         print("No pending search demand targets.")
+        # Nothing to do is not a failure, but it must still be
+        # DISTINGUISHABLE from "we tried and everything failed" -- write
+        # a summary with had_pending_targets=False so the wrapper (which
+        # otherwise only sees "the docker exec step exited 0") can tell
+        # the two apart instead of treating a missing summary file as an
+        # error, or a truly-empty run as if useful work happened.
+        write_process_summary_if_configured(None, had_pending_targets=False)
         return
 
     ids = [row["id"] for row in rows]
@@ -178,16 +207,24 @@ def main():
 
     if args.dry_run:
         print("Dry run only. Nothing collected.")
+        # No summary written here: --dry-run is an operator debugging
+        # aid, never invoked by run_collection_cycle_safe.sh, so there is
+        # no wrapper waiting to read a summary for this invocation.
         return
 
     mark_targets(ids, "running")
+
+    plan_result_path = LOGS_DIR / f".plan_collect_result_{uuid.uuid4().hex}.json"
 
     env = {
         "LINKEDIN_QUERIES_FILE": str(DEMAND_QUERIES_FILE),
         "LINKEDIN_LIMIT": os.getenv("SEARCH_DEMAND_LINKEDIN_LIMIT", "20"),
         "LINKEDIN_MAX_PAGES": os.getenv("SEARCH_DEMAND_LINKEDIN_MAX_PAGES", "2"),
         "LINKEDIN_QUERY_COOLDOWN_HOURS": os.getenv("SEARCH_DEMAND_COOLDOWN_HOURS", "0"),
+        lpc.PLAN_COLLECT_RESULT_PATH_ENV_VAR: str(plan_result_path),
     }
+
+    batch_report = None
 
     try:
         code = subprocess.run(
@@ -208,6 +245,18 @@ def main():
         if code != 0:
             raise RuntimeError(f"linkedin_plan_collect failed with code {code}")
 
+        # Success is never inferred from returncode alone: exit 0 paired
+        # with a missing or malformed batch report is still a failure --
+        # the report is the only machine-readable source of truth for
+        # what linkedin_plan_collect actually did.
+        try:
+            batch_report = lpc.read_batch_result(plan_result_path)
+        except lpc.BatchResultReadError as exc:
+            raise RuntimeError(
+                f"linkedin_plan_collect exited 0 but its batch report could not be used "
+                f"(category={exc.category})"
+            ) from exc
+
         if not args.skip_post_processing:
             run_module("scripts.backfill_companies_from_jobs")
 
@@ -225,12 +274,37 @@ def main():
         else:
             print("Skipping post-processing: company backfill, logo sync, embeddings.")
 
+        # Written BEFORE mark_targets(ids, "done") deliberately: if this
+        # write fails, we must fall through to the `except` block below
+        # and mark these rows "failed" (requeued) rather than leaving a
+        # contradictory "done" status that a failed summary write can
+        # never undo cleanly.
+        write_process_summary_if_configured(batch_report, had_pending_targets=True)
+
+        # Preserved, documented behavior (NOT changed by this pass): the
+        # entire fetched set is marked "done" once linkedin_plan_collect
+        # reports at least one successful query, even if batch_report says
+        # partial_failure=True. There is no exact query-to-row mapping
+        # available here to attribute failures to specific ids -- guessing
+        # one would risk silently losing/mis-marking real work. This is an
+        # explicit, documented phase 2B blocker (see
+        # docs/PRODUCTION_RUNBOOK.md), not an oversight. What IS new this
+        # pass: batch_report["partial_failure"] is still truthfully
+        # recorded in the process summary above, so the wrapper's
+        # heartbeat shows "partial_failure" even though these demand-queue
+        # rows are marked done.
         mark_targets(ids, "done")
         print("Search demand queue processed successfully.")
 
     except Exception as exc:
         mark_targets(ids, "failed", error=exc)
         raise
+
+    finally:
+        try:
+            plan_result_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
