@@ -31,27 +31,42 @@ providing a plain TCP-reachable PostgreSQL server, indistinguishable
 from any other disposable test database from this file's point of view).
 
 A DISCOVERED, PRE-EXISTING FINDING (not introduced by this pass, but
-directly relevant to it): the repository's OWN tracked schema-management
-scripts (scripts/repair_jobpulse_schema.py, scripts/migrate_database.py)
-create only a non-unique `idx_jobs_job_url` index on `jobs.job_url`, not
-a UNIQUE constraint -- `grep` of the whole repository found no
-`ADD CONSTRAINT ... UNIQUE` / `UNIQUE INDEX` on `job_url` for the
-PostgreSQL schema anywhere (only the LEGACY SQLite schema in
-legacy/init_db_sqlite.py has `job_url ... UNIQUE`). `insert_job()`'s
+directly relevant to it, corrected after a follow-up audit found an
+earlier pass's repo-wide grep had silently skipped the tracked `db/`
+directory -- see docs/PRODUCTION_RUNBOOK.md for the full account): this
+repository has TWO separate, non-converging PostgreSQL schema-bootstrap
+paths for `jobs.job_url`. `db/init.sql` IS tracked and HAS declared
+`job_url TEXT NOT NULL UNIQUE` since the initial repository commit, but
+it is mounted into `/docker-entrypoint-initdb.d/init.sql` only by the
+LOCAL/DEV `docker-compose.yml` -- `docker-compose.prod.yml` does not
+mount or execute `db/init.sql` at all. The actual PRODUCTION
+bootstrap/startup path runs `scripts/repair_jobpulse_schema.py` (invoked
+from `docker-compose.prod.yml`'s `api` service command), which defines
+`job_url` without `NOT NULL` or `UNIQUE` and creates only a non-unique
+`idx_jobs_job_url` index; `scripts/migrate_database.py` does not add an
+exact `UNIQUE(job_url)` constraint or unique index either. So a fresh
+database bootstrapped via the local/dev `db/init.sql` path DOES get
+`UNIQUE(job_url)`, but a fresh or existing database bootstrapped/repaired
+through the current production compose path does NOT. `insert_job()`'s
 `ON CONFLICT (job_url) DO UPDATE` REQUIRES a unique or exclusion
 constraint on `job_url` to be valid SQL at all -- PostgreSQL raises
 `there is no unique or exclusion constraint matching the ON CONFLICT
 specification` otherwise. This test's own disposable schema explicitly
 creates that constraint (matching the task's instruction to create
 "the minimum disposable jobs table and matching unique constraint needed
-by insert_job()"), so a PASS here does NOT prove production's real
-schema has this constraint -- only that the SQL is correct GIVEN the
-constraint exists. This must be verified directly against the real
-production schema by an operator (e.g. `\\d jobs` or
+by insert_job()"), so a PASS here proves `ON CONFLICT (job_url)` and
+`RETURNING (xmax = 0)` behave correctly when the required unique
+definition exists -- it does NOT prove production's real, live table has
+it, since the disposable CI table's `UNIQUE(job_url)` is independent of
+whatever production's `repair_jobpulse_schema.py`-driven schema actually
+contains. This must be verified directly against the real production
+schema by an operator (e.g. `\\d jobs` or
 `SELECT conname FROM pg_constraint WHERE conrelid = 'jobs'::regclass;`)
 before this UPSERT-based insert/update distinction can be trusted in
-production -- this repository cannot verify it, since connecting to
-production is explicitly out of scope for this pass.
+production. Direct, read-only production verification is still required
+before merge, because merging this branch to `main` triggers automatic
+production deployment -- this repository cannot verify it here, since
+connecting to production is explicitly out of scope for this pass.
 """
 import os
 import sys

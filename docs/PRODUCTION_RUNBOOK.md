@@ -257,24 +257,63 @@ disposable PostgreSQL 16 database, when one is available -- see "Phase
 `inserted=false`, this holds across separate transactions/connections
 (not just within one), and a rolled-back transaction leaves no
 persistent state. **A DISCOVERED, PRE-EXISTING FINDING, unrelated to any
-code change in this pass:** grepping the whole repository found no
-`UNIQUE` constraint (or unique index) on `jobs.job_url` anywhere in the
-tracked PostgreSQL schema-management scripts
-(`scripts/repair_jobpulse_schema.py`, `scripts/migrate_database.py`) --
-only a plain, non-unique `idx_jobs_job_url` index. `insert_job()`'s
-`ON CONFLICT (job_url) DO UPDATE` REQUIRES a unique/exclusion constraint
-on `job_url` to be valid SQL at all; PostgreSQL raises `there is no
-unique or exclusion constraint matching the ON CONFLICT specification`
-otherwise. The integration test's own disposable table explicitly
-creates this constraint (as instructed, "the minimum disposable jobs
+code change in this pass, corrected after a follow-up audit found the
+first pass's grep had silently skipped an entire tracked directory (see
+below):** this repository has TWO separate, non-converging PostgreSQL
+schema-bootstrap paths for `jobs.job_url`, and only one of them defines a
+unique constraint.
+
+`db/init.sql` is tracked and has declared
+`job_url TEXT NOT NULL UNIQUE` since the initial repository commit
+(`git log --follow -- db/init.sql` shows it present from the very first
+commit onward, never removed or renamed). `docker-compose.yml` mounts
+this file into `/docker-entrypoint-initdb.d/init.sql`
+(`docker-compose.yml:44`), which PostgreSQL's official image executes
+automatically the first time it initializes an empty data directory --
+but this is the **local/development** compose file only.
+
+`docker-compose.prod.yml` does not mount or reference `db/init.sql`
+anywhere, and its `db` service has no `/docker-entrypoint-initdb.d`
+volume at all. The **actual production bootstrap/startup path** is the
+`api` service's command in `docker-compose.prod.yml`, which runs
+`python -m scripts.repair_jobpulse_schema` before starting `uvicorn`.
+`scripts/repair_jobpulse_schema.py` defines `job_url` as plain `TEXT` --
+no `NOT NULL`, no `UNIQUE` -- and creates only
+`CREATE INDEX IF NOT EXISTS idx_jobs_job_url ON jobs(job_url)`, a
+non-unique index. `scripts/migrate_database.py` was also checked and
+does not add an exact `UNIQUE(job_url)` constraint or unique index
+either. Both use `IF NOT EXISTS`/`ADD COLUMN IF NOT EXISTS` throughout,
+so re-running them against an existing table never escalates a plain
+column to a unique one.
+
+**Net effect:** the repository guarantees `UNIQUE(job_url)` for a fresh
+database initialized through the local/dev `db/init.sql` path, but does
+**not** guarantee it for a fresh or existing database initialized or
+repaired through the current production compose path
+(`docker-compose.prod.yml` + `scripts/repair_jobpulse_schema.py`).
+`insert_job()`'s `ON CONFLICT (job_url) DO UPDATE` REQUIRES a
+unique/exclusion constraint on `job_url` to be valid SQL at all;
+PostgreSQL raises `there is no unique or exclusion constraint matching
+the ON CONFLICT specification` otherwise. The PostgreSQL 16 CI
+integration test proves that `ON CONFLICT (job_url)` and
+`RETURNING (xmax = 0)` behave correctly precisely when the required
+unique definition exists: the test's own disposable table explicitly
+creates that constraint (as instructed, "the minimum disposable jobs
 table and matching unique constraint needed by insert_job()"), so a PASS
 there proves the SQL is correct GIVEN the constraint exists -- it does
-**NOT** prove production's real, live schema has it. This must be
+**NOT** prove production's real, live table has it, since the disposable
+CI table's `UNIQUE(job_url)` is independent of whatever production's
+`repair_jobpulse_schema.py`-driven schema actually contains. This must be
 verified directly against the real production database by an operator
 (`\d jobs` or `SELECT conname FROM pg_constraint WHERE conrelid =
 'jobs'::regclass;`) before deploying anything that depends on this
-UPSERT -- connecting to production to check this is explicitly out of
-scope for every phase of this work.
+UPSERT. Direct, read-only production verification is still required
+before merge, because merging this branch to `main` triggers automatic
+production deployment (`.github/workflows/docker-build.yml` ->
+`workflow_run` -> `.github/workflows/deploy.yml`) -- connecting to
+production to run that read-only check is explicitly out of scope for
+every phase of this work, so merge remains blocked until an operator
+performs it separately.
 
 **No triggers or rules were found on `jobs`** in any tracked
 schema-management script (`grep -r "CREATE TRIGGER\|CREATE RULE"` across
@@ -1039,11 +1078,19 @@ enhancement, not attempted this phase.
   were available in this development environment, so
   `tests/test_upsert_returning_integration.py` has not been executed
   locally; only the CI job's future runs constitute real evidence. **A
-  discovered, pre-existing gap**: no tracked schema script creates a
-  `UNIQUE` constraint on `jobs.job_url` (only a non-unique index) --
-  production's real schema must be verified directly by an operator
-  before this UPSERT can be trusted there; this repository cannot check
-  that without connecting to production, which is out of scope.
+  discovered, pre-existing gap**: `db/init.sql` declares
+  `UNIQUE(job_url)` and is present on this branch, but it is mounted only
+  by the local/dev `docker-compose.yml`
+  (`/docker-entrypoint-initdb.d/init.sql`) -- the production bootstrap
+  path (`docker-compose.prod.yml` running
+  `scripts/repair_jobpulse_schema.py`) creates only a non-unique
+  `idx_jobs_job_url` index, and `scripts/migrate_database.py` adds no
+  `UNIQUE(job_url)` either. Production's real schema must be verified
+  directly by an operator (see "Real PostgreSQL 16 evidence for this
+  SQL" above) before this UPSERT can be trusted there; this repository
+  cannot check that without connecting to production, which is out of
+  scope, and merge remains blocked on that check because merging
+  triggers automatic production deployment.
 - **The in-container half of the dual timeout design
   (`scripts/run_with_deadline.py`) is unit-tested as a real subprocess
   with real process groups, but not Docker-runtime integration-tested**
