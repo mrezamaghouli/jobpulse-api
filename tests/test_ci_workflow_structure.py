@@ -13,6 +13,8 @@ No network access, no `actionlint` download -- if `actionlint` happens to
 already be installed locally it is invoked as an extra check, otherwise
 skipped (never a hard dependency of this test file).
 """
+import base64
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -261,3 +263,243 @@ def test_deploy_condition_only_fires_on_dispatch_or_successful_main_push_build(
         f"head_branch={head_branch!r} workflow_run.event={wr_event!r}: "
         f"expected should_deploy={should_deploy}, condition evaluated to {result!r}"
     )
+
+
+# --- Build workflow: reject manually dispatched non-main builds ----------
+#
+# docker-build.yml supports workflow_dispatch, which can be run against any
+# selected branch and would otherwise publish the mutable `:main` tag from
+# that branch's code. A job-level guard restricts build-api to the existing
+# push-to-main trigger or a workflow_dispatch explicitly run against main.
+
+BUILD_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
+
+
+@pytest.fixture(scope="module")
+def build_workflow() -> dict:
+    return yaml.safe_load(BUILD_WORKFLOW_PATH.read_text())
+
+
+def test_build_workflow_push_trigger_still_targets_main(build_workflow):
+    triggers = _triggers(build_workflow)
+    assert triggers["push"]["branches"] == ["main"]
+
+
+def test_build_workflow_retains_workflow_dispatch(build_workflow):
+    triggers = _triggers(build_workflow)
+    assert "workflow_dispatch" in triggers
+
+
+def test_build_job_has_a_branch_guard_condition(build_workflow):
+    condition = build_workflow["jobs"]["build-api"].get("if", "")
+    assert "push" in condition
+    assert "refs/heads/main" in condition
+
+
+def test_build_step_still_publishes_main_and_sha_tags(build_workflow):
+    steps = build_workflow["jobs"]["build-api"]["steps"]
+    build_step = next(s for s in steps if s.get("name") == "Build and push API image")
+    tags_text = build_step["with"]["tags"]
+    assert ":main" in tags_text
+    assert "${{ github.sha }}" in tags_text
+
+
+def _build_condition_as_python(condition: str) -> str:
+    py = condition
+    py = py.replace("github.event_name", "github['event_name']")
+    py = py.replace("github.ref", "github['ref']")
+    py = py.replace("||", " or ")
+    py = py.replace("&&", " and ")
+    return py
+
+
+@pytest.mark.parametrize(
+    "event_name,ref,should_build",
+    [
+        ("push", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/feature-x", False),
+    ],
+    ids=["push-main", "dispatch-main", "dispatch-feature"],
+)
+def test_build_job_only_runs_for_push_or_main_dispatch(build_workflow, event_name, ref, should_build):
+    condition = build_workflow["jobs"]["build-api"]["if"]
+    py_expr = _build_condition_as_python(condition)
+
+    github = {"event_name": event_name, "ref": ref}
+
+    result = eval(py_expr, {"__builtins__": {}}, {"github": github})
+    assert result is should_build, (
+        f"event_name={event_name!r} ref={ref!r}: expected should_build={should_build}, "
+        f"condition evaluated to {result!r}"
+    )
+
+
+# --- Production compose: image pinned via JOBPULSE_API_IMAGE -------------
+
+COMPOSE_PROD_PATH = REPO_ROOT / "docker-compose.prod.yml"
+
+
+@pytest.fixture(scope="module")
+def compose_prod() -> dict:
+    return yaml.safe_load(COMPOSE_PROD_PATH.read_text())
+
+
+def test_compose_prod_is_valid_yaml_with_an_api_service(compose_prod):
+    assert isinstance(compose_prod, dict)
+    assert isinstance(compose_prod.get("services"), dict)
+    assert "api" in compose_prod["services"]
+
+
+def test_compose_prod_api_image_uses_env_var_with_main_fallback(compose_prod):
+    image = compose_prod["services"]["api"]["image"]
+    assert image == "${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}", (
+        "the api service image must be overridable via JOBPULSE_API_IMAGE so "
+        "the deploy workflow can pin it to an immutable build SHA, while "
+        "still defaulting to :main for existing manual/operator workflows"
+    )
+
+
+def test_compose_prod_only_api_image_line_changed(compose_prod):
+    """Regression guard: db/frontend images, and everything else about the
+    api service, must be untouched by the image-pinning change."""
+    assert compose_prod["services"]["db"]["image"] == "postgres:16-alpine"
+    assert compose_prod["services"]["frontend"]["image"] == "nginx:alpine"
+    api = compose_prod["services"]["api"]
+    assert api["container_name"] == "jobpulse-api-prod"
+    assert api["ports"] == ["127.0.0.1:8000:8000"]
+
+
+# --- Deploy workflow: pin automatic deploys to the exact build SHA -------
+#
+# Automatic deploys previously always pulled the mutable `:main` tag, so a
+# later build could silently change what an already-triggered deployment
+# actually installs. The deploy job now resolves an immutable image before
+# ever opening the SSH connection: workflow_run deployments are pinned to
+# `ghcr.io/mrezamaghouli/jobpulse-api:<workflow_run.head_sha>` (after
+# validating head_sha is exactly a 40-character lowercase hex SHA), while
+# manual workflow_dispatch deploys continue to use `:main`. The resolved
+# image is base64-encoded and passed to the remote shell the same way
+# GHCR_TOKEN_B64 already is, decoded there, and exported as
+# JOBPULSE_API_IMAGE for scripts/deploy_prod_from_ghcr.sh (which already
+# reads that variable).
+
+
+def _resolve_image_step(deploy_workflow):
+    steps = deploy_workflow["jobs"]["deploy"]["steps"]
+    matches = [s for s in steps if s.get("id") == "resolve_image"]
+    assert matches, "expected a deploy step with id: resolve_image"
+    return matches[0]
+
+
+def _deploy_ssh_step(deploy_workflow):
+    steps = deploy_workflow["jobs"]["deploy"]["steps"]
+    matches = [s for s in steps if s.get("name") == "Deploy from GHCR to production VM"]
+    assert matches, "expected the 'Deploy from GHCR to production VM' step"
+    return matches[0]
+
+
+def test_resolve_image_step_runs_before_the_ssh_deploy_step(deploy_workflow):
+    steps = deploy_workflow["jobs"]["deploy"]["steps"]
+    ids_and_names = [s.get("id") or s.get("name") for s in steps]
+    assert ids_and_names.index("resolve_image") < ids_and_names.index(
+        "Deploy from GHCR to production VM"
+    )
+
+
+def test_resolve_image_step_validates_head_sha_format(deploy_workflow):
+    run_text = _resolve_image_step(deploy_workflow)["run"]
+    assert "workflow_run.head_sha" in run_text
+    assert "[0-9a-f]{40}" in run_text, "head_sha must be validated as exactly 40 lowercase hex characters"
+
+
+def test_resolve_image_step_never_falls_back_to_main_for_automatic_deploys(deploy_workflow):
+    run_text = _resolve_image_step(deploy_workflow)["run"]
+    assert "workflow_dispatch" in run_text
+    assert 'DEPLOY_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:main"' in run_text
+    assert "${HEAD_SHA}" in run_text
+
+
+def test_deploy_step_base64_passes_resolved_image_and_exports_it_remotely(deploy_workflow):
+    resolve_run_text = _resolve_image_step(deploy_workflow)["run"]
+    assert "base64" in resolve_run_text
+    assert "GITHUB_OUTPUT" in resolve_run_text
+
+    ssh_step = _deploy_ssh_step(deploy_workflow)
+    assert ssh_step.get("env", {}).get("DEPLOY_IMAGE_B64") == "${{ steps.resolve_image.outputs.deploy_image_b64 }}"
+
+    ssh_run_text = ssh_step["run"]
+    assert "DEPLOY_IMAGE_B64" in ssh_run_text
+    assert "export JOBPULSE_API_IMAGE=" in ssh_run_text
+    assert "./scripts/deploy_prod_from_ghcr.sh" in ssh_run_text
+    # the resolved image must reach the remote host before the deploy script runs
+    assert ssh_run_text.index("export JOBPULSE_API_IMAGE=") < ssh_run_text.index(
+        "./scripts/deploy_prod_from_ghcr.sh"
+    )
+
+
+def test_deploy_ssh_step_never_prints_the_decoded_ghcr_token(deploy_workflow):
+    ssh_run_text = _deploy_ssh_step(deploy_workflow)["run"]
+    assert "echo \"$GHCR_TOKEN\"" not in ssh_run_text
+    assert "echo $GHCR_TOKEN" not in ssh_run_text
+    assert "GHCR_TOKEN_B64\" | base64 -d | docker login" in ssh_run_text, (
+        "the decoded GHCR token must be piped straight into docker login, "
+        "never echoed to the log"
+    )
+
+
+def _run_resolve_image_script(run_text: str, event_name: str, head_sha: str, tmp_path):
+    """Simulate the GitHub Actions templating step (literal ${{ }}
+    substitution happens before the shell ever sees the script) and then
+    actually execute the real resolve_image step's bash, so this proves
+    the shipped script's behavior rather than a hand-copied stand-in."""
+    script = run_text.replace("${{ github.event_name }}", event_name)
+    script = script.replace("${{ github.event.workflow_run.head_sha }}", head_sha)
+
+    output_file = tmp_path / "github_output"
+    output_file.write_text("")
+
+    env = dict(os.environ)
+    env["GITHUB_OUTPUT"] = str(output_file)
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    resolved_image = None
+    for line in output_file.read_text().splitlines():
+        if line.startswith("deploy_image_b64="):
+            resolved_image = base64.b64decode(line.split("=", 1)[1]).decode()
+
+    return result, resolved_image
+
+
+def test_resolve_image_script_resolves_main_for_manual_dispatch(deploy_workflow, tmp_path):
+    run_text = _resolve_image_step(deploy_workflow)["run"]
+    result, image = _run_resolve_image_script(run_text, "workflow_dispatch", "0" * 40, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert image == "ghcr.io/mrezamaghouli/jobpulse-api:main"
+
+
+def test_resolve_image_script_pins_to_head_sha_for_automatic_deploy(deploy_workflow, tmp_path):
+    run_text = _resolve_image_step(deploy_workflow)["run"]
+    sha = "a" * 40
+    result, image = _run_resolve_image_script(run_text, "workflow_run", sha, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert image == f"ghcr.io/mrezamaghouli/jobpulse-api:{sha}"
+    assert ":main" not in image, "automatic deploys must never resolve to the mutable :main tag"
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    ["", "not-a-sha", "A" * 40, "a" * 39, "a" * 41, "g" * 40],
+    ids=["empty", "not-hex", "uppercase", "too-short", "too-long", "invalid-hex-char"],
+)
+def test_resolve_image_script_rejects_invalid_head_sha(deploy_workflow, tmp_path, bad_sha):
+    run_text = _resolve_image_step(deploy_workflow)["run"]
+    result, image = _run_resolve_image_script(run_text, "workflow_run", bad_sha, tmp_path)
+    assert result.returncode != 0, f"expected failure for head_sha={bad_sha!r}"
+    assert image is None

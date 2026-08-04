@@ -21,7 +21,7 @@ services:
       retries: 10
 
   api:
-    image: ghcr.io/mrezamaghouli/jobpulse-api:main
+    image: ${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}
     container_name: jobpulse-api-prod
     restart: unless-stopped
     env_file:

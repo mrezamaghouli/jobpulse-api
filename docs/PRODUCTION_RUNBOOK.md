@@ -1426,7 +1426,7 @@ Expected flow:
 Push to main (paths: Dockerfile, requirements*.txt, app/**, scripts/**, config/**)
 → Build JobPulse API Image
 → Deploy Production (automatic, via workflow_run on a successful build)
-→ VM pulls ghcr.io/mrezamaghouli/jobpulse-api:main
+→ VM pulls ghcr.io/mrezamaghouli/jobpulse-api:<the exact commit SHA that was built>
 → Health check
 
 `deploy.yml` no longer has a direct `push` trigger. Automatic production
@@ -1455,7 +1455,27 @@ automatic deploy.
 production deploys. Use it for frontend/docs-only changes (no API-build-path
 files touched) and for any deploy that should happen without a fresh main
 push-triggered image build, until a unified CI/build/deploy pipeline is
-implemented.
+implemented. Manual deploys pull the mutable `ghcr.io/mrezamaghouli/jobpulse-api:main`
+tag, same as before.
+
+Automatic deploys are pinned to an immutable image, not `:main`. Before
+opening the SSH connection, the deploy job resolves
+`ghcr.io/mrezamaghouli/jobpulse-api:<workflow_run.head_sha>` -- the exact
+commit SHA of the build that triggered it -- after validating that
+`head_sha` is exactly a 40-character lowercase hex commit SHA (the job
+fails before SSH if it is missing or malformed). That image reference is
+base64-encoded and passed to the VM the same way `GHCR_TOKEN_B64` already
+is, decoded there, and exported as `JOBPULSE_API_IMAGE`, which
+`docker-compose.prod.yml`'s `api` service now reads
+(`${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}`) and
+which `scripts/deploy_prod_from_ghcr.sh` already consumed. Because the tag
+is the build's own SHA, a later build publishing a new `:main` image can
+never change what an already-triggered automatic deployment installs.
+`docker-build.yml`'s `build-api` job now also refuses to run for a
+`workflow_dispatch` launched against anything other than `main`, so a
+feature-branch manual build can never reach the push-and-tag step.
+Automatic rollback in `scripts/deploy_prod_from_ghcr.sh` is unchanged: it
+still retags and redeploys the previous image ID on a failed health check.
 Production Rules
 Do not run docker compose up -d --build on the VM.
 Do not commit .env, .api_keys.env, .admin.env, .admin_token, .telegram_alert.env, .auth, logs, or backups.

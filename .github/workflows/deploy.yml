@@ -35,6 +35,26 @@ jobs:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
     steps:
+      - name: Resolve deployment image
+        id: resolve_image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DEPLOY_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:main"
+          else
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "ERROR: workflow_run.head_sha is missing or is not a valid 40-character lowercase hex commit SHA" >&2
+              exit 1
+            fi
+            DEPLOY_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${HEAD_SHA}"
+          fi
+
+          echo "Resolved deployment image: $DEPLOY_IMAGE"
+          echo "deploy_image_b64=$(printf '%s' "$DEPLOY_IMAGE" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+
       - name: Validate secrets
         shell: bash
         run: |
@@ -47,6 +67,8 @@ jobs:
 
       - name: Deploy from GHCR to production VM
         shell: bash
+        env:
+          DEPLOY_IMAGE_B64: ${{ steps.resolve_image.outputs.deploy_image_b64 }}
         run: |
           set -euo pipefail
 
@@ -60,7 +82,7 @@ jobs:
 
           GHCR_TOKEN_B64="$(printf '%s' "${GHCR_TOKEN:-}" | base64 -w 0)"
 
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" "GHCR_TOKEN_B64='$GHCR_TOKEN_B64' bash -s" <<'REMOTE'
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" "GHCR_TOKEN_B64='$GHCR_TOKEN_B64' DEPLOY_IMAGE_B64='$DEPLOY_IMAGE_B64' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /opt/jobpulse
@@ -71,6 +93,13 @@ jobs:
           if [ -n "${GHCR_TOKEN_B64:-}" ]; then
             echo "$GHCR_TOKEN_B64" | base64 -d | docker login ghcr.io -u mrezamaghouli --password-stdin
           fi
+
+          if [ -z "${DEPLOY_IMAGE_B64:-}" ]; then
+            echo "ERROR: DEPLOY_IMAGE_B64 is missing" >&2
+            exit 1
+          fi
+
+          export JOBPULSE_API_IMAGE="$(printf '%s' "$DEPLOY_IMAGE_B64" | base64 -d)"
 
           ./scripts/deploy_prod_from_ghcr.sh
 
