@@ -1543,3 +1543,34 @@ JSON response validity
 rate-limit headers when available
 ```
 
+### Full Production Smoke Test (`scripts/production_smoke_test.sh`)
+
+```bash
+cd /opt/jobpulse
+
+./scripts/production_smoke_test.sh
+```
+
+This is the broader deploy-verification smoke test (health, authenticated
+`/jobs` checks, admin, job count, collection/migration scripts). It loads
+production secrets from `.api_keys.env`, `.admin.env`, and `.env`, in the
+same precedence order used by `docker-compose.prod.yml`'s `api` service
+`env_file` list, so `JOBPULSE_PUBLIC_API_KEYS` and `ADMIN_API_KEY` are
+available even when only set in `.api_keys.env`/`.admin.env` rather than
+`.env`. It selects one usable key from the comma-separated
+`JOBPULSE_PUBLIC_API_KEYS` value (whitespace trimmed, empty entries
+ignored) and fails clearly, before sending any protected request, if no
+usable key is configured -- this is deliberate: previously the script sent
+every `/jobs` request with no `X-API-Key` at all, so `/api/health` passed
+while `/api/jobs` correctly returned `401 invalid_api_key`, and the smoke
+test reported a false production failure even though the API was behaving
+correctly. It now checks, in order, that an unauthenticated `/jobs`
+request is rejected with `401`, then that the same request **with**
+`X-API-Key` set succeeds with `200`; every other protected `/jobs` request
+(limit/query-length validation, cache checks) also carries `X-API-Key`.
+`/api/health` and the admin-without-key check remain unauthenticated as
+before, and the admin-with-key check continues to use `X-Admin-Key`. The
+public and admin keys are never printed to the console or log file. Its
+temporary response/header files are created with `mktemp` in a unique
+directory and removed via an EXIT trap on both success and failure.
+
