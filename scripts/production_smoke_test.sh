@@ -25,36 +25,87 @@ pass() {
   log "PASS $*"
 }
 
-load_env() {
-  if [[ -f "${PROJECT_DIR}/.env" ]]; then
+SMOKE_TMP_DIR=""
+
+cleanup() {
+  local exit_code=$?
+  if [[ -n "$SMOKE_TMP_DIR" ]]; then
+    rm -rf "$SMOKE_TMP_DIR" || log "WARNING: failed to remove temporary directory $SMOKE_TMP_DIR"
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
+
+# Never use predictable fixed /tmp output paths: a pre-existing file or
+# symlink at a shared name could interfere with or hijack the redirection.
+SMOKE_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/jobpulse_smoke_test.XXXXXX")"
+if [[ -z "$SMOKE_TMP_DIR" || ! -d "$SMOKE_TMP_DIR" ]]; then
+  echo "ERROR: failed to create a temporary directory" >&2
+  exit 1
+fi
+chmod 700 "$SMOKE_TMP_DIR"
+
+BODY_FILE="${SMOKE_TMP_DIR}/body.out"
+HEADERS_FILE="${SMOKE_TMP_DIR}/headers.out"
+
+load_env_file() {
+  local env_file="$1"
+  if [[ -f "$env_file" ]]; then
     set -a
-    # shellcheck disable=SC1091
-    source "${PROJECT_DIR}/.env"
+    # shellcheck disable=SC1090
+    source "$env_file"
     set +a
   fi
 }
 
+# Same effective precedence as docker-compose.prod.yml's api service
+# env_file list: later files override earlier ones for overlapping keys.
+load_env() {
+  load_env_file "${PROJECT_DIR}/.api_keys.env"
+  load_env_file "${PROJECT_DIR}/.admin.env"
+  load_env_file "${PROJECT_DIR}/.env"
+}
+
+# Mirrors app/api_security.py's get_configured_public_api_keys(): split on
+# commas, trim whitespace, skip empty entries, use the first usable key.
+select_public_api_key() {
+  local raw="${JOBPULSE_PUBLIC_API_KEYS:-}"
+  local IFS=','
+  local candidate
+  for candidate in $raw; do
+    candidate="$(printf '%s' "$candidate" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [[ -n "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 curl_status() {
   local url="$1"
-  curl -sS -o /tmp/jobpulse_smoke_body.out -w "%{http_code}" "$url"
+  shift
+  curl -sS -o "$BODY_FILE" -w "%{http_code}" "$@" "$url"
 }
 
 curl_header_status() {
   local url="$1"
-  curl -sS -i "$url" -o /tmp/jobpulse_smoke_headers.out -w "%{http_code}"
+  shift
+  curl -sS -i -o "$HEADERS_FILE" -w "%{http_code}" "$@" "$url"
 }
 
 require_status() {
   local name="$1"
   local expected="$2"
   local url="$3"
+  shift 3
 
   local status
-  status="$(curl_status "$url" || true)"
+  status="$(curl_status "$url" "$@" || true)"
 
   if [[ "$status" != "$expected" ]]; then
     log "URL=$url"
-    log "BODY=$(cat /tmp/jobpulse_smoke_body.out 2>/dev/null || true)"
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
     fail "$name expected_http=$expected actual_http=$status"
   fi
 
@@ -65,8 +116,8 @@ require_json_contains() {
   local name="$1"
   local needle="$2"
 
-  if ! grep -q "$needle" /tmp/jobpulse_smoke_body.out; then
-    log "BODY=$(cat /tmp/jobpulse_smoke_body.out 2>/dev/null || true)"
+  if ! grep -q "$needle" "$BODY_FILE"; then
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
     fail "$name missing=$needle"
   fi
 
@@ -81,14 +132,23 @@ main() {
 
   docker compose -f "$COMPOSE_FILE" ps | tee -a "$LOG_FILE"
 
+  local public_api_key
+  if ! public_api_key="$(select_public_api_key)"; then
+    fail "no usable public API key found in JOBPULSE_PUBLIC_API_KEYS"
+  fi
+
   require_status "health" "200" "${BASE_URL}/health"
   require_json_contains "health_database_connected" '"database":"connected"'
 
-  require_status "jobs_search" "200" "${BASE_URL}/jobs?query=python%20backend%20remote&limit=5&page=1"
+  require_status "jobs_without_key_blocked" "401" "${BASE_URL}/jobs?query=python%20backend%20remote&limit=5&page=1"
+
+  require_status "jobs_search" "200" "${BASE_URL}/jobs?query=python%20backend%20remote&limit=5&page=1" \
+    -H "X-API-Key: ${public_api_key}"
   require_json_contains "jobs_search_has_title" '"title"'
   require_json_contains "jobs_search_has_quality_score" '"quality_score"'
 
-  require_status "api_guard_limit_validation" "400" "${BASE_URL}/jobs?query=backend&limit=999&page=1"
+  require_status "api_guard_limit_validation" "400" "${BASE_URL}/jobs?query=backend&limit=999&page=1" \
+    -H "X-API-Key: ${public_api_key}"
   require_json_contains "api_guard_limit_error" 'limit must be between'
 
   local long_query
@@ -96,20 +156,21 @@ main() {
 print("a" * 150)
 PY
 )"
-  require_status "api_guard_query_length_validation" "400" "${BASE_URL}/jobs?query=${long_query}&limit=5&page=1"
+  require_status "api_guard_query_length_validation" "400" "${BASE_URL}/jobs?query=${long_query}&limit=5&page=1" \
+    -H "X-API-Key: ${public_api_key}"
 
   local first_cache_status second_cache_status
-  first_cache_status="$(curl_header_status "${BASE_URL}/jobs?query=smoke%20python%20backend%20remote&limit=3&page=1" || true)"
-  grep -i "x-jobpulse-cache" /tmp/jobpulse_smoke_headers.out | tee -a "$LOG_FILE" || true
+  first_cache_status="$(curl_header_status "${BASE_URL}/jobs?query=smoke%20python%20backend%20remote&limit=3&page=1" -H "X-API-Key: ${public_api_key}" || true)"
+  grep -i "x-jobpulse-cache" "$HEADERS_FILE" | tee -a "$LOG_FILE" || true
 
-  second_cache_status="$(curl_header_status "${BASE_URL}/jobs?query=smoke%20python%20backend%20remote&limit=3&page=1" || true)"
-  grep -i "x-jobpulse-cache" /tmp/jobpulse_smoke_headers.out | tee -a "$LOG_FILE" || true
+  second_cache_status="$(curl_header_status "${BASE_URL}/jobs?query=smoke%20python%20backend%20remote&limit=3&page=1" -H "X-API-Key: ${public_api_key}" || true)"
+  grep -i "x-jobpulse-cache" "$HEADERS_FILE" | tee -a "$LOG_FILE" || true
 
   if [[ "$first_cache_status" != "200" || "$second_cache_status" != "200" ]]; then
     fail "cache_test expected 200/200 got ${first_cache_status}/${second_cache_status}"
   fi
 
-  if grep -qi "x-jobpulse-cache: HIT" /tmp/jobpulse_smoke_headers.out; then
+  if grep -qi "x-jobpulse-cache: HIT" "$HEADERS_FILE"; then
     pass "api_cache_hit"
   else
     log "WARN cache HIT header not observed; continuing"
@@ -118,20 +179,20 @@ PY
   require_status "admin_without_key_blocked" "401" "${BASE_URL}/admin/summary"
 
   if [[ -z "${ADMIN_API_KEY:-}" ]]; then
-    fail "ADMIN_API_KEY missing from .env"
+    fail "ADMIN_API_KEY missing from .admin.env/.env"
   fi
 
   local admin_status
   admin_status="$(
     curl -sS \
       -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-      -o /tmp/jobpulse_smoke_body.out \
+      -o "$BODY_FILE" \
       -w "%{http_code}" \
       "${BASE_URL}/admin/summary" || true
   )"
 
   if [[ "$admin_status" != "200" ]]; then
-    log "BODY=$(cat /tmp/jobpulse_smoke_body.out 2>/dev/null || true)"
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
     fail "admin_with_key expected_http=200 actual_http=$admin_status"
   fi
 
