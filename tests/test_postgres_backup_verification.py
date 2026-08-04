@@ -128,6 +128,10 @@ case "$cmd" in
     ;;
 
   createdb|dropdb)
+    if [[ "$cmd" == "dropdb" && "${FAKE_DROPDB_MODE:-ok}" == "fail" ]]; then
+      echo "fake-docker dropdb: simulated failure" >&2
+      exit 1
+    fi
     exit 0
     ;;
 
@@ -186,11 +190,14 @@ def run_backup(sandbox, mode="ok"):
     )
 
 
-def run_verify(sandbox):
+def run_verify(sandbox, extra_env=None):
+    env = dict(sandbox["env"])
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", str(SCRIPTS / "verify_latest_backup.sh")],
         cwd=REPO_ROOT,
-        env=sandbox["env"],
+        env=env,
         capture_output=True,
         text=True,
     )
@@ -314,3 +321,142 @@ def test_full_workflow_recovers_after_a_corrupt_backup_attempt(sandbox):
 
     verify_result = run_verify(sandbox)
     assert verify_result.returncode == 0, verify_result.stderr
+
+
+# --- Restore-verification log-file hardening -----------------------------
+#
+# Before this fix, a hypothetical fixed path such as
+# /tmp/jobpulse_restore_test.log could fail under Linux's
+# fs.protected_regular behavior if a pre-existing file at that path was
+# owned by another user (a real failure seen in production: "Permission
+# denied"). The fix replaces the fixed path with a unique file created via
+# `mktemp`, restricts its permissions, and always removes it -- and the
+# test-database cleanup itself -- through a single EXIT trap.
+
+FIXED_RESTORE_LOG_PATH = "/tmp/jobpulse_restore_test.log"
+VERIFY_SCRIPT = SCRIPTS / "verify_latest_backup.sh"
+
+
+def _make_corrupt_dump_be_the_newest(sandbox):
+    run_backup(sandbox, mode="ok")
+    good = next(p for p in sandbox["backup_dir"].iterdir() if p.name.endswith(".dump"))
+    corrupt = sandbox["backup_dir"] / "jobpulse_99999999T999999Z.dump"
+    corrupt.write_text("GARBAGE_NOT_A_DUMP")
+    os.utime(corrupt, (good.stat().st_mtime + 100, good.stat().st_mtime + 100))
+    return corrupt
+
+
+def test_verify_script_does_not_reference_fixed_tmp_log_path():
+    text = VERIFY_SCRIPT.read_text()
+    assert FIXED_RESTORE_LOG_PATH not in text
+
+
+def test_verify_script_creates_restore_log_with_mktemp():
+    text = VERIFY_SCRIPT.read_text()
+    assert "mktemp" in text
+    assert "RESTORE_LOG" in text
+
+
+def test_verify_script_traps_database_cleanup_on_exit():
+    text = VERIFY_SCRIPT.read_text()
+    assert "trap cleanup EXIT" in text
+
+
+def test_verifier_restore_pipeline_failure_returns_nonzero(sandbox):
+    _make_corrupt_dump_be_the_newest(sandbox)
+    result = run_verify(sandbox)
+    assert result.returncode != 0
+
+
+def test_verifier_restore_failure_prints_bounded_diagnostic_tail(sandbox):
+    _make_corrupt_dump_be_the_newest(sandbox)
+    result = run_verify(sandbox)
+    combined = result.stdout + result.stderr
+    assert "does not appear to be a valid archive" in combined
+    assert "restore log" in combined.lower()
+    # Bounded: the diagnostic excerpt must be a small, fixed-size tail,
+    # not the entire log dumped to the console.
+    assert combined.count("does not appear to be a valid archive") <= 2
+
+
+def test_verifier_removes_temp_restore_log_on_success(sandbox, tmp_path):
+    scratch_tmpdir = tmp_path / "script_tmp"
+    scratch_tmpdir.mkdir()
+    run_backup(sandbox, mode="ok")
+
+    result = run_verify(sandbox, extra_env={"TMPDIR": str(scratch_tmpdir)})
+
+    assert result.returncode == 0, result.stderr
+    leftovers = list(scratch_tmpdir.glob("jobpulse_restore_test.*"))
+    assert leftovers == [], f"temp restore log(s) left behind: {leftovers}"
+
+
+def test_verifier_removes_temp_restore_log_on_failure(sandbox, tmp_path):
+    scratch_tmpdir = tmp_path / "script_tmp"
+    scratch_tmpdir.mkdir()
+    _make_corrupt_dump_be_the_newest(sandbox)
+
+    result = run_verify(sandbox, extra_env={"TMPDIR": str(scratch_tmpdir)})
+
+    assert result.returncode != 0
+    leftovers = list(scratch_tmpdir.glob("jobpulse_restore_test.*"))
+    assert leftovers == [], f"temp restore log(s) left behind after failure: {leftovers}"
+
+
+def test_verifier_attempts_database_cleanup_after_post_creation_failure(sandbox):
+    _make_corrupt_dump_be_the_newest(sandbox)
+    sandbox["call_log"].write_text("")
+
+    result = run_verify(sandbox)
+    assert result.returncode != 0
+
+    calls = sandbox["call_log"].read_text().splitlines()
+    assert "createdb" in calls, "test database must have been created before the restore was attempted"
+    createdb_idx = calls.index("createdb")
+    trailing_dropdb = [i for i, c in enumerate(calls) if c == "dropdb" and i > createdb_idx]
+    assert trailing_dropdb, "cleanup must attempt to drop the test database after a post-creation failure"
+
+
+def test_verifier_cleanup_failure_does_not_mask_restore_failure(sandbox):
+    _make_corrupt_dump_be_the_newest(sandbox)
+
+    result = run_verify(sandbox, extra_env={"FAKE_DROPDB_MODE": "fail"})
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "does not appear to be a valid archive" in combined, (
+        "the original restore failure must still be reported"
+    )
+    assert "warning" in combined.lower() and "drop" in combined.lower(), (
+        "a cleanup failure must be reported, not silently swallowed"
+    )
+
+
+def test_verifier_ignores_preexisting_hostile_file_at_fixed_path(sandbox, tmp_path):
+    scratch_tmpdir = tmp_path / "script_tmp"
+    scratch_tmpdir.mkdir()
+    hostile = scratch_tmpdir / "jobpulse_restore_test.log"
+    hostile.write_text("PRE-EXISTING HOSTILE CONTENT OWNED BY SOMEONE ELSE")
+
+    run_backup(sandbox, mode="ok")
+    result = run_verify(sandbox, extra_env={"TMPDIR": str(scratch_tmpdir)})
+
+    assert result.returncode == 0, result.stderr
+    assert hostile.read_text() == "PRE-EXISTING HOSTILE CONTENT OWNED BY SOMEONE ELSE", (
+        "the script must never touch a pre-existing file at the old fixed log path"
+    )
+
+
+def test_verifier_ignores_preexisting_hostile_symlink_at_fixed_path(sandbox, tmp_path):
+    scratch_tmpdir = tmp_path / "script_tmp"
+    scratch_tmpdir.mkdir()
+    symlink_target = tmp_path / "should-never-be-created-or-followed"
+    hostile_symlink = scratch_tmpdir / "jobpulse_restore_test.log"
+    hostile_symlink.symlink_to(symlink_target)
+
+    run_backup(sandbox, mode="ok")
+    result = run_verify(sandbox, extra_env={"TMPDIR": str(scratch_tmpdir)})
+
+    assert result.returncode == 0, result.stderr
+    assert hostile_symlink.is_symlink()
+    assert not symlink_target.exists(), "the script must never write through the hostile symlink's target"

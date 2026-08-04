@@ -108,6 +108,20 @@ cd /opt/jobpulse
 ./scripts/restore_verify_postgres_prod.sh
 
 ./scripts/check_postgres_backups.py | python3 -m json.tool
+
+Ad-hoc latest-backup restore check (`scripts/verify_latest_backup.sh`):
+
+An operator-run alternative that restores the newest `.dump` into the
+`jobpulse_restore_test` database and prints row/table checks. It writes its
+restore output to a unique temporary log created with `mktemp` (never a
+fixed `/tmp` path, so a pre-existing file or symlink left by another user
+cannot break or hijack the redirection). On restore failure it prints a
+bounded, sanitized tail of that log. The temporary log and the
+`jobpulse_restore_test` verification database are both cleaned up through a
+single EXIT trap that runs after success, after failure, and after an
+interrupted run; a cleanup failure is reported but never hides the
+original restore/check failure's exit status. It never alters the real
+production database.
 Backup Status
 cd /opt/jobpulse
 
@@ -1409,11 +1423,24 @@ Main workflows:
 
 Expected flow:
 
-Push to main
+Push to main (paths: Dockerfile, requirements*.txt, app/**, scripts/**, config/**)
 → Build JobPulse API Image
-→ Deploy Production
+→ Deploy Production (automatic, via workflow_run on a successful build)
 → VM pulls ghcr.io/mrezamaghouli/jobpulse-api:main
 → Health check
+
+`deploy.yml` no longer has a direct `push` trigger. Automatic production
+deployment fires only from a `workflow_run` completion of "Build JobPulse
+API Image" with `conclusion == 'success'`; a failed, cancelled, or skipped
+build never triggers a deploy. This was fixed because the old direct
+`push` trigger on `frontend/**`/`docs/**`/etc. could race the
+`workflow_run` deploy when a single commit touched both an API-build path
+and a push-trigger path, enqueueing two automatic production deploys for
+one push (`cancel-in-progress: false` meant both could run sequentially).
+`workflow_dispatch` remains available for manual deploys. Frontend/docs-only
+changes (no API-build-path files touched) currently require a manual
+`workflow_dispatch` run of `Deploy Production` until a unified CI/build/deploy
+pipeline is implemented.
 Production Rules
 Do not run docker compose up -d --build on the VM.
 Do not commit .env, .api_keys.env, .admin.env, .admin_token, .telegram_alert.env, .auth, logs, or backups.

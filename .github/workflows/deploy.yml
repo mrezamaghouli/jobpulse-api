@@ -7,17 +7,6 @@ on:
     types:
       - completed
 
-  push:
-    branches:
-      - main
-    paths:
-      - "frontend/**"
-      - "docs/**"
-      - "README.md"
-      - "scripts/deploy_prod_from_ghcr.sh"
-      - "docker-compose.prod.yml"
-      - ".github/workflows/deploy.yml"
-
   workflow_dispatch:
 
 concurrency:
@@ -26,7 +15,7 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
 
     env:

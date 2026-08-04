@@ -20,9 +20,36 @@ echo "Latest backup: $LATEST_BACKUP"
 echo "Backup size:"
 du -h "$LATEST_BACKUP"
 
+# Never use a fixed /tmp path: a pre-existing file or symlink left by
+# another user at a predictable path can make the redirection below fail
+# (or, worse, get silently followed) under Linux fs.protected_regular /
+# fs.protected_symlinks. mktemp guarantees a fresh, uniquely named file
+# that we own.
+RESTORE_LOG="$(mktemp "${TMPDIR:-/tmp}/jobpulse_restore_test.XXXXXX")" || {
+  echo "ERROR: failed to create a temporary restore log" >&2
+  exit 1
+}
+if [ -z "$RESTORE_LOG" ] || [ ! -f "$RESTORE_LOG" ]; then
+  echo "ERROR: failed to create a temporary restore log" >&2
+  exit 1
+fi
+chmod 600 "$RESTORE_LOG"
+
+DB_CREATED=0
+
 cleanup() {
-  docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-    dropdb -U "$DB_USER" --if-exists "$TEST_DB" >/dev/null 2>&1 || true
+  local exit_code=$?
+
+  rm -f "$RESTORE_LOG" || echo "WARNING: failed to remove temporary restore log $RESTORE_LOG" >&2
+
+  if [ "$DB_CREATED" -eq 1 ]; then
+    if ! docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+      dropdb -U "$DB_USER" --if-exists "$TEST_DB" >/dev/null 2>&1; then
+      echo "WARNING: failed to drop temporary verification database $TEST_DB" >&2
+    fi
+  fi
+
+  exit "$exit_code"
 }
 trap cleanup EXIT
 
@@ -33,10 +60,16 @@ docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
 echo "Creating test database..."
 docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
   createdb -U "$DB_USER" "$TEST_DB"
+DB_CREATED=1
 
 echo "Restoring latest backup into test database..."
-cat "$LATEST_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  pg_restore -U "$DB_USER" -d "$TEST_DB" --no-owner --no-privileges --exit-on-error
+if ! cat "$LATEST_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+  pg_restore -U "$DB_USER" -d "$TEST_DB" --no-owner --no-privileges --exit-on-error \
+  >"$RESTORE_LOG" 2>&1; then
+  echo "ERROR: restore failed. Last 20 lines of restore log (sanitized):" >&2
+  tail -n 20 "$RESTORE_LOG" | sed -E 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][A-Za-z_]*[=: ]+)[^[:space:]]+/\1[REDACTED]/g' >&2
+  exit 1
+fi
 
 echo "Checking restored data..."
 docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
