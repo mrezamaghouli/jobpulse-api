@@ -1431,16 +1431,31 @@ Push to main (paths: Dockerfile, requirements*.txt, app/**, scripts/**, config/*
 
 `deploy.yml` no longer has a direct `push` trigger. Automatic production
 deployment fires only from a `workflow_run` completion of "Build JobPulse
-API Image" with `conclusion == 'success'`; a failed, cancelled, or skipped
-build never triggers a deploy. This was fixed because the old direct
-`push` trigger on `frontend/**`/`docs/**`/etc. could race the
-`workflow_run` deploy when a single commit touched both an API-build path
-and a push-trigger path, enqueueing two automatic production deploys for
-one push (`cancel-in-progress: false` meant both could run sequentially).
-`workflow_dispatch` remains available for manual deploys. Frontend/docs-only
-changes (no API-build-path files touched) currently require a manual
-`workflow_dispatch` run of `Deploy Production` until a unified CI/build/deploy
-pipeline is implemented.
+API Image" that was itself triggered by a `push` to `main` and completed
+with `conclusion == 'success'`; a failed, cancelled, or skipped build never
+triggers a deploy. This was fixed because the old direct `push` trigger on
+`frontend/**`/`docs/**`/etc. could race the `workflow_run` deploy when a
+single commit touched both an API-build path and a push-trigger path,
+enqueueing two automatic production deploys for one push
+(`cancel-in-progress: false` meant both could run sequentially).
+
+The `workflow_run` trigger is additionally restricted to `branches: [main]`,
+and the deploy job's `if:` condition separately checks
+`head_branch == 'main'` and `event == 'push'` on the triggering build run.
+Together these mean: manually running "Build JobPulse API Image" via its own
+`workflow_dispatch` does **not** deploy production, even if it succeeds and
+even if it was run against `main`; and a build run against any feature
+branch (whether push- or dispatch-triggered) cannot trigger automatic
+production deployment either, regardless of its outcome. This closes the
+gap where a manually dispatched build against a non-`main` ref -- which
+still publishes the mutable `:main` image tag -- could otherwise cause an
+automatic deploy.
+
+`workflow_dispatch` on `deploy.yml` itself remains available for manual
+production deploys. Use it for frontend/docs-only changes (no API-build-path
+files touched) and for any deploy that should happen without a fresh main
+push-triggered image build, until a unified CI/build/deploy pipeline is
+implemented.
 Production Rules
 Do not run docker compose up -d --build on the VM.
 Do not commit .env, .api_keys.env, .admin.env, .admin_token, .telegram_alert.env, .auth, logs, or backups.

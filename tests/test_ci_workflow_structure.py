@@ -172,6 +172,10 @@ def test_deploy_workflow_retains_workflow_run_trigger_from_build(deploy_workflow
     workflow_run = triggers["workflow_run"]
     assert workflow_run["workflows"] == ["Build JobPulse API Image"]
     assert workflow_run["types"] == ["completed"]
+    assert workflow_run["branches"] == ["main"], (
+        "a manually dispatched or non-main build must not be able to "
+        "arm the automatic deploy trigger"
+    )
 
 
 def test_deploy_workflow_retains_workflow_dispatch_trigger(deploy_workflow):
@@ -190,12 +194,16 @@ def test_deploy_workflow_concurrency_group_still_configured(deploy_workflow):
     )
 
 
-def test_deploy_job_condition_mentions_dispatch_and_successful_workflow_run(deploy_workflow):
+def test_deploy_job_condition_mentions_dispatch_and_successful_main_push_build(deploy_workflow):
     condition = deploy_workflow["jobs"]["deploy"].get("if", "")
     assert "workflow_dispatch" in condition
     assert "workflow_run" in condition
     assert "conclusion" in condition and "success" in condition
-    assert "'push'" not in condition and '"push"' not in condition
+    assert "head_branch" in condition and "main" in condition
+    assert "workflow_run.event ==" in condition and "'push'" in condition, (
+        "'push' must only appear as the required github.event.workflow_run.event "
+        "value (the build's own trigger), never as a direct top-level push trigger"
+    )
 
 
 def _condition_as_python(condition: str) -> str:
@@ -205,6 +213,8 @@ def _condition_as_python(condition: str) -> str:
     gets exercised below."""
     py = condition
     py = py.replace("github.event.workflow_run.conclusion", "event['workflow_run']['conclusion']")
+    py = py.replace("github.event.workflow_run.head_branch", "event['workflow_run']['head_branch']")
+    py = py.replace("github.event.workflow_run.event", "event['workflow_run']['event']")
     py = py.replace("github.event_name", "github['event_name']")
     py = py.replace("||", " or ")
     py = py.replace("&&", " and ")
@@ -212,27 +222,42 @@ def _condition_as_python(condition: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "event_name,conclusion,should_deploy",
+    "event_name,conclusion,head_branch,wr_event,should_deploy,case_id",
     [
-        ("workflow_run", "success", True),
-        ("workflow_run", "failure", False),
-        ("workflow_run", "cancelled", False),
-        ("workflow_run", "skipped", False),
-        ("workflow_dispatch", None, True),
-        ("push", None, False),
+        ("workflow_dispatch", None, None, None, True, "deploy-workflow_dispatch"),
+        ("workflow_run", "success", "main", "push", True, "success-push-main"),
+        ("workflow_run", "failure", "main", "push", False, "failure-push-main"),
+        ("workflow_run", "cancelled", "main", "push", False, "cancelled-push-main"),
+        ("workflow_run", "skipped", "main", "push", False, "skipped-push-main"),
+        ("workflow_run", "success", "feature-branch", "push", False, "success-push-feature"),
+        ("workflow_run", "success", "main", "workflow_dispatch", False, "success-dispatch-main"),
+        ("workflow_run", "success", "feature-branch", "workflow_dispatch", False, "success-dispatch-feature"),
+        ("push", None, None, None, False, "unrelated-push-event"),
+    ],
+    ids=[
+        "deploy-workflow_dispatch",
+        "success-push-main",
+        "failure-push-main",
+        "cancelled-push-main",
+        "skipped-push-main",
+        "success-push-feature",
+        "success-dispatch-main",
+        "success-dispatch-feature",
+        "unrelated-push-event",
     ],
 )
-def test_deploy_condition_only_fires_on_dispatch_or_successful_build(
-    deploy_workflow, event_name, conclusion, should_deploy
+def test_deploy_condition_only_fires_on_dispatch_or_successful_main_push_build(
+    deploy_workflow, event_name, conclusion, head_branch, wr_event, should_deploy, case_id
 ):
     condition = deploy_workflow["jobs"]["deploy"]["if"]
     py_expr = _condition_as_python(condition)
 
     github = {"event_name": event_name}
-    event = {"workflow_run": {"conclusion": conclusion}}
+    event = {"workflow_run": {"conclusion": conclusion, "head_branch": head_branch, "event": wr_event}}
 
     result = eval(py_expr, {"__builtins__": {}}, {"github": github, "event": event})
     assert result is should_deploy, (
-        f"event_name={event_name!r} conclusion={conclusion!r}: "
+        f"[{case_id}] event_name={event_name!r} conclusion={conclusion!r} "
+        f"head_branch={head_branch!r} workflow_run.event={wr_event!r}: "
         f"expected should_deploy={should_deploy}, condition evaluated to {result!r}"
     )
