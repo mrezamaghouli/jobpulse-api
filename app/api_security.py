@@ -27,7 +27,7 @@ PROTECTED_PREFIXES = (
 _rate_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
-def _configured_api_keys() -> set[str]:
+def get_configured_public_api_keys() -> set[str]:
     raw = os.getenv("JOBPULSE_PUBLIC_API_KEYS", "").strip()
     if not raw:
         return set()
@@ -101,7 +101,7 @@ async def public_api_security_middleware(request: Request, call_next):
     if _is_open_path(path) or not _is_protected_path(path):
         return await call_next(request)
 
-    configured_keys = _configured_api_keys()
+    configured_keys = get_configured_public_api_keys()
 
     # Fail closed when public endpoints are protected but no key is configured.
     if not configured_keys:
@@ -109,7 +109,11 @@ async def public_api_security_middleware(request: Request, call_next):
             status_code=503,
             content={
                 "error": "api_key_not_configured",
-                "message": "Public API key protection is enabled, but no API keys are configured.",
+                "message": (
+                    "Public API key protection is enabled, but no API keys are "
+                    "configured. Set JOBPULSE_PUBLIC_API_KEYS to one or more "
+                    "comma-separated keys (see docs/PRODUCTION_RUNBOOK.md)."
+                ),
             },
         )
 

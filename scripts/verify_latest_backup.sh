@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-BACKUP_DIR="/opt/jobpulse/backups"
-COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"
-DB_SERVICE="db"
-DB_USER="jobpulse_user"
-DB_NAME="jobpulse"
-TEST_DB="jobpulse_restore_test"
+cd "$(dirname "$0")/.."
 
-LATEST_BACKUP="$(ls -1t "$BACKUP_DIR"/jobpulse_*.sql 2>/dev/null | head -n 1 || true)"
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+DB_SERVICE="${JOBPULSE_DB_SERVICE:-db}"
+DB_USER="${POSTGRES_USER:-jobpulse_user}"
+BACKUP_DIR="${JOBPULSE_BACKUP_DIR:-/opt/jobpulse/backups/postgres}"
+TEST_DB="${JOBPULSE_VERIFY_DB:-jobpulse_restore_test}"
+
+LATEST_BACKUP="$(ls -1t "$BACKUP_DIR"/*.dump 2>/dev/null | head -n 1 || true)"
 
 if [ -z "$LATEST_BACKUP" ]; then
-  echo "ERROR: No backup file found in $BACKUP_DIR"
+  echo "ERROR: No .dump backup found in $BACKUP_DIR"
   exit 1
 fi
 
@@ -19,20 +20,56 @@ echo "Latest backup: $LATEST_BACKUP"
 echo "Backup size:"
 du -h "$LATEST_BACKUP"
 
-cd /opt/jobpulse
+# Never use a fixed /tmp path: a pre-existing file or symlink left by
+# another user at a predictable path can make the redirection below fail
+# (or, worse, get silently followed) under Linux fs.protected_regular /
+# fs.protected_symlinks. mktemp guarantees a fresh, uniquely named file
+# that we own.
+RESTORE_LOG="$(mktemp "${TMPDIR:-/tmp}/jobpulse_restore_test.XXXXXX")" || {
+  echo "ERROR: failed to create a temporary restore log" >&2
+  exit 1
+}
+if [ -z "$RESTORE_LOG" ] || [ ! -f "$RESTORE_LOG" ]; then
+  echo "ERROR: failed to create a temporary restore log" >&2
+  exit 1
+fi
+chmod 600 "$RESTORE_LOG"
+
+DB_CREATED=0
+
+cleanup() {
+  local exit_code=$?
+
+  rm -f "$RESTORE_LOG" || echo "WARNING: failed to remove temporary restore log $RESTORE_LOG" >&2
+
+  if [ "$DB_CREATED" -eq 1 ]; then
+    if ! docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+      dropdb -U "$DB_USER" --if-exists "$TEST_DB" >/dev/null 2>&1; then
+      echo "WARNING: failed to drop temporary verification database $TEST_DB" >&2
+    fi
+  fi
+
+  exit "$exit_code"
+}
+trap cleanup EXIT
 
 echo "Dropping old test database if exists..."
 docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  psql -U "$DB_USER" -d postgres -c "DROP DATABASE IF EXISTS $TEST_DB;"
+  dropdb -U "$DB_USER" --if-exists "$TEST_DB" >/dev/null 2>&1 || true
 
 echo "Creating test database..."
 docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  psql -U "$DB_USER" -d postgres -c "CREATE DATABASE $TEST_DB;"
+  createdb -U "$DB_USER" "$TEST_DB"
+DB_CREATED=1
 
 echo "Restoring latest backup into test database..."
-cat "$LATEST_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  psql -U "$DB_USER" -d "$TEST_DB" >/tmp/jobpulse_restore_test.log 2>& -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  psql -U "$DB_USER" -d "$TEST_DB" >/tmp1
+if ! cat "$LATEST_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+  pg_restore -U "$DB_USER" -d "$TEST_DB" --no-owner --no-privileges --exit-on-error \
+  >"$RESTORE_LOG" 2>&1; then
+  echo "ERROR: restore failed. Last 20 lines of restore log (sanitized):" >&2
+  tail -n 20 "$RESTORE_LOG" | sed -E 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][A-Za-z_]*[=: ]+)[^[:space:]]+/\1[REDACTED]/g' >&2
+  exit 1
+fi
 
 echo "Checking restored data..."
 docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
@@ -60,8 +97,4 @@ WHERE table_schema='public'
 ORDER BY table_name;
 "
 
-echo "Cleaning up test database..."
-docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-  psql -U "$DB_USER" -d postgres -c "DROP DATABASE IF EXISTS $TEST_DB;"
-
-echo "OK: latest backup restore test passed ✅"
+echo "OK: latest backup restore test passed"

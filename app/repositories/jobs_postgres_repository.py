@@ -14,7 +14,41 @@ from app.postgres_database import get_postgres_connection
 
 
 from app.search_intelligence import record_job_search_event
-from app.search_quality import rerank_jobs
+from app.search_quality import quality_score as text_relevance_quality_score
+
+# Canonical INTRINSIC quality formula: an exact SQL port of
+# calculate_quality_score() (structural posting completeness -- logo,
+# apply_url, description, company LinkedIn URL). This is the only quality
+# signal meaningful for filters-only/no-query browsing, where there is no
+# free-text query for a lexical/text-relevance quality score to apply to.
+# Weights sum to 1.0, so the result is already bounded to [0, 1].
+QUALITY_SCORE_SQL = """
+    (
+        CASE WHEN j.company_logo_url IS NOT NULL AND j.company_logo_url != '' THEN 0.30 ELSE 0 END +
+        CASE WHEN j.apply_url IS NOT NULL AND j.apply_url != '' THEN 0.25 ELSE 0 END +
+        CASE WHEN j.job_description IS NOT NULL AND j.job_description != '' THEN 0.25 ELSE 0 END +
+        CASE WHEN j.company_linkedin_url IS NOT NULL AND j.company_linkedin_url != '' THEN 0.20 ELSE 0 END
+    )
+"""
+
+# Exact SQL equivalent of backend_relevance_value() for rows that never went
+# through the free-text hybrid path (match_score is always 0 there, since
+# search_score is only ever populated for hybrid/query results). Used to rank
+# the FULL filtered candidate set in SQL, before LIMIT/OFFSET, when
+# sort_by=relevance is requested without a query -- see get_all_jobs_from_db.
+RELEVANCE_SCORE_SQL = f"""
+    (({QUALITY_SCORE_SQL}) * 0.15)
+    +
+    (
+        CASE
+            WHEN COALESCE(j.date_posted_at, j.first_seen_at, j.last_seen_at) >= NOW() - INTERVAL '24 hours' THEN 0.10
+            WHEN COALESCE(j.date_posted_at, j.first_seen_at, j.last_seen_at) >= NOW() - INTERVAL '72 hours' THEN 0.06
+            WHEN COALESCE(j.date_posted_at, j.first_seen_at, j.last_seen_at) >= NOW() - INTERVAL '168 hours' THEN 0.03
+            ELSE 0
+        END
+    )
+"""
+
 JOB_SELECT_COLUMNS = """
     id,
     linkedin_job_id,
@@ -54,12 +88,28 @@ JOB_SELECT_COLUMNS = """
 """
 
 
+# Single shared allowlist for every public sort_by value, mapping the
+# external, user-facing name to the actual (unqualified) jobs table column
+# to sort on. Used by get_safe_sort_clause, the filters-only SQL ORDER BY in
+# get_all_jobs_from_db, and the hybrid path's sort_ranked_candidates -- one
+# allowlist so a sort_by value can never be interpolated into SQL directly
+# and so all three call sites can never drift out of sync with each other.
+#
+# date_posted_at (TIMESTAMP, nullable) is the canonical posted-time column:
+# it holds the real timestamp collectors captured from the listing, and is
+# already what the relevance/freshness formulas key off (see
+# RELEVANCE_SCORE_SQL / freshness_boost_for_relevance).
+# date_posted (TEXT, always populated) is a legacy column collectors fill
+# with the collector's *run date* (str(date.today())), not the job's actual
+# posting date -- it is kept only as a public compatibility alias and always
+# resolves to the same date_posted_at ordering, never sorted on directly.
 ALLOWED_SORT_FIELDS = {
     "id": "id",
     "title": "title",
     "company": "company",
     "location": "location",
-    "date_posted": "date_posted",
+    "date_posted_at": "date_posted_at",
+    "date_posted": "date_posted_at",
     "first_seen_at": "first_seen_at",
     "last_seen_at": "last_seen_at",
     "salary_min": "salary_min",
@@ -220,8 +270,43 @@ def build_jobs_filters(
     return "", params
 
 
+def get_safe_quality_threshold():
+    """Safely parses JOB_SEARCH_MIN_QUALITY_SCORE: trims whitespace, falls
+    back to the 0.18 default for anything unset or unparsable (never raises,
+    so a misconfigured value cannot crash a search request), and clamps the
+    result into [0.0, 1.0] so an out-of-range value cannot silently disable
+    filtering (e.g. a huge number) or make it reject everything (e.g. a
+    negative number misread as "very strict"). The raw malformed value is
+    never echoed back -- only whether parsing succeeded matters. Shared by
+    both the filters-only and hybrid paths so there is exactly one parser
+    for this threshold."""
+    default = 0.18
+    raw = os.getenv("JOB_SEARCH_MIN_QUALITY_SCORE", str(default))
+
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+    # float() parses "nan"/"NaN"/"inf"/"Infinity"/"-Infinity" without
+    # raising, so a non-finite value would otherwise slip past the except
+    # above -- math.isfinite() is required to actually reject them.
+    if not math.isfinite(value):
+        return default
+
+    return max(0.0, min(value, 1.0))
+
+
+def get_quality_filter_enabled():
+    """Safely parses JOB_SEARCH_FILTER_LOW_QUALITY. Shared by both the
+    filters-only and hybrid paths so there is exactly one parser."""
+    raw = os.getenv("JOB_SEARCH_FILTER_LOW_QUALITY", "true")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_safe_sort_clause(sort_by=None, sort_order=None):
-    sort_field = ALLOWED_SORT_FIELDS.get(sort_by or "last_seen_at", "last_seen_at")
+    normalized_sort_by = str(sort_by or "").strip().lower()
+    sort_field = ALLOWED_SORT_FIELDS.get(normalized_sort_by, "last_seen_at")
 
     normalized_sort_order = str(sort_order or "desc").lower()
 
@@ -233,7 +318,7 @@ def get_safe_sort_clause(sort_by=None, sort_order=None):
     if sort_field in [
         "salary_min",
         "salary_max",
-        "date_posted",
+        "date_posted_at",
         "first_seen_at",
         "last_seen_at",
     ]:
@@ -254,9 +339,11 @@ def extract_search_query_from_kwargs(kwargs):
     )
 
 def get_jobs_from_db(**kwargs):
-    result = get_all_jobs_from_db(**kwargs)
-    query = extract_search_query_from_kwargs(kwargs)
-    return rerank_jobs(result, query)
+    # get_all_jobs_from_db is the single owner of filtering, quality
+    # eligibility, relevance scoring, ordering, total/total_pages
+    # calculation, and pagination -- its result is already final. Nothing
+    # here may filter or reorder an already-paginated page.
+    return get_all_jobs_from_db(**kwargs)
 
 
 
@@ -404,13 +491,13 @@ def search_jobs_from_db(**kwargs):
     response_meta = build_search_response_metadata(kwargs, data)
 
     if isinstance(data, dict):
+        # get_all_jobs_from_db is the single owner of ordering: both the
+        # filters-only path (SQL ORDER BY RELEVANCE_SCORE_SQL) and the
+        # hybrid path (final_score sort before slicing) already return this
+        # page in the correct, final order. Nothing here may re-sort or
+        # re-filter it -- that would reorder/drop rows on an already-built
+        # page, which is exactly the bug this pipeline was fixed to remove.
         results = data.get("results", [])
-
-        if str(kwargs.get("sort_by") or "").lower() == "relevance":
-            results = sort_results_by_backend_relevance(
-                results,
-                kwargs.get("sort_order") or "desc",
-            )
 
         total = data.get("total")
         if total is None:
@@ -751,6 +838,35 @@ def serialize_search_result(row, score=None):
     return serialized
 
 
+def sort_ranked_candidates(ranked, sort_by, sort_order):
+    """The single, final sort for the hybrid path's complete (score, row)
+    candidate set -- called exactly once, after the relevance threshold and
+    quality gate, before slicing. Honors the requested sort_by/sort_order
+    (accepting exactly the same field names as ALLOWED_SORT_FIELDS, plus the
+    virtual "relevance" field), with a deterministic id tie-break and
+    NULLS-LAST handling so no field's missing values can crash the sort or
+    produce an unstable page boundary."""
+    reverse = str(sort_order or "desc").lower() != "asc"
+    normalized_sort_by = str(sort_by or "").strip().lower()
+
+    if normalized_sort_by == "relevance":
+        ranked.sort(key=lambda item: (item[0], int(item[1].get("id") or 0)), reverse=reverse)
+        return ranked
+
+    field = ALLOWED_SORT_FIELDS.get(normalized_sort_by, "last_seen_at")
+
+    non_null = [item for item in ranked if item[1].get(field) is not None]
+    null_items = [item for item in ranked if item[1].get(field) is None]
+
+    non_null.sort(
+        key=lambda item: (item[1].get(field), int(item[1].get("id") or 0)),
+        reverse=reverse,
+    )
+    null_items.sort(key=lambda item: int(item[1].get("id") or 0), reverse=reverse)
+
+    return non_null + null_items
+
+
 def get_all_jobs_from_db(
     query=None,
     title=None,
@@ -893,24 +1009,35 @@ def get_all_jobs_from_db(
         if where_clauses:
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
-        allowed_sort_columns = {
-            "id": "j.id",
-            "title": "j.title",
-            "company": "j.company",
-            "location": "j.location",
-            "date_posted": "j.date_posted",
-            "first_seen_at": "j.first_seen_at",
-            "last_seen_at": "j.last_seen_at",
-            "salary_min": "j.salary_min",
-            "salary_max": "j.salary_max",
-        }
-
-        safe_sort_by = allowed_sort_columns.get(sort_by, "j.last_seen_at")
-        safe_sort_order = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+        # Filters-only SQL sort column: resolved from the same shared
+        # ALLOWED_SORT_FIELDS allowlist as get_safe_sort_clause and the
+        # hybrid path's sort_ranked_candidates, so "relevance" (handled
+        # separately below) and any unrecognized value both fall back
+        # deterministically to last_seen_at, and a sort_by value is never
+        # interpolated into SQL directly.
+        normalized_sort_by = str(sort_by or "").strip().lower()
+        safe_sort_by = f"j.{ALLOWED_SORT_FIELDS.get(normalized_sort_by, 'last_seen_at')}"
+        safe_sort_order = "ASC" if str(sort_order or "").strip().lower() == "asc" else "DESC"
 
         use_hybrid_search = bool(query and str(query).strip())
 
         if not use_hybrid_search:
+            filter_low_quality = get_quality_filter_enabled()
+
+            # Quality ELIGIBILITY (drop) is a separate concern from relevance
+            # ORDERING below: apply it as a WHERE condition, shared by the
+            # COUNT and SELECT queries, so total/total_pages always describe
+            # the exact same eligible set that is actually paginated -- never
+            # a post-pagination filter that could underfill an already-built
+            # page.
+            if filter_low_quality:
+                min_quality_score = get_safe_quality_threshold()
+                where_clauses.append(f"({QUALITY_SCORE_SQL}) >= %s")
+                params.append(min_quality_score)
+
+                if where_clauses:
+                    where_sql = "WHERE " + " AND ".join(where_clauses)
+
             cursor.execute(
                 f"""
                 SELECT COUNT(*) AS total
@@ -923,15 +1050,34 @@ def get_all_jobs_from_db(
             total_row = cursor.fetchone()
             total = total_row["total"] if total_row else 0
 
+            sort_by_relevance_without_query = str(sort_by or "").lower() == "relevance"
+
+            if sort_by_relevance_without_query:
+                # Rank the COMPLETE filtered candidate set by the same
+                # formula backend_relevance_value() uses, before LIMIT/OFFSET
+                # -- not by recency, with Python re-ranking only the already
+                # -sliced page afterward (which can never surface a
+                # candidate SQL already excluded).
+                order_by_sql = f"""
+                    ORDER BY
+                        ({RELEVANCE_SCORE_SQL}) {safe_sort_order},
+                        j.last_seen_at {safe_sort_order} NULLS LAST,
+                        j.id {safe_sort_order}
+                """
+            else:
+                order_by_sql = f"""
+                    ORDER BY
+                        {safe_sort_by} {safe_sort_order} NULLS LAST,
+                        j.id DESC
+                """
+
             cursor.execute(
                 f"""
                 SELECT
                     {JOB_SELECT_COLUMNS}
                 FROM jobs j
                 {where_sql}
-                ORDER BY
-                    {safe_sort_by} {safe_sort_order} NULLS LAST,
-                    j.id DESC
+                {order_by_sql}
                 LIMIT %s
                 OFFSET %s;
                 """,
@@ -1036,8 +1182,10 @@ def get_all_jobs_from_db(
 
             ranked.append((final_score, row))
 
-        ranked.sort(key=lambda item: (item[0], item[1].get("id") or 0), reverse=True)
-
+        # No sort here: the relevance-threshold filter below only inspects
+        # scores (order-independent), and the quality gate after it only
+        # filters too. The single, sort_by/sort_order-aware final sort runs
+        # once, after both, immediately before slicing -- see below.
 
         # Do not treat weak fuzzy/semantic matches as real inventory.
         # Multi-word searches must pass a stronger relevance threshold.
@@ -1054,6 +1202,37 @@ def get_all_jobs_from_db(
             for item in ranked
             if float(item[0] or 0) >= min_relevance_score
         ]
+
+        # Quality eligibility (text-relevance-blended, since a free-text
+        # query exists here) is applied to the COMPLETE relevance-thresholded
+        # candidate set, before slicing -- not as a second reranker run on
+        # an already-paginated page afterward. Reuses search_quality.py's
+        # quality_score() so there is exactly one text-relevance quality
+        # formula, not a duplicate. This is a keep/drop gate only; it does
+        # not sort -- the single final sort happens next.
+        filter_low_quality = get_quality_filter_enabled()
+        min_quality_score = get_safe_quality_threshold()
+
+        quality_eligible = []
+        for score, row in ranked:
+            job_for_quality = dict(row)
+            job_for_quality["search_score"] = score
+            combined_quality, quality_reasons = text_relevance_quality_score(query, job_for_quality)
+
+            if filter_low_quality and combined_quality < min_quality_score:
+                continue
+
+            annotated_row = dict(row)
+            annotated_row["quality_score"] = combined_quality
+            annotated_row["quality_reasons"] = quality_reasons
+            quality_eligible.append((score, annotated_row))
+
+        ranked = quality_eligible
+
+        # The single, final, sort_by/sort_order-aware sort over the complete
+        # eligible set -- after relevance threshold and quality gate, before
+        # slicing. Nothing after this point may reorder or drop rows.
+        ranked = sort_ranked_candidates(ranked, sort_by, sort_order)
 
         total = len(ranked)
         page_items = ranked[offset:offset + safe_limit]

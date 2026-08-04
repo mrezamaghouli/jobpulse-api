@@ -1,10 +1,32 @@
+import os
 import re
-from datetime import date
+import sys
+import time
+from datetime import date, datetime, timezone
 
 import psycopg2
 
 from app.config import get_postgres_config
 from scripts.providers.provider_factory import get_job_provider
+from scripts.collector_result import (
+    CollectorResult,
+    ERROR_CATEGORY_FETCH,
+    ERROR_CATEGORY_INTERNAL,
+    ERROR_CATEGORY_PERSIST,
+    OUTCOME_FAILED_FETCH,
+    OUTCOME_FAILED_INTERNAL,
+    OUTCOME_FAILED_PERSIST,
+    RESULT_PATH_ENV_VAR,
+    ROW_OUTCOME_FILTERED_HEADER_ARTIFACT,
+    ROW_OUTCOME_FILTERED_MISSING_IDENTIFIER,
+    ROW_OUTCOME_INSERTED,
+    ROW_OUTCOME_UPDATED_EXISTING,
+    SCHEMA_VERSION,
+    SUCCESS_OUTCOMES,
+    determine_outcome,
+    sanitize_error_text,
+    write_result_atomic,
+)
 
 
 def extract_linkedin_job_id_from_url(value):
@@ -354,7 +376,49 @@ def sanitize_linkedin_apply_fields(job):
     return job
 
 
+class UpsertEvidenceError(RuntimeError):
+    """Raised when the RETURNING (xmax = 0) AS inserted clause on
+    insert_job()'s own UPSERT did not produce conclusive boolean
+    evidence: no row at all, a null value, or any non-boolean value.
+
+    An inconclusive read is NEVER treated as "not inserted" / "updated
+    existing" -- that would be reporting an unproven guess as proven
+    evidence, the same category of defect this whole schema exists to
+    eliminate. The caller (collect_jobs_to_postgres()) catches this like
+    any other persistence-layer exception: the transaction is rolled
+    back, the row is counted as a persistence_error, and the whole run
+    is reported as failed_persist with a non-zero exit code -- it is
+    never silently absorbed into a technical-success outcome.
+    """
+
+
+def _interpret_upsert_returning(row) -> str:
+    """Strictly validates the single RETURNING row from insert_job()'s
+    UPSERT statement. Only an ACTUAL Python bool (which is exactly what
+    psycopg2 produces for a real PostgreSQL `boolean` RETURNING
+    expression) is accepted -- not a truthy/falsy value of any other
+    type (0/1, "true"/"false" strings, etc.), and not a missing row or a
+    null value."""
+    if row is None:
+        raise UpsertEvidenceError("UPSERT RETURNING produced no row")
+
+    value = row[0]
+
+    if not isinstance(value, bool):
+        raise UpsertEvidenceError(
+            f"UPSERT RETURNING produced inconclusive evidence (expected bool, got {type(value).__name__})"
+        )
+
+    return ROW_OUTCOME_INSERTED if value else ROW_OUTCOME_UPDATED_EXISTING
+
+
 def insert_job(cursor, job):
+    """Attempts to upsert one normalized job row.
+
+    Returns an explicit ROW_OUTCOME_* string on every path -- including
+    every early return -- never None. The caller must count based on this
+    return value, never on the mere fact that insert_job() was called.
+    """
     job = sanitize_linkedin_apply_fields(job)
     job = truncate_job_varchar_fields(job)
 
@@ -366,7 +430,13 @@ def insert_job(cursor, job):
             "|",
             job.get("company"),
         )
-        return
+        # Distinct from ROW_OUTCOME_FILTERED_MISSING_IDENTIFIER below: this
+        # row is a LinkedIn search-results header artifact (e.g. "500+
+        # Software Engineer Jobs in Germany"), not a real job listing that
+        # merely lacks an identifier. Conflating the two previously hid how
+        # much of a query's "filtered" output was junk-row noise versus a
+        # real job LinkedIn simply didn't expose an ID for.
+        return ROW_OUTCOME_FILTERED_HEADER_ARTIFACT
 
     # If provider returns an empty ID, try to recover it from job_url/apply_url.
     # If it still cannot be recovered, skip it to avoid unique constraint errors on "".
@@ -400,7 +470,7 @@ def insert_job(cursor, job):
             "|",
             job.get("company"),
         )
-        return
+        return ROW_OUTCOME_FILTERED_MISSING_IDENTIFIER
 
     job["linkedin_job_id"] = linkedin_job_id
 
@@ -512,53 +582,204 @@ def insert_job(cursor, job):
             date_posted = COALESCE(EXCLUDED.date_posted, jobs.date_posted),
 
             last_seen_at = CURRENT_TIMESTAMP,
-            is_active = TRUE;
+            is_active = TRUE
+        RETURNING (xmax = 0) AS inserted;
         """,
         job,
     )
 
+    # `xmax = 0` is a PostgreSQL-SPECIFIC system-column technique for
+    # distinguishing an INSERT ... ON CONFLICT DO UPDATE statement's two
+    # branches from its own RETURNING clause -- it is NOT a SQL-standard
+    # or officially-guaranteed feature; it is an accepted, widely-deployed
+    # convention that depends on PostgreSQL's own MVCC implementation
+    # details (a row's `xmax` system column is unset (0) for a tuple's
+    # very first version, and is set to the current transaction's ID the
+    # moment any UPDATE touches it). This is per-statement,
+    # transaction-safe evidence from the exact SQL this collector
+    # executed -- not an approximation, and not a pre-SELECT-then-INSERT
+    # race (there is no separate SELECT: the single INSERT statement both
+    # performs the write and proves which branch fired). Its exact
+    # behavior against this schema, its constraints, and any triggers on
+    # `jobs` is validated by a real PostgreSQL 16 integration test in
+    # tests/test_upsert_returning_integration.py -- see
+    # docs/PRODUCTION_RUNBOOK.md for whether that test has actually been
+    # run in this environment (it requires either local PostgreSQL 16
+    # binaries or a disposable test DSN; a mocked-cursor unit test alone
+    # proves only that the SQL string is well-formed, never that
+    # PostgreSQL 16 executes it as expected).
+    row = cursor.fetchone()
+    return _interpret_upsert_returning(row)
 
-def collect_jobs_to_postgres():
-    provider = get_job_provider()
 
-    raw_jobs = provider.fetch_jobs()
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    connection = psycopg2.connect(**get_postgres_config())
-    cursor = connection.cursor()
 
-    ensure_jobs_runtime_columns(cursor)
+def _build_result(started_at, started_monotonic, provider_name, counters, outcome,
+                   error_category=None, sanitized_error=None) -> CollectorResult:
+    return CollectorResult(
+        schema_version=SCHEMA_VERSION,
+        provider=provider_name,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        duration_seconds=round(time.monotonic() - started_monotonic, 2),
+        jobs_discovered=counters["jobs_discovered"],
+        jobs_valid=counters["jobs_valid"],
+        jobs_filtered_invalid=counters["jobs_filtered_invalid"],
+        jobs_filtered_non_linkedin=counters["jobs_filtered_non_linkedin"],
+        jobs_filtered_header_artifact=counters["jobs_filtered_header_artifact"],
+        jobs_filtered_missing_identifier=counters["jobs_filtered_missing_identifier"],
+        rows_inserted=counters["rows_inserted"],
+        rows_updated_existing=counters["rows_updated_existing"],
+        persistence_errors=counters["persistence_errors"],
+        outcome=outcome,
+        error_category=error_category,
+        sanitized_error=sanitized_error,
+    )
 
-    inserted_or_updated_count = 0
-    skipped_duplicate_count = 0
-    skipped_non_linkedin_count = 0
-    skipped_invalid_count = 0
 
-    for raw_job in raw_jobs:
-        normalized_job = normalize_job(raw_job)
+def _finalize(result: CollectorResult, result_path) -> int:
+    """Writes the result document (if a path is configured) and prints one
+    short prefixed summary line for operators. The summary line is for
+    humans only -- no caller may parse it; the result file is the only
+    machine-readable contract. Returns the process exit code: 0 for any
+    success_* outcome, 1 for any failed_* outcome, and -- independent of
+    the outcome above -- a failed result-file write always forces a
+    non-zero return, since an unrecorded outcome cannot be trusted by any
+    caller reading the result path."""
+    print(f"COLLECTOR_RESULT outcome={result.outcome} "
+          f"discovered={result.jobs_discovered} valid={result.jobs_valid} "
+          f"inserted={result.rows_inserted} updated_existing={result.rows_updated_existing} "
+          f"persistence_errors={result.persistence_errors}")
 
-        if not is_valid_job(normalized_job):
-            skipped_invalid_count += 1
-            continue
+    exit_code = 0 if result.outcome in SUCCESS_OUTCOMES else 1
 
-        if not is_linkedin_job(normalized_job):
-            skipped_non_linkedin_count += 1
-            continue
+    if result_path:
+        try:
+            write_result_atomic(result_path, result)
+        except Exception as exc:
+            print(f"COLLECTOR_RESULT_WRITE_FAILED path={result_path} error={sanitize_error_text(exc)}", file=sys.stderr)
+            return 1
 
-        insert_job(cursor, normalized_job)
-        inserted_or_updated_count += 1
+    return exit_code
 
-    connection.commit()
 
-    cursor.close()
-    connection.close()
+def collect_jobs_to_postgres() -> int:
+    """Runs one collection pass and returns a process exit code (0/1).
 
-    print("LinkedIn PostgreSQL collector finished successfully.")
-    print(f"Provider: {provider.__class__.__name__}")
-    print(f"Inserted or updated LinkedIn jobs: {inserted_or_updated_count}")
-    print(f"Skipped duplicate jobs: {skipped_duplicate_count}")
-    print(f"Skipped non-LinkedIn jobs: {skipped_non_linkedin_count}")
-    print(f"Skipped invalid jobs: {skipped_invalid_count}")
+    Every input row produces an explicit, provable outcome -- nothing is
+    ever counted as inserted/updated unless the corresponding SQL
+    statement's own RETURNING evidence proves it (see insert_job()).
+    There is deliberately no whole-table COUNT(*) before/after delta
+    anywhere in this function: a global count cannot distinguish this
+    collector's own writes from a concurrent process's inserts/deletes
+    happening in the same window, so it is never used as insert proof.
+    """
+    started_at = _now_iso()
+    started_monotonic = time.monotonic()
+    result_path = os.getenv(RESULT_PATH_ENV_VAR)
+
+    counters = {
+        "jobs_discovered": 0,
+        "jobs_valid": 0,
+        "jobs_filtered_invalid": 0,
+        "jobs_filtered_non_linkedin": 0,
+        "jobs_filtered_header_artifact": 0,
+        "jobs_filtered_missing_identifier": 0,
+        "rows_inserted": 0,
+        "rows_updated_existing": 0,
+        "persistence_errors": 0,
+    }
+
+    try:
+        provider = get_job_provider()
+        provider_name = provider.__class__.__name__
+    except Exception as exc:
+        result = _build_result(
+            started_at, started_monotonic, "unknown", counters,
+            OUTCOME_FAILED_INTERNAL, ERROR_CATEGORY_INTERNAL, sanitize_error_text(exc),
+        )
+        return _finalize(result, result_path)
+
+    try:
+        raw_jobs = provider.fetch_jobs()
+    except Exception as exc:
+        result = _build_result(
+            started_at, started_monotonic, provider_name, counters,
+            OUTCOME_FAILED_FETCH, ERROR_CATEGORY_FETCH, sanitize_error_text(exc),
+        )
+        return _finalize(result, result_path)
+
+    counters["jobs_discovered"] = len(raw_jobs)
+
+    connection = None
+    try:
+        connection = psycopg2.connect(**get_postgres_config())
+        cursor = connection.cursor()
+
+        ensure_jobs_runtime_columns(cursor)
+
+        for raw_job in raw_jobs:
+            normalized_job = normalize_job(raw_job)
+
+            if not is_valid_job(normalized_job):
+                counters["jobs_filtered_invalid"] += 1
+                continue
+
+            if not is_linkedin_job(normalized_job):
+                counters["jobs_filtered_non_linkedin"] += 1
+                continue
+
+            counters["jobs_valid"] += 1
+
+            row_outcome = insert_job(cursor, normalized_job)
+
+            if row_outcome == ROW_OUTCOME_INSERTED:
+                counters["rows_inserted"] += 1
+            elif row_outcome == ROW_OUTCOME_UPDATED_EXISTING:
+                counters["rows_updated_existing"] += 1
+            elif row_outcome == ROW_OUTCOME_FILTERED_HEADER_ARTIFACT:
+                counters["jobs_filtered_header_artifact"] += 1
+            elif row_outcome == ROW_OUTCOME_FILTERED_MISSING_IDENTIFIER:
+                counters["jobs_filtered_missing_identifier"] += 1
+            else:
+                # Defensive: insert_job() must always return a known
+                # ROW_OUTCOME_* value. An unrecognized outcome is treated
+                # as neither a write nor a filter -- it is simply not
+                # counted as anything provable, rather than guessed.
+                pass
+
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+    except Exception as exc:
+        counters["persistence_errors"] += 1
+
+        if connection is not None:
+            try:
+                connection.rollback()
+                connection.close()
+            except Exception:
+                pass
+
+        result = _build_result(
+            started_at, started_monotonic, provider_name, counters,
+            OUTCOME_FAILED_PERSIST, ERROR_CATEGORY_PERSIST, sanitize_error_text(exc),
+        )
+        return _finalize(result, result_path)
+
+    outcome = determine_outcome(
+        jobs_discovered=counters["jobs_discovered"],
+        rows_inserted=counters["rows_inserted"],
+        rows_updated_existing=counters["rows_updated_existing"],
+        persistence_errors=counters["persistence_errors"],
+    )
+
+    result = _build_result(started_at, started_monotonic, provider_name, counters, outcome)
+    return _finalize(result, result_path)
 
 
 if __name__ == "__main__":
-    collect_jobs_to_postgres()
+    sys.exit(collect_jobs_to_postgres())

@@ -6,7 +6,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
-from app.api_security import public_api_security_middleware
+from app.api_cache import SimpleApiCacheMiddleware
+from app.api_security import get_configured_public_api_keys, public_api_security_middleware
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -42,6 +43,12 @@ logging.basicConfig(
 
 logger = logging.getLogger("jobpulse")
 
+if APP_ENV == "production" and not get_configured_public_api_keys():
+    logger.warning(
+        "JOBPULSE_PUBLIC_API_KEYS is not set. Every /jobs* request will return "
+        "503 until at least one key is configured (see docs/PRODUCTION_RUNBOOK.md)."
+    )
+
 
 app = FastAPI(
     title=APP_NAME,
@@ -63,6 +70,17 @@ def get_cors_origins() -> list[str]:
 
     return origins
 
+
+# Cache middleware must be registered first so that Starlette builds it as the
+# INNERMOST layer (closest to the router). Starlette's add_middleware() prepends
+# to the middleware list and build_middleware_stack() wraps in reverse order, so
+# the last-registered middleware ends up outermost and the first-registered ends
+# up innermost. Registering the cache here (before auth/rate-limit/guard) ensures
+# every request passes public_api_security_middleware, api_key_auth, rate_limit,
+# and ApiGuardMiddleware BEFORE a cache hit can short-circuit the request -
+# otherwise a cached response could be served to unauthenticated/unlimited
+# clients without ever reaching those checks.
+app.add_middleware(SimpleApiCacheMiddleware)
 
 app.middleware("http")(public_api_security_middleware)
 
@@ -633,13 +651,10 @@ def get_recent_collector_runs(limit: int = 10):
 from app.api_guard import ApiGuardMiddleware
 app.add_middleware(ApiGuardMiddleware)
 
-
-# Internal short-lived cache for repeated public job search queries.
-from app.api_cache import SimpleApiCacheMiddleware
-app.add_middleware(SimpleApiCacheMiddleware)
-
 # Private admin endpoints protected by X-Admin-Key.
-app.include_router(admin_router)
+# /api/admin is the canonical route convention: it's the only admin prefix
+# nginx proxies to the backend.
+app.include_router(admin_router, prefix="/api/admin")
 
 
 # Admin status routes

@@ -1,5 +1,4 @@
 import math
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -253,50 +252,3 @@ def quality_score(query: str, job: dict) -> tuple[float, list[str]]:
     combined = max(0.0, min(round(combined, 6), 1.0))
 
     return combined, reasons
-
-
-def rerank_jobs(result, query: str | None):
-    if not query:
-        return result
-
-    min_quality_score = safe_float(os.getenv("JOB_SEARCH_MIN_QUALITY_SCORE"), 0.18)
-    should_filter = os.getenv("JOB_SEARCH_FILTER_LOW_QUALITY", "true").lower() in {"1", "true", "yes", "on"}
-
-    if isinstance(result, dict) and isinstance(result.get("results"), list):
-        jobs = result["results"]
-        result = dict(result)
-    elif isinstance(result, list):
-        jobs = result
-    else:
-        return result
-
-    reranked = []
-
-    for job in jobs:
-        if not isinstance(job, dict):
-            reranked.append(job)
-            continue
-
-        score, reasons = quality_score(query, job)
-        job = dict(job)
-        job["quality_score"] = score
-        job["quality_reasons"] = reasons
-
-        if not should_filter or score >= min_quality_score:
-            reranked.append(job)
-
-    reranked.sort(
-        key=lambda item: (
-            safe_float(item.get("quality_score"), 0.0),
-            safe_float(item.get("search_score"), 0.0),
-            str(item.get("last_seen_at") or ""),
-        ),
-        reverse=True,
-    )
-
-    if isinstance(result, dict):
-        result["results"] = reranked
-        result["count"] = len(reranked)
-        return result
-
-    return reranked
