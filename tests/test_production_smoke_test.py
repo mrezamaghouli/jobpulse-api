@@ -74,6 +74,19 @@ fi
 status=500
 body='{}'
 
+# FAKE_CURL_JOBS_MODE controls the /jobs (list[Job]) body shape:
+#   empty (default)     -> [] -- the realistic "no matching active jobs" case
+#   nonempty             -> a one-element array of objects
+#   malformed             -> not valid JSON at all
+#   top_level_object      -> a JSON object instead of an array
+#   non_object_elements   -> an array whose elements are not objects
+#
+# FAKE_CURL_SEARCH_MODE controls the /jobs/search envelope body shape:
+#   empty (default)  -> a structurally valid envelope with zero results
+#   nonempty          -> a structurally valid envelope with one result
+#   missing_key       -> envelope missing "total_pages"
+#   results_not_list  -> "results" is a string instead of a list
+#   malformed         -> not valid JSON at all
 case "$URL" in
   */health)
     status=200
@@ -88,6 +101,22 @@ case "$URL" in
       body='{"error":"invalid_admin_key"}'
     fi
     ;;
+  */jobs/search*)
+    if [[ -z "$API_KEY" ]]; then
+      status=401
+      body='{"error":"invalid_api_key"}'
+    else
+      status=200
+      case "${FAKE_CURL_SEARCH_MODE:-empty}" in
+        empty) body='{"results":[],"count":0,"page":1,"limit":5,"total_pages":0}' ;;
+        nonempty) body='{"results":[{"title":"Fake Job","quality_score":0.87}],"count":1,"page":1,"limit":5,"total_pages":1}' ;;
+        missing_key) body='{"results":[],"count":0,"page":1,"limit":5}' ;;
+        results_not_list) body='{"results":"nope","count":0,"page":1,"limit":5,"total_pages":0}' ;;
+        malformed) body='not valid json' ;;
+        *) body='{"results":[],"count":0,"page":1,"limit":5,"total_pages":0}' ;;
+      esac
+    fi
+    ;;
   */jobs*)
     if [[ -z "$API_KEY" ]]; then
       status=401
@@ -100,7 +129,14 @@ case "$URL" in
       body='{"error":"query too long"}'
     else
       status=200
-      body='{"results":[{"title":"Fake Job","quality_score":0.87}]}'
+      case "${FAKE_CURL_JOBS_MODE:-empty}" in
+        empty) body='[]' ;;
+        nonempty) body='[{"title":"Fake Job","quality_score":0.87}]' ;;
+        malformed) body='not valid json' ;;
+        top_level_object) body='{"oops":"not an array"}' ;;
+        non_object_elements) body='[1,2,3]' ;;
+        *) body='[]' ;;
+      esac
     fi
     ;;
   *)
@@ -289,6 +325,7 @@ def test_unauthenticated_jobs_probe_runs_before_authenticated_one_and_expects_40
     "check_name,url_fragment",
     [
         ("jobs_search", "/jobs?query=python%20backend%20remote&limit=5"),
+        ("jobs_search_endpoint", "/jobs/search?query=python%20backend%20remote&limit=5"),
         ("api_guard_limit_validation", "limit=999"),
         ("api_guard_query_length_validation", "aaaaaaaaaa"),
     ],
@@ -438,3 +475,122 @@ def test_env_files_loaded_in_compose_precedence_order(sandbox):
     authenticated_calls = [c for c in jobs_search_calls if "API_KEY=<none>" not in c]
     assert authenticated_calls
     assert all("API_KEY=from-dot-env" in c for c in authenticated_calls)
+
+
+# --- Data-independent /jobs and /jobs/search validation -------------------
+#
+# Root cause: GET /jobs has response_model=list[Job] and legitimately
+# returns [] when the selected query has no matching active jobs -- that
+# is real, healthy production behavior, not a failure. The smoke test
+# previously grepped the /jobs body for "title" and "quality_score",
+# which only exist when a row happens to match, so a query with zero
+# matches produced a false FAIL against a perfectly healthy production.
+# GET /jobs/search has a stable envelope (results, count, page, limit,
+# total_pages) regardless of match count, so it is the endpoint used to
+# probe structural/contract stability; /jobs itself is only checked for
+# being a JSON array whose elements (if any) are objects, never for row
+# content.
+#
+# FAKE_CURL_JOBS_MODE/FAKE_CURL_SEARCH_MODE (see FAKE_CURL above) drive
+# the response bodies for these tests; the default for both is "empty",
+# so the whole suite's default sandbox run already proves the zero-match
+# case works end to end without any test depending on a production row
+# actually existing.
+
+
+def test_full_smoke_run_succeeds_with_zero_matching_jobs(sandbox):
+    """The sandbox's default FAKE_CURL_JOBS_MODE/FAKE_CURL_SEARCH_MODE
+    are both "empty" -- this is the exact production scenario (a healthy
+    deploy where the smoke test's query happens to match nothing) that
+    previously produced a false failure."""
+    result = run_smoke_test(sandbox)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS jobs_search_is_valid_json_array" in result.stdout
+    assert "PASS jobs_search_endpoint_envelope" in result.stdout
+    assert "production_smoke_test_finished status=OK" in result.stdout
+
+
+def test_jobs_array_accepts_nonempty_list_of_objects(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "nonempty"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS jobs_search_is_valid_json_array" in result.stdout
+
+
+def test_jobs_array_rejects_malformed_json(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "malformed"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_is_valid_json_array" in combined
+    assert "invalid_json" in combined
+
+
+def test_jobs_array_rejects_top_level_object(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "top_level_object"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_is_valid_json_array" in combined
+    assert "expected_top_level_array" in combined
+
+
+def test_jobs_array_rejects_non_object_elements(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "non_object_elements"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_is_valid_json_array" in combined
+    assert "not_an_object" in combined
+
+
+def test_jobs_search_envelope_accepts_empty_results(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_SEARCH_MODE": "empty"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS jobs_search_endpoint_envelope" in result.stdout
+
+
+def test_jobs_search_envelope_accepts_nonempty_results(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_SEARCH_MODE": "nonempty"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS jobs_search_endpoint_envelope" in result.stdout
+
+
+def test_jobs_search_envelope_rejects_missing_required_key(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_SEARCH_MODE": "missing_key"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_endpoint_envelope" in combined
+    assert "missing_keys=total_pages" in combined
+
+
+def test_jobs_search_envelope_rejects_results_not_a_list(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_SEARCH_MODE": "results_not_list"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_endpoint_envelope" in combined
+    assert "results_not_a_list" in combined
+
+
+def test_jobs_search_envelope_rejects_malformed_json(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_SEARCH_MODE": "malformed"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL jobs_search_endpoint_envelope" in combined
+    assert "invalid_json" in combined
+
+
+def test_secrets_never_appear_in_output_regardless_of_jobs_data_shape(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "nonempty"})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    combined = result.stdout + result.stderr
+    assert "first-public-key" not in combined
+    assert "admin-secret-token" not in combined
+
+    calls = _call_log_lines(sandbox)
+    assert any("API_KEY=first-public-key" in c for c in calls), "sanity: the key really was used"
+
+
+def test_temp_output_directory_is_removed_after_a_json_validation_failure(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_JOBS_MODE": "malformed"})
+    assert result.returncode != 0
+
+    leftovers = list(sandbox["scratch_tmpdir"].glob("jobpulse_smoke_test.*"))
+    assert leftovers == [], f"temp directory left behind after a JSON validation failure: {leftovers}"
