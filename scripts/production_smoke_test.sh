@@ -124,6 +124,92 @@ require_json_contains() {
   pass "$name contains=$needle"
 }
 
+# GET /jobs (response_model=list[Job]) legitimately returns [] when the
+# selected query has no matching active jobs -- that is not a failure.
+# Only the JSON shape is validated here, never row content.
+require_jobs_array() {
+  local name="$1"
+  local error
+
+  if ! error="$(python3 - "$BODY_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError as exc:
+    print(f"invalid_json: {exc}")
+    sys.exit(1)
+
+if not isinstance(data, list):
+    print(f"expected_top_level_array actual_type={type(data).__name__}")
+    sys.exit(1)
+
+for index, item in enumerate(data):
+    if not isinstance(item, dict):
+        print(f"element_{index}_not_an_object actual_type={type(item).__name__}")
+        sys.exit(1)
+PY
+)"; then
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
+    fail "$name ${error:-invalid_jobs_array}"
+  fi
+
+  pass "$name"
+}
+
+# GET /jobs/search has a stable response envelope regardless of how many
+# (if any) rows match: results, count, page, limit, total_pages. This is
+# the endpoint to probe for structural contract stability, since /jobs
+# itself carries no such envelope.
+require_jobs_search_envelope() {
+  local name="$1"
+  local error
+
+  if ! error="$(python3 - "$BODY_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError as exc:
+    print(f"invalid_json: {exc}")
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    print(f"expected_top_level_object actual_type={type(data).__name__}")
+    sys.exit(1)
+
+required_keys = ("results", "count", "page", "limit", "total_pages")
+missing = [key for key in required_keys if key not in data]
+if missing:
+    print(f"missing_keys={','.join(missing)}")
+    sys.exit(1)
+
+if not isinstance(data["results"], list):
+    print(f"results_not_a_list actual_type={type(data['results']).__name__}")
+    sys.exit(1)
+
+for key in ("count", "page", "limit", "total_pages"):
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        print(f"{key}_not_a_non_negative_integer value={value!r}")
+        sys.exit(1)
+PY
+)"; then
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
+    fail "$name ${error:-invalid_jobs_search_envelope}"
+  fi
+
+  pass "$name"
+}
+
 main() {
   cd "$PROJECT_DIR"
   load_env
@@ -144,8 +230,11 @@ main() {
 
   require_status "jobs_search" "200" "${BASE_URL}/jobs?query=python%20backend%20remote&limit=5&page=1" \
     -H "X-API-Key: ${public_api_key}"
-  require_json_contains "jobs_search_has_title" '"title"'
-  require_json_contains "jobs_search_has_quality_score" '"quality_score"'
+  require_jobs_array "jobs_search_is_valid_json_array"
+
+  require_status "jobs_search_endpoint" "200" "${BASE_URL}/jobs/search?query=python%20backend%20remote&limit=5&page=1" \
+    -H "X-API-Key: ${public_api_key}"
+  require_jobs_search_envelope "jobs_search_endpoint_envelope"
 
   require_status "api_guard_limit_validation" "400" "${BASE_URL}/jobs?query=backend&limit=999&page=1" \
     -H "X-API-Key: ${public_api_key}"

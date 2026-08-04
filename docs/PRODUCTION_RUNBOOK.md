@@ -1574,3 +1574,19 @@ public and admin keys are never printed to the console or log file. Its
 temporary response/header files are created with `mktemp` in a unique
 directory and removed via an EXIT trap on both success and failure.
 
+The authenticated `GET /jobs` check is deliberately data-independent:
+`/jobs` has `response_model=list[Job]` and legitimately returns `[]` when
+the smoke test's query happens to match no active jobs -- that is healthy
+production behavior, not a failure, so smoke success never requires a
+matching job to exist. The check only validates, using Python's `json`
+module (not `grep`), that the response is valid JSON, that its top level
+is an array, and that every element of a non-empty array is a JSON
+object -- it never asserts on row content like `title` or
+`quality_score`. Because `/jobs` carries no stable envelope when empty, a
+separate authenticated `GET /jobs/search` probe validates the endpoint
+that does have one: the response must be a JSON object containing
+`results` (a list, which may be empty), and `count`, `page`, `limit`, and
+`total_pages` (each a non-negative integer) -- again independent of
+whether any row actually matches. Authentication and HTTP-status
+expectations for every check are unchanged by this.
+
