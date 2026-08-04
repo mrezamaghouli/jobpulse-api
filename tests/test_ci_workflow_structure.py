@@ -15,6 +15,7 @@ skipped (never a hard dependency of this test file).
 """
 import base64
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -470,26 +471,34 @@ def _run_resolve_image_script(run_text: str, event_name: str, head_sha: str, tmp
     )
 
     resolved_image = None
+    resolved_git_ref = None
     for line in output_file.read_text().splitlines():
         if line.startswith("deploy_image_b64="):
             resolved_image = base64.b64decode(line.split("=", 1)[1]).decode()
+        elif line.startswith("deploy_git_ref_b64="):
+            resolved_git_ref = base64.b64decode(line.split("=", 1)[1]).decode()
 
-    return result, resolved_image
+    return result, resolved_image, resolved_git_ref
 
 
 def test_resolve_image_script_resolves_main_for_manual_dispatch(deploy_workflow, tmp_path):
     run_text = _resolve_image_step(deploy_workflow)["run"]
-    result, image = _run_resolve_image_script(run_text, "workflow_dispatch", "0" * 40, tmp_path)
+    result, image, git_ref = _run_resolve_image_script(run_text, "workflow_dispatch", "0" * 40, tmp_path)
     assert result.returncode == 0, result.stderr
     assert image == "ghcr.io/mrezamaghouli/jobpulse-api:main"
+    assert git_ref == "origin/main", "manual deploys must check out the latest origin/main"
 
 
 def test_resolve_image_script_pins_to_head_sha_for_automatic_deploy(deploy_workflow, tmp_path):
     run_text = _resolve_image_step(deploy_workflow)["run"]
     sha = "a" * 40
-    result, image = _run_resolve_image_script(run_text, "workflow_run", sha, tmp_path)
+    result, image, git_ref = _run_resolve_image_script(run_text, "workflow_run", sha, tmp_path)
     assert result.returncode == 0, result.stderr
     assert image == f"ghcr.io/mrezamaghouli/jobpulse-api:{sha}"
+    assert git_ref == sha
+    assert image.rsplit(":", 1)[1] == git_ref, (
+        "the deployed image tag and the VM git checkout must pin to the exact same commit SHA"
+    )
     assert ":main" not in image, "automatic deploys must never resolve to the mutable :main tag"
 
 
@@ -500,6 +509,192 @@ def test_resolve_image_script_pins_to_head_sha_for_automatic_deploy(deploy_workf
 )
 def test_resolve_image_script_rejects_invalid_head_sha(deploy_workflow, tmp_path, bad_sha):
     run_text = _resolve_image_step(deploy_workflow)["run"]
-    result, image = _run_resolve_image_script(run_text, "workflow_run", bad_sha, tmp_path)
+    result, image, git_ref = _run_resolve_image_script(run_text, "workflow_run", bad_sha, tmp_path)
     assert result.returncode != 0, f"expected failure for head_sha={bad_sha!r}"
     assert image is None
+    assert git_ref is None
+
+
+def test_deploy_step_passes_both_resolved_values_to_remote_shell(deploy_workflow):
+    ssh_step = _deploy_ssh_step(deploy_workflow)
+    assert ssh_step["env"]["DEPLOY_IMAGE_B64"] == "${{ steps.resolve_image.outputs.deploy_image_b64 }}"
+    assert ssh_step["env"]["DEPLOY_GIT_REF_B64"] == "${{ steps.resolve_image.outputs.deploy_git_ref_b64 }}"
+
+    ssh_invocation = next(
+        line for line in ssh_step["run"].splitlines() if line.strip().startswith("ssh -i")
+    )
+    assert "GHCR_TOKEN_B64='$GHCR_TOKEN_B64'" in ssh_invocation
+    assert "DEPLOY_IMAGE_B64='$DEPLOY_IMAGE_B64'" in ssh_invocation
+    assert "DEPLOY_GIT_REF_B64='$DEPLOY_GIT_REF_B64'" in ssh_invocation
+
+
+def test_remote_checkout_script_validates_commit_and_ancestry(deploy_workflow):
+    ssh_run_text = _deploy_ssh_step(deploy_workflow)["run"]
+    assert 'git cat-file -e "${DEPLOY_GIT_REF}^{commit}"' in ssh_run_text, (
+        "automatic checkout must verify the triggering commit actually exists locally"
+    )
+    assert 'git merge-base --is-ancestor "$DEPLOY_GIT_REF" origin/main' in ssh_run_text, (
+        "automatic checkout must verify the triggering commit is an ancestor of origin/main"
+    )
+    assert 'git reset --hard "$DEPLOY_GIT_REF"' in ssh_run_text
+    assert 'git reset --hard origin/main' in ssh_run_text
+
+
+def test_git_checkout_happens_before_deploy_script(deploy_workflow):
+    ssh_run_text = _deploy_ssh_step(deploy_workflow)["run"]
+    assert ssh_run_text.index('git reset --hard') < ssh_run_text.index(
+        "./scripts/deploy_prod_from_ghcr.sh"
+    ), "the repository checkout must land before the deploy script runs"
+
+
+def test_remote_script_rejects_ref_that_is_neither_origin_main_nor_a_sha(deploy_workflow):
+    ssh_run_text = _deploy_ssh_step(deploy_workflow)["run"]
+    assert 'if [ "$DEPLOY_GIT_REF" != "origin/main" ] && ! [[ "$DEPLOY_GIT_REF" =~ ^[0-9a-f]{40}$ ]]; then' in ssh_run_text
+    assert "decoded deployment git ref is invalid" in ssh_run_text
+
+
+# --- Remote checkout logic exercised against a real, disposable local git repo ---
+#
+# These tests extract the actual heredoc body sent to the VM (up to, but
+# not including, the docker-login/deploy-script tail, which needs Docker
+# and real registry credentials and must not run here) and execute it
+# against a throwaway local git remote + working checkout that stands in
+# for /opt/jobpulse -- entirely local, no network, no real repository or
+# production host touched.
+
+
+def _extract_remote_heredoc(ssh_run_text: str) -> str:
+    lines = ssh_run_text.splitlines()
+    start = next(i for i, l in enumerate(lines) if "<<'REMOTE'" in l) + 1
+    end = next(i for i, l in enumerate(lines) if l.strip() == "REMOTE" and i > start)
+    return "\n".join(lines[start:end])
+
+
+def _remote_checkout_only_script(ssh_run_text: str) -> str:
+    heredoc = _extract_remote_heredoc(ssh_run_text)
+    marker = 'if [ -n "${GHCR_TOKEN_B64:-}" ]; then'
+    return heredoc[: heredoc.index(marker)]
+
+
+def _run_git(args, cwd, check=True):
+    env = dict(os.environ)
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }
+    )
+    return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=check)
+
+
+@pytest.fixture
+def git_sandbox(tmp_path):
+    """A disposable local git remote ('origin.git') plus a working clone
+    ('opt_jobpulse') standing in for the production VM's /opt/jobpulse
+    checkout. `old_sha` is an ancestor of the current main tip (`tip_sha`);
+    `stray_sha` is a real, locally-present commit that was never merged
+    into main."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git(["init", "-q", "-b", "main"], seed)
+    (seed / "f.txt").write_text("1")
+    _run_git(["add", "."], seed)
+    _run_git(["commit", "-q", "-m", "c1"], seed)
+    old_sha = _run_git(["rev-parse", "HEAD"], seed).stdout.strip()
+
+    (seed / "f.txt").write_text("2")
+    _run_git(["add", "."], seed)
+    _run_git(["commit", "-q", "-m", "c2"], seed)
+    tip_sha = _run_git(["rev-parse", "HEAD"], seed).stdout.strip()
+
+    _run_git(["checkout", "-q", "-b", "stray"], seed)
+    (seed / "f.txt").write_text("3")
+    _run_git(["add", "."], seed)
+    _run_git(["commit", "-q", "-m", "stray"], seed)
+    stray_sha = _run_git(["rev-parse", "HEAD"], seed).stdout.strip()
+    _run_git(["checkout", "-q", "main"], seed)
+
+    origin_dir = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(seed), str(origin_dir)],
+        check=True, capture_output=True, text=True,
+    )
+
+    deploy_dir = tmp_path / "opt_jobpulse"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin_dir), str(deploy_dir)],
+        check=True, capture_output=True, text=True,
+    )
+
+    return {
+        "deploy_dir": deploy_dir,
+        "old_sha": old_sha,
+        "tip_sha": tip_sha,
+        "stray_sha": stray_sha,
+    }
+
+
+def _head_sha(repo_dir):
+    return _run_git(["rev-parse", "HEAD"], repo_dir).stdout.strip()
+
+
+def _run_remote_checkout(deploy_workflow, git_sandbox, deploy_git_ref: str):
+    ssh_run_text = _deploy_ssh_step(deploy_workflow)["run"]
+    script = _remote_checkout_only_script(ssh_run_text)
+    script = script.replace(
+        "cd /opt/jobpulse", f"cd {shlex.quote(str(git_sandbox['deploy_dir']))}"
+    )
+
+    env = dict(os.environ)
+    env["DEPLOY_IMAGE_B64"] = base64.b64encode(b"ghcr.io/mrezamaghouli/jobpulse-api:main").decode()
+    env["DEPLOY_GIT_REF_B64"] = base64.b64encode(deploy_git_ref.encode()).decode()
+
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=git_sandbox["deploy_dir"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_remote_checkout_manual_resets_to_origin_main(deploy_workflow, git_sandbox):
+    result = _run_remote_checkout(deploy_workflow, git_sandbox, "origin/main")
+    assert result.returncode == 0, result.stderr
+    assert _head_sha(git_sandbox["deploy_dir"]) == git_sandbox["tip_sha"]
+
+
+def test_remote_checkout_automatic_resets_to_exact_triggering_sha(deploy_workflow, git_sandbox):
+    result = _run_remote_checkout(deploy_workflow, git_sandbox, git_sandbox["old_sha"])
+    assert result.returncode == 0, result.stderr
+    assert _head_sha(git_sandbox["deploy_dir"]) == git_sandbox["old_sha"]
+
+
+def test_remote_checkout_rejects_commit_not_an_ancestor_of_main(deploy_workflow, git_sandbox):
+    result = _run_remote_checkout(deploy_workflow, git_sandbox, git_sandbox["stray_sha"])
+    assert result.returncode != 0
+    assert _head_sha(git_sandbox["deploy_dir"]) == git_sandbox["tip_sha"], (
+        "a rejected checkout must never move HEAD"
+    )
+
+
+def test_remote_checkout_rejects_unavailable_commit(deploy_workflow, git_sandbox):
+    missing_sha = "d" * 40
+    result = _run_remote_checkout(deploy_workflow, git_sandbox, missing_sha)
+    assert result.returncode != 0
+    assert _head_sha(git_sandbox["deploy_dir"]) == git_sandbox["tip_sha"]
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    ["main", "origin/develop", "not-a-sha", "A" * 40, "a" * 39, ""],
+    ids=["bare-main", "other-remote-branch", "not-hex", "uppercase", "too-short", "empty"],
+)
+def test_remote_checkout_rejects_arbitrary_decoded_refs(deploy_workflow, git_sandbox, bad_ref):
+    result = _run_remote_checkout(deploy_workflow, git_sandbox, bad_ref)
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "decoded deployment git ref is invalid" in combined or "DEPLOY_GIT_REF_B64 is missing" in combined
+    assert _head_sha(git_sandbox["deploy_dir"]) == git_sandbox["tip_sha"]

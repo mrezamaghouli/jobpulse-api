@@ -1474,8 +1474,31 @@ never change what an already-triggered automatic deployment installs.
 `docker-build.yml`'s `build-api` job now also refuses to run for a
 `workflow_dispatch` launched against anything other than `main`, so a
 feature-branch manual build can never reach the push-and-tag step.
-Automatic rollback in `scripts/deploy_prod_from_ghcr.sh` is unchanged: it
-still retags and redeploys the previous image ID on a failed health check.
+
+Automatic deploys also pin the VM's `/opt/jobpulse` repository checkout to
+that same build commit, not just the image. Previously the remote shell
+always ran `git fetch origin main && git reset --hard origin/main`, so if
+`main` advanced between the triggering build and the deploy actually
+running, the VM could deploy an older image SHA using a newer
+`docker-compose.prod.yml` and `scripts/deploy_prod_from_ghcr.sh` -- a
+mismatch between the image and the deployment tooling that produced it.
+The resolve-deployment step now also emits a base64-encoded
+`deploy_git_ref_b64`, passed to the VM alongside `deploy_image_b64`: for
+automatic deploys it is the same validated `workflow_run.head_sha` used
+for the image tag; for manual `workflow_dispatch` deploys it is
+`origin/main`. On the VM, after `git fetch origin main`, a manual deploy
+still runs `git reset --hard origin/main`; an automatic deploy instead
+runs `git cat-file -e "$DEPLOY_GIT_REF^{commit}"` (the commit must exist),
+`git merge-base --is-ancestor "$DEPLOY_GIT_REF" origin/main` (it must be
+reachable from current main), and only then `git reset --hard
+"$DEPLOY_GIT_REF"` -- failing the deploy before
+`scripts/deploy_prod_from_ghcr.sh` ever runs if either check fails or the
+decoded ref isn't exactly `origin/main` or a 40-character lowercase hex
+SHA. This means a later `main` push can never change either the image or
+the deployment scripts/Compose config used by an already-triggered
+automatic deployment. Automatic rollback in
+`scripts/deploy_prod_from_ghcr.sh` is unchanged: it still retags and
+redeploys the previous image ID on a failed health check.
 Production Rules
 Do not run docker compose up -d --build on the VM.
 Do not commit .env, .api_keys.env, .admin.env, .admin_token, .telegram_alert.env, .auth, logs, or backups.

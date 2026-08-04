@@ -35,7 +35,7 @@ jobs:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 
     steps:
-      - name: Resolve deployment image
+      - name: Resolve deployment image and git ref
         id: resolve_image
         shell: bash
         run: |
@@ -43,6 +43,7 @@ jobs:
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             DEPLOY_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:main"
+            DEPLOY_GIT_REF="origin/main"
           else
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
             if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -50,10 +51,13 @@ jobs:
               exit 1
             fi
             DEPLOY_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${HEAD_SHA}"
+            DEPLOY_GIT_REF="${HEAD_SHA}"
           fi
 
           echo "Resolved deployment image: $DEPLOY_IMAGE"
+          echo "Resolved deployment git ref: $DEPLOY_GIT_REF"
           echo "deploy_image_b64=$(printf '%s' "$DEPLOY_IMAGE" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          echo "deploy_git_ref_b64=$(printf '%s' "$DEPLOY_GIT_REF" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
       - name: Validate secrets
         shell: bash
@@ -69,6 +73,7 @@ jobs:
         shell: bash
         env:
           DEPLOY_IMAGE_B64: ${{ steps.resolve_image.outputs.deploy_image_b64 }}
+          DEPLOY_GIT_REF_B64: ${{ steps.resolve_image.outputs.deploy_git_ref_b64 }}
         run: |
           set -euo pipefail
 
@@ -82,21 +87,40 @@ jobs:
 
           GHCR_TOKEN_B64="$(printf '%s' "${GHCR_TOKEN:-}" | base64 -w 0)"
 
-          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" "GHCR_TOKEN_B64='$GHCR_TOKEN_B64' DEPLOY_IMAGE_B64='$DEPLOY_IMAGE_B64' bash -s" <<'REMOTE'
+          ssh -i ~/.ssh/jobpulse_deploy_key -p "$VM_PORT" "$VM_USER@$VM_HOST" "GHCR_TOKEN_B64='$GHCR_TOKEN_B64' DEPLOY_IMAGE_B64='$DEPLOY_IMAGE_B64' DEPLOY_GIT_REF_B64='$DEPLOY_GIT_REF_B64' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /opt/jobpulse
 
-          git fetch origin main
-          git reset --hard origin/main
-
-          if [ -n "${GHCR_TOKEN_B64:-}" ]; then
-            echo "$GHCR_TOKEN_B64" | base64 -d | docker login ghcr.io -u mrezamaghouli --password-stdin
-          fi
-
           if [ -z "${DEPLOY_IMAGE_B64:-}" ]; then
             echo "ERROR: DEPLOY_IMAGE_B64 is missing" >&2
             exit 1
+          fi
+
+          if [ -z "${DEPLOY_GIT_REF_B64:-}" ]; then
+            echo "ERROR: DEPLOY_GIT_REF_B64 is missing" >&2
+            exit 1
+          fi
+
+          DEPLOY_GIT_REF="$(printf '%s' "$DEPLOY_GIT_REF_B64" | base64 -d)"
+
+          if [ "$DEPLOY_GIT_REF" != "origin/main" ] && ! [[ "$DEPLOY_GIT_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: decoded deployment git ref is invalid" >&2
+            exit 1
+          fi
+
+          git fetch origin main
+
+          if [ "$DEPLOY_GIT_REF" = "origin/main" ]; then
+            git reset --hard origin/main
+          else
+            git cat-file -e "${DEPLOY_GIT_REF}^{commit}"
+            git merge-base --is-ancestor "$DEPLOY_GIT_REF" origin/main
+            git reset --hard "$DEPLOY_GIT_REF"
+          fi
+
+          if [ -n "${GHCR_TOKEN_B64:-}" ]; then
+            echo "$GHCR_TOKEN_B64" | base64 -d | docker login ghcr.io -u mrezamaghouli --password-stdin
           fi
 
           export JOBPULSE_API_IMAGE="$(printf '%s' "$DEPLOY_IMAGE_B64" | base64 -d)"
