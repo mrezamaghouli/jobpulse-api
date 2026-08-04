@@ -6,6 +6,8 @@ on:
       - Build JobPulse API Image
     types:
       - completed
+    branches:
+      - main
 
   workflow_dispatch:
 
