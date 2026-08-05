@@ -1568,11 +1568,56 @@ correctly. It now checks, in order, that an unauthenticated `/jobs`
 request is rejected with `401`, then that the same request **with**
 `X-API-Key` set succeeds with `200`; every other protected `/jobs` request
 (limit/query-length validation, cache checks) also carries `X-API-Key`.
-`/api/health` and the admin-without-key check remain unauthenticated as
-before, and the admin-with-key check continues to use `X-Admin-Key`. The
-public and admin keys are never printed to the console or log file. Its
+`/api/health` remains unauthenticated as before. The public API key and
+`ADMIN_API_KEY` are never printed to the console or log file. Its
 temporary response/header files are created with `mktemp` in a unique
 directory and removed via an EXIT trap on both success and failure.
+
+#### Admin checks are two independent auth layers, tested separately
+
+Admin access is protected by **two independent layers**, and the smoke
+test checks each one on its own URL instead of conflating them:
+
+- **nginx Basic Auth**, in front of the public `location /api/admin/`
+  proxy. This is `auth_basic`/`auth_basic_user_file` in
+  `frontend/nginx.conf`; it rejects unauthenticated requests before
+  they ever reach the backend.
+- **FastAPI's `X-Admin-Key` check**, applied independently inside the
+  application to every `/api/admin/*` route, regardless of how the
+  request arrived.
+
+Previously the smoke test sent `X-Admin-Key` through the public nginx
+proxy without Basic Auth credentials. nginx correctly rejected that
+request with `401` before FastAPI ever saw it, and the test reported
+`admin_with_key expected_http=200 actual_http=401` -- a false
+production failure caused by testing the wrong layer, not a real
+regression. The fix is to test each layer where it actually applies:
+
+- `admin_proxy_basic_auth_required` sends an unauthenticated request
+  (no Basic Auth, no `X-Admin-Key`) to `${BASE_URL}/admin/summary`
+  (the public, nginx-proxied URL) and requires `401` **and** a
+  `WWW-Authenticate: Basic` response header, so the failure is
+  attributable specifically to the nginx Basic Auth layer rather than
+  to any other `401`. It deliberately never sends plaintext Basic Auth
+  credentials -- the smoke test does not need them to prove the layer
+  is active.
+- `admin_api_without_key_blocked` and `admin_api_with_key` talk
+  directly to the loopback-only backend at
+  `${ADMIN_API_BASE_URL}/admin/summary` (default
+  `http://127.0.0.1:8000/api`), bypassing nginx entirely, and require
+  `401` without `X-Admin-Key` and `200` with it. `docker-compose.prod.yml`
+  binds the API's port 8000 to `127.0.0.1` only -- **this binding must
+  remain loopback-only and must never be exposed publicly** -- so this
+  check only works when the smoke test runs on the production host
+  itself, alongside the containers. The authenticated response is
+  validated (`admin_api_with_key_envelope`) as a JSON object containing
+  the stable top-level keys `status`, `jobs`, `demand_queue`,
+  `collection`, and `top_searches_7d`; no production count is required
+  to be non-zero.
+
+Both `auth_basic` in nginx and the `X-Admin-Key` check in FastAPI must
+remain enabled -- this smoke test only verifies both layers are active,
+it never weakens or bypasses either one.
 
 The authenticated `GET /jobs` check is deliberately data-independent:
 `/jobs` has `response_model=list[Job]` and legitimately returns `[]` when

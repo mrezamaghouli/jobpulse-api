@@ -4,6 +4,7 @@ set -Eeuo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/opt/jobpulse}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 BASE_URL="${BASE_URL:-http://localhost/api}"
+ADMIN_API_BASE_URL="${ADMIN_API_BASE_URL:-http://127.0.0.1:8000/api}"
 LOG_FILE="${PROJECT_DIR}/logs/production_smoke_test.log"
 
 mkdir -p "${PROJECT_DIR}/logs"
@@ -161,6 +162,95 @@ PY
   pass "$name"
 }
 
+require_valid_json() {
+  local name="$1"
+  local error
+
+  if ! error="$(python3 - "$BODY_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        json.load(fh)
+except json.JSONDecodeError as exc:
+    print(f"invalid_json: {exc}")
+    sys.exit(1)
+PY
+)"; then
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
+    fail "$name ${error:-invalid_json}"
+  fi
+
+  pass "$name"
+}
+
+# The FastAPI admin summary envelope is only asserted structurally
+# (stable top-level keys) so a healthy production with e.g. zero rows
+# in demand_queue never produces a false failure here.
+require_admin_summary_envelope() {
+  local name="$1"
+  local error
+
+  if ! error="$(python3 - "$BODY_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except json.JSONDecodeError as exc:
+    print(f"invalid_json: {exc}")
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    print(f"expected_top_level_object actual_type={type(data).__name__}")
+    sys.exit(1)
+
+required_keys = ("status", "jobs", "demand_queue", "collection", "top_searches_7d")
+missing = [key for key in required_keys if key not in data]
+if missing:
+    print(f"missing_keys={','.join(missing)}")
+    sys.exit(1)
+PY
+)"; then
+    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
+    fail "$name ${error:-invalid_admin_summary_envelope}"
+  fi
+
+  pass "$name"
+}
+
+# nginx (not FastAPI) owns location /api/admin/ with auth_basic; a
+# request through the public proxy with no Basic Auth must be rejected
+# by nginx itself, before it ever reaches FastAPI's X-Admin-Key check.
+# The WWW-Authenticate header is the signal that this 401 came from the
+# Basic Auth layer specifically, not from some other unrelated 401.
+require_admin_proxy_basic_auth() {
+  local name="$1"
+  local url="$2"
+
+  local status
+  status="$(curl_header_status "$url" || true)"
+
+  if [[ "$status" != "401" ]]; then
+    log "URL=$url"
+    log "HEADERS=$(cat "$HEADERS_FILE" 2>/dev/null || true)"
+    fail "$name expected_http=401 actual_http=$status"
+  fi
+
+  if ! grep -iq '^WWW-Authenticate:[[:space:]]*Basic' "$HEADERS_FILE"; then
+    log "HEADERS=$(cat "$HEADERS_FILE" 2>/dev/null || true)"
+    fail "$name missing_www_authenticate_basic_header"
+  fi
+
+  pass "$name http=$status"
+}
+
 # GET /jobs/search has a stable response envelope regardless of how many
 # (if any) rows match: results, count, page, limit, total_pages. This is
 # the endpoint to probe for structural contract stability, since /jobs
@@ -214,7 +304,7 @@ main() {
   cd "$PROJECT_DIR"
   load_env
 
-  log "production_smoke_test_started base_url=${BASE_URL}"
+  log "production_smoke_test_started base_url=${BASE_URL} admin_api_base_url=${ADMIN_API_BASE_URL}"
 
   docker compose -f "$COMPOSE_FILE" ps | tee -a "$LOG_FILE"
 
@@ -265,28 +355,23 @@ PY
     log "WARN cache HIT header not observed; continuing"
   fi
 
-  require_status "admin_without_key_blocked" "401" "${BASE_URL}/admin/summary"
+  # Admin access is protected by two independent layers: nginx Basic
+  # Auth in front of the public proxy, and FastAPI's X-Admin-Key check
+  # on the loopback-only backend. Each layer is probed on its own URL
+  # so a 401 from one is never mistaken for a 401 from the other.
+
+  require_admin_proxy_basic_auth "admin_proxy_basic_auth_required" "${BASE_URL}/admin/summary"
+
+  require_status "admin_api_without_key_blocked" "401" "${ADMIN_API_BASE_URL}/admin/summary"
+  require_valid_json "admin_api_without_key_blocked_is_valid_json"
 
   if [[ -z "${ADMIN_API_KEY:-}" ]]; then
     fail "ADMIN_API_KEY missing from .admin.env/.env"
   fi
 
-  local admin_status
-  admin_status="$(
-    curl -sS \
-      -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-      -o "$BODY_FILE" \
-      -w "%{http_code}" \
-      "${BASE_URL}/admin/summary" || true
-  )"
-
-  if [[ "$admin_status" != "200" ]]; then
-    log "BODY=$(cat "$BODY_FILE" 2>/dev/null || true)"
-    fail "admin_with_key expected_http=200 actual_http=$admin_status"
-  fi
-
-  require_json_contains "admin_summary_has_jobs" '"jobs"'
-  pass "admin_with_key"
+  require_status "admin_api_with_key" "200" "${ADMIN_API_BASE_URL}/admin/summary" \
+    -H "X-Admin-Key: ${ADMIN_API_KEY}"
+  require_admin_summary_envelope "admin_api_with_key_envelope"
 
   local jobs_count
   jobs_count="$(
