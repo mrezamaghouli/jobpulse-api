@@ -1,12 +1,25 @@
 """
 Regression tests for scripts/production_smoke_test.sh.
 
-Root cause: production has JOBPULSE_PUBLIC_API_KEYS configured and
-/jobs* correctly requires it (app/api_security.py fails closed on a
-missing/invalid key), but the smoke test sent protected /jobs requests
-without any X-API-Key header. /api/health passed, /api/jobs came back
-401 invalid_api_key, and the smoke test reported a false production
-failure -- the app was behaving correctly the whole time.
+Root cause (public API keys): production has JOBPULSE_PUBLIC_API_KEYS
+configured and /jobs* correctly requires it (app/api_security.py fails
+closed on a missing/invalid key), but the smoke test sent protected
+/jobs requests without any X-API-Key header. /api/health passed,
+/api/jobs came back 401 invalid_api_key, and the smoke test reported a
+false production failure -- the app was behaving correctly the whole
+time.
+
+Root cause (admin auth false negative): admin access is protected by
+two independent layers -- nginx Basic Auth in front of the public
+`/api/admin/` proxy location, and FastAPI's own X-Admin-Key check on
+the loopback-only backend. The smoke test used to send X-Admin-Key
+through the public proxy without Basic Auth; nginx correctly rejected
+that request with 401 before it ever reached FastAPI, and the test
+conflated the two layers into a single false failure. The script now
+probes each layer on its own URL: an unauthenticated request through
+${BASE_URL} must be rejected by nginx (401 + WWW-Authenticate: Basic),
+and X-Admin-Key is tested directly against the loopback-only
+${ADMIN_API_BASE_URL} backend, never through the public proxy.
 
 These tests exercise the real script against fake `curl` and `docker`
 binaries (no real network, Docker daemon, PostgreSQL, or production
@@ -15,8 +28,10 @@ JOBPULSE_PUBLIC_API_KEYS (trimmed, empty entries skipped); the script
 fails clearly before any protected request if no usable key exists;
 every protected /jobs request carries X-API-Key while health stays
 unauthenticated; the unauthenticated-jobs-401-then-authenticated-200
-sequence holds; admin checks are unaffected; secrets are never printed;
-and the temporary output directory is always cleaned up.
+sequence holds; the nginx Basic Auth and FastAPI X-Admin-Key admin
+layers are checked independently and never conflated; secrets are
+never printed; and the temporary output directory is always cleaned
+up.
 """
 
 import os
@@ -87,18 +102,46 @@ body='{}'
 #   missing_key       -> envelope missing "total_pages"
 #   results_not_list  -> "results" is a string instead of a list
 #   malformed         -> not valid JSON at all
+#
+# FAKE_CURL_ADMIN_MODE controls the direct-backend authenticated
+# admin/summary body shape (only used when ADMIN_KEY is present):
+#   empty (default)  -> a structurally valid envelope with all 5 keys
+#   missing_key       -> envelope missing "collection"
+#   malformed         -> not valid JSON at all
+#
+# Admin auth has two independent layers, matched here the same way
+# they are reached in production: the public nginx proxy location
+# (BASE_URL, no 127.0.0.1 in the host) always 401s with a
+# WWW-Authenticate: Basic header and never looks at X-Admin-Key --
+# nginx rejects before FastAPI is ever reached. The loopback-only
+# direct backend (ADMIN_API_BASE_URL, host contains 127.0.0.1) only
+# enforces FastAPI's X-Admin-Key check and never involves Basic Auth.
+WWW_AUTH_HEADER=""
 case "$URL" in
   */health)
     status=200
     body='{"status":"ok","database":"connected"}'
     ;;
   */admin/summary*)
-    if [[ -n "$ADMIN_KEY" ]]; then
-      status=200
-      body='{"jobs":42}'
+    if [[ "$URL" == *"127.0.0.1"* ]]; then
+      if [[ -n "$ADMIN_KEY" ]]; then
+        status=200
+        case "${FAKE_CURL_ADMIN_MODE:-empty}" in
+          empty) body='{"status":"ok","jobs":42,"demand_queue":[],"collection":{"pending":0},"top_searches_7d":[]}' ;;
+          missing_key) body='{"status":"ok","jobs":42,"demand_queue":[],"top_searches_7d":[]}' ;;
+          malformed) body='not valid json' ;;
+          *) body='{"status":"ok","jobs":42,"demand_queue":[],"collection":{"pending":0},"top_searches_7d":[]}' ;;
+        esac
+      else
+        status=401
+        body='{"error":"invalid_admin_key"}'
+      fi
     else
       status=401
-      body='{"error":"invalid_admin_key"}'
+      body='<html><head><title>401 Authorization Required</title></head><body>401 Authorization Required</body></html>'
+      if [[ -z "${FAKE_CURL_OMIT_WWW_AUTH:-}" ]]; then
+        WWW_AUTH_HEADER='WWW-Authenticate: Basic realm="JobPulse Admin"\r\n'
+      fi
     fi
     ;;
   */jobs/search*)
@@ -149,6 +192,9 @@ if [[ "$INCLUDE_HEADERS" -eq 1 ]]; then
   {
     printf 'HTTP/1.1 %s OK\r\n' "$status"
     printf 'Content-Type: application/json\r\n'
+    if [[ -n "$WWW_AUTH_HEADER" ]]; then
+      printf '%b' "$WWW_AUTH_HEADER"
+    fi
     printf 'X-JobPulse-Cache: MISS\r\n'
     printf '\r\n'
     printf '%s' "$body"
@@ -241,6 +287,7 @@ def sandbox(tmp_path):
     env["PROJECT_DIR"] = str(project_dir)
     env["COMPOSE_FILE"] = "docker-compose.prod.yml"
     env["BASE_URL"] = "http://localhost/api"
+    env["ADMIN_API_BASE_URL"] = "http://127.0.0.1:8000/api"
     env["TMPDIR"] = str(scratch_tmpdir)
     env["FAKE_CURL_CALL_LOG"] = str(call_log)
 
@@ -359,35 +406,134 @@ def test_cache_requests_are_authenticated_and_expect_200(sandbox):
     assert all("API_KEY=first-public-key" in c for c in cache_calls)
 
 
-def test_admin_without_key_still_expects_401(sandbox):
+# --- Admin auth: two independent layers, checked independently --------
+#
+# Root cause: nginx protects the public `/api/admin/` proxy location
+# with HTTP Basic Auth; FastAPI independently protects `/api/admin/*`
+# with X-Admin-Key. The old smoke test sent X-Admin-Key through the
+# public proxy without Basic Auth, nginx correctly rejected it with
+# 401 before FastAPI ever saw the request, and the test reported a
+# false production failure. The script now probes each layer on its
+# own URL: BASE_URL (public, proxied by nginx) for the Basic Auth
+# layer, and ADMIN_API_BASE_URL (loopback-only, 127.0.0.1:8000) for
+# FastAPI's X-Admin-Key layer -- never mixed.
+
+
+def test_admin_proxy_basic_auth_required_returns_401_and_is_accepted(sandbox):
     result = run_smoke_test(sandbox)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS admin_without_key_blocked http=401" in result.stdout
+    assert "PASS admin_proxy_basic_auth_required http=401" in result.stdout
 
     calls = _call_log_lines(sandbox)
-    admin_calls = [c for c in calls if "/admin/summary" in c and "ADMIN_KEY=<none>" in c]
-    assert admin_calls
+    proxy_calls = [c for c in calls if "URL=http://localhost/api/admin/summary" in c]
+    assert proxy_calls, "expected a request to the public nginx admin proxy"
 
 
-def test_admin_with_key_still_uses_x_admin_key_header(sandbox):
+def test_admin_proxy_request_carries_no_admin_key_or_api_key(sandbox):
+    """The nginx Basic Auth layer must be probed with nothing else
+    attached -- no X-Admin-Key (that's FastAPI's job) and no
+    X-API-Key (that's the public /jobs layer's job)."""
     result = run_smoke_test(sandbox)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS admin_with_key" in result.stdout
 
     calls = _call_log_lines(sandbox)
-    admin_calls = [c for c in calls if "/admin/summary" in c and "ADMIN_KEY=admin-secret-token" in c]
-    assert admin_calls
-    # the admin path must never receive the public API key header
-    assert all("API_KEY=<none>" in c for c in admin_calls)
+    proxy_calls = [c for c in calls if "URL=http://localhost/api/admin/summary" in c]
+    assert proxy_calls
+    assert all("ADMIN_KEY=<none>" in c for c in proxy_calls)
+    assert all("API_KEY=<none>" in c for c in proxy_calls)
+
+
+def test_admin_api_without_key_blocked_returns_401_via_direct_backend(sandbox):
+    result = run_smoke_test(sandbox)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS admin_api_without_key_blocked http=401" in result.stdout
+    assert "PASS admin_api_without_key_blocked_is_valid_json" in result.stdout
+
+    calls = _call_log_lines(sandbox)
+    direct_calls = [
+        c for c in calls
+        if "URL=http://127.0.0.1:8000/api/admin/summary" in c and "ADMIN_KEY=<none>" in c
+    ]
+    assert direct_calls, "expected an unauthenticated request straight to the loopback backend"
+
+
+def test_admin_api_with_key_returns_200_via_direct_backend(sandbox):
+    result = run_smoke_test(sandbox)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS admin_api_with_key http=200" in result.stdout
+
+    calls = _call_log_lines(sandbox)
+    direct_calls = [
+        c for c in calls
+        if "URL=http://127.0.0.1:8000/api/admin/summary" in c and "ADMIN_KEY=admin-secret-token" in c
+    ]
+    assert direct_calls
+    # the direct admin backend request must never carry the public API key
+    assert all("API_KEY=<none>" in c for c in direct_calls)
+
+
+def test_admin_api_with_key_envelope_is_structurally_validated(sandbox):
+    result = run_smoke_test(sandbox)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS admin_api_with_key_envelope" in result.stdout
+
+
+def test_admin_api_with_key_envelope_rejects_missing_required_key(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_ADMIN_MODE": "missing_key"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL admin_api_with_key_envelope" in combined
+    assert "missing_keys=collection" in combined
+
+
+def test_admin_api_with_key_envelope_rejects_malformed_json(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_ADMIN_MODE": "malformed"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL admin_api_with_key_envelope" in combined
+    assert "invalid_json" in combined
 
 
 def test_admin_env_file_is_loaded_for_admin_api_key(sandbox):
     """ADMIN_API_KEY only exists in .admin.env in this sandbox (not
-    .env), so a successful admin_with_key check proves .admin.env was
-    actually sourced."""
+    .env), so a successful admin_api_with_key check proves .admin.env
+    was actually sourced."""
     result = run_smoke_test(sandbox)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS admin_with_key" in result.stdout
+    assert "PASS admin_api_with_key" in result.stdout
+
+
+def test_admin_proxy_basic_auth_required_fails_without_www_authenticate_header(sandbox):
+    """A bare 401 through the public proxy is not proof the Basic Auth
+    layer produced it -- the check must fail clearly if the
+    WWW-Authenticate: Basic header is absent, rather than silently
+    accepting any 401 as the nginx layer."""
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_OMIT_WWW_AUTH": "1"})
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "FAIL admin_proxy_basic_auth_required" in combined
+    assert "missing_www_authenticate_basic_header" in combined
+
+
+def test_temp_output_directory_is_removed_after_admin_envelope_failure(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"FAKE_CURL_ADMIN_MODE": "malformed"})
+    assert result.returncode != 0
+
+    leftovers = list(sandbox["scratch_tmpdir"].glob("jobpulse_smoke_test.*"))
+    assert leftovers == [], f"temp directory left behind after an admin envelope failure: {leftovers}"
+
+
+def test_admin_api_base_url_override_is_used_for_direct_backend_checks(sandbox):
+    result = run_smoke_test(sandbox, extra_env={"ADMIN_API_BASE_URL": "http://127.0.0.1:9000/api"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS admin_api_without_key_blocked http=401" in result.stdout
+    assert "PASS admin_api_with_key http=200" in result.stdout
+
+    calls = _call_log_lines(sandbox)
+    overridden_calls = [c for c in calls if "URL=http://127.0.0.1:9000/api/admin/summary" in c]
+    assert overridden_calls, "expected direct backend requests to use the overridden ADMIN_API_BASE_URL"
+    default_port_calls = [c for c in calls if "URL=http://127.0.0.1:8000/api/admin/summary" in c]
+    assert not default_port_calls, "the default ADMIN_API_BASE_URL must not be used once overridden"
 
 
 def test_missing_public_api_key_fails_before_any_protected_request(sandbox):
