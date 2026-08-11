@@ -21,6 +21,7 @@ from app.config import (
     get_linkedin_location,
     get_postgres_config,
 )
+from scripts.tor.tor_client import get_proxy_config
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -182,10 +183,16 @@ class LinkedInBrowserProvider:
 
         print(f"Launching browser channel: {channel}")
 
+        proxy_config = get_proxy_config()
+
+        if proxy_config:
+            print(f"Routing through Tor proxy: {proxy_config['server']}")
+
         return playwright.chromium.launch(
             channel=channel,
             headless=os.getenv("LINKEDIN_HEADLESS", "true").lower() not in ("0", "false", "no"),
             slow_mo=200,
+            proxy=proxy_config,
         )
 
     def build_jobs_search_url(self, keywords: str, location: str) -> str:

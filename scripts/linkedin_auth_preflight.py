@@ -1,6 +1,7 @@
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from scripts.providers.linkedin_browser_provider import assert_linkedin_authenticated
+from scripts.tor.tor_client import get_proxy_config
 
 
 def preflight_linkedin_auth():
@@ -27,6 +28,7 @@ def preflight_linkedin_auth():
                 headless=True,
                 channel=os.getenv("LINKEDIN_BROWSER_CHANNEL", "chrome"),
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
+                proxy=get_proxy_config(),
             )
 
             context = browser.new_context(storage_state=state_path)

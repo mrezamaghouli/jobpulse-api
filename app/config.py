@@ -75,3 +75,64 @@ def get_linkedin_location():
 
 def get_linkedin_limit():
     return int(get_env_value("LINKEDIN_LIMIT", "10"))
+
+
+# -----------------------------------------------------------------------------
+# Tor outbound routing (experimental, disabled by default -- see
+# scripts/tor/tor_client.py and scripts/tor/circuit_manager.py). When
+# TOR_ENABLED is false, none of the other TOR_* values are read by any
+# collector code path.
+# -----------------------------------------------------------------------------
+def get_tor_enabled():
+    value = get_env_value("TOR_ENABLED", "false").lower().strip()
+    return value in ["true", "1", "yes", "on"]
+
+
+def get_tor_socks_host():
+    return get_env_value("TOR_SOCKS_HOST", "127.0.0.1").strip()
+
+
+def _get_int_env_value(key: str, default: int) -> int:
+    raw_value = get_env_value(key, str(default))
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+def get_tor_socks_port():
+    return _get_int_env_value("TOR_SOCKS_PORT", 9050)
+
+
+def get_tor_control_host():
+    return get_env_value("TOR_CONTROL_HOST", "127.0.0.1").strip()
+
+
+def get_tor_control_port():
+    return _get_int_env_value("TOR_CONTROL_PORT", 9051)
+
+
+def get_tor_control_password():
+    return get_env_value("TOR_CONTROL_PASSWORD", "")
+
+
+def get_tor_ip_check_url():
+    return get_env_value("TOR_IP_CHECK_URL", "https://check.torproject.org/api/ip").strip()
+
+
+def get_tor_newnym_min_interval_seconds():
+    """Minimum time between NEWNYM signals sent to the same Tor instance,
+    enforced across separate process invocations via a persisted
+    timestamp (see scripts/tor/circuit_manager.py) -- not merely within
+    one connection. Defaults to 10s, matching stem's own built-in
+    per-connection courtesy interval (Controller.get_newnym_wait())."""
+    return _get_int_env_value("TOR_NEWNYM_MIN_INTERVAL_SECONDS", 10)
+
+
+def get_tor_newnym_max_wait_seconds():
+    """Upper bound on how long request_new_identity() will sleep for an
+    active NEWNYM cooldown before giving up and raising a transient
+    NewnymCooldownError instead. Never exceeded -- this is what keeps
+    the wait bounded rather than an unbounded/blocking sleep."""
+    return _get_int_env_value("TOR_NEWNYM_MAX_WAIT_SECONDS", 5)
