@@ -1,0 +1,311 @@
+name: Production Rollback Checkpoint
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-checkpoint
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-latest
+
+    env:
+      VM_HOST: "35.192.251.190"
+      VM_USER: "mrezamaghouli"
+      VM_PORT: "22"
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+
+    steps:
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "VM_SSH_KEY secret is missing"
+            exit 1
+          fi
+
+      - name: Run production rollback checkpoint
+        id: checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_checkpoint_key
+          chmod 600 ~/.ssh/jobpulse_checkpoint_key
+
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          OUTPUT_FILE="$(mktemp)"
+
+          set +e
+          ssh -i ~/.ssh/jobpulse_checkpoint_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' | tee "$OUTPUT_FILE"
+          set -euo pipefail
+
+          RUN_ID="${RUN_ID:?RUN_ID is required}"
+
+          fail() {
+            echo "CHECKPOINT_FAILED: $*" >&2
+            exit 1
+          }
+
+          cd /opt/jobpulse || fail "cannot cd to /opt/jobpulse"
+
+          COMPOSE_FILE="docker-compose.prod.yml"
+          BACKUP_DIR="/opt/jobpulse/backups/postgres"
+
+          echo "== identity =="
+          hostname
+
+          INITIAL_GIT_STATUS="$(git status --short || true)"
+          REAL_ROLLBACK_GIT_SHA="$(git rev-parse HEAD)"
+          git rev-parse origin/main || true
+          git log -1 --oneline || true
+
+          docker compose -f "$COMPOSE_FILE" ps
+
+          curl -fsS http://127.0.0.1:8000/health >/dev/null || fail "initial health check failed"
+
+          snapshot_container() {
+            docker inspect "$1" --format \
+              '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
+              2>/dev/null || fail "cannot inspect container: $1"
+          }
+
+          API_BASELINE="$(snapshot_container jobpulse-api-prod)"
+          PG_BASELINE="$(snapshot_container jobpulse-postgres-prod)"
+          FE_BASELINE="$(snapshot_container jobpulse-frontend-prod)"
+
+          echo "api      baseline: $API_BASELINE"
+          echo "postgres baseline: $PG_BASELINE"
+          echo "frontend baseline: $FE_BASELINE"
+
+          REAL_ROLLBACK_IMAGE_NAME="$(docker inspect jobpulse-api-prod --format '{{.Config.Image}}')"
+          REAL_ROLLBACK_IMAGE_ID="$(docker inspect jobpulse-api-prod --format '{{.Image}}')"
+          REAL_ROLLBACK_IMAGE_DIGEST="$(
+            docker image inspect "$REAL_ROLLBACK_IMAGE_ID" \
+              --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}none{{end}}' 2>/dev/null || echo none
+          )"
+
+          echo "== backup =="
+
+          [ -d "$BACKUP_DIR" ] || fail "canonical backup dir missing: $BACKUP_DIR"
+
+          DB_SERVICE="db"
+          DB_USER="jobpulse_user"
+          DB_NAME="jobpulse"
+
+          # Inline hardened backup creation (no retention/rotation of any kind:
+          # this workflow must never delete or rotate pre-existing backups).
+          TS="$(date -u +"%Y%m%dT%H%M%SZ")"
+          TMP_DUMP="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.tmp"
+          TMP_LIST="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.list.tmp"
+          NEW_BACKUP="$BACKUP_DIR/${DB_NAME}_${TS}_checkpoint.dump"
+          LIST_FILE="$NEW_BACKUP.list"
+          SHA_FILE="$NEW_BACKUP.sha256"
+          MANIFEST_FILE="$NEW_BACKUP.json"
+
+          [ -e "$NEW_BACKUP" ] && fail "backup target already exists, refusing to overwrite: $NEW_BACKUP"
+
+          cleanup_backup_tmp() {
+            rm -f "$TMP_DUMP" "$TMP_LIST"
+          }
+          trap cleanup_backup_tmp EXIT
+
+          (
+            umask 077
+            docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+              pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner --no-privileges > "$TMP_DUMP"
+          )
+          test -s "$TMP_DUMP" || fail "temporary dump is empty"
+
+          (
+            umask 077
+            cat "$TMP_DUMP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" pg_restore -l > "$TMP_LIST"
+          )
+          test -s "$TMP_LIST" || fail "temporary dump failed pg_restore --list validation before promotion"
+
+          chmod 600 "$TMP_DUMP" "$TMP_LIST" || fail "failed to set restrictive permissions on temporary backup files"
+
+          # Atomic, no-clobber promotion: ln fails loudly (EEXIST) instead of
+          # silently overwriting if a same-named backup already exists.
+          ln "$TMP_DUMP" "$NEW_BACKUP" || fail "failed to atomically promote backup (target may already exist): $NEW_BACKUP"
+          rm -f "$TMP_DUMP"
+          ln "$TMP_LIST" "$LIST_FILE" || fail "failed to atomically promote backup TOC listing (target may already exist): $LIST_FILE"
+          rm -f "$TMP_LIST"
+
+          trap - EXIT
+
+          BACKUP_MODE_BITS="$(stat -c '%a' "$NEW_BACKUP")"
+          [ "$BACKUP_MODE_BITS" = "600" ] || fail "backup file does not have exact mode 600: $BACKUP_MODE_BITS"
+
+          LIST_MODE_BITS="$(stat -c '%a' "$LIST_FILE")"
+          [ "$LIST_MODE_BITS" = "600" ] || fail "backup TOC listing does not have exact mode 600: $LIST_MODE_BITS"
+
+          stat -c '%a %U:%G %n' "$NEW_BACKUP"
+
+          REAL_BACKUP_SIZE="$(stat -c%s "$NEW_BACKUP")"
+          REAL_BACKUP_SHA256="$(sha256sum "$NEW_BACKUP" | cut -d' ' -f1)"
+          REAL_BACKUP_CREATED_AT="$TS"
+
+          umask 077
+          sha256sum "$NEW_BACKUP" > "$SHA_FILE"
+          chmod 600 "$SHA_FILE" || fail "failed to set restrictive permissions on checksum file"
+          SHA_MODE_BITS="$(stat -c '%a' "$SHA_FILE")"
+          [ "$SHA_MODE_BITS" = "600" ] || fail "checksum file does not have exact mode 600: $SHA_MODE_BITS"
+
+          cat > "$MANIFEST_FILE" <<JSON
+          {
+            "created_at_utc": "$REAL_BACKUP_CREATED_AT",
+            "db_name": "$DB_NAME",
+            "db_user": "$DB_USER",
+            "file": "$NEW_BACKUP",
+            "bytes": $REAL_BACKUP_SIZE,
+            "sha256": "$REAL_BACKUP_SHA256",
+            "format": "pg_dump custom",
+            "source": "production-checkpoint.yml",
+            "run_id": "$RUN_ID"
+          }
+          JSON
+          chmod 600 "$MANIFEST_FILE" || fail "failed to set restrictive permissions on manifest file"
+          MANIFEST_MODE_BITS="$(stat -c '%a' "$MANIFEST_FILE")"
+          [ "$MANIFEST_MODE_BITS" = "600" ] || fail "manifest file does not have exact mode 600: $MANIFEST_MODE_BITS"
+
+          REAL_BACKUP_PATH="$NEW_BACKUP"
+          REAL_BACKUP_MODE="pg_dump custom (-Fc --no-owner --no-privileges)"
+
+          echo "== validate backup =="
+
+          TOC="$(cat "$NEW_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" pg_restore --list)"
+          [ -n "$TOC" ] || fail "pg_restore --list produced no output"
+
+          for t in jobs companies linkedin_query_runs; do
+            echo "$TOC" | grep -qE "\\b${t}\\b" || fail "expected table missing from backup TOC: $t"
+          done
+
+          echo "== disposable restore verification =="
+
+          NET_NAME="jobpulse-checkpoint-${RUN_ID}-net"
+          PG_NAME="jobpulse-checkpoint-${RUN_ID}-pg"
+
+          cleanup_disposable() {
+            docker rm -f -v "$PG_NAME" >/dev/null 2>&1 || true
+            docker network rm "$NET_NAME" >/dev/null 2>&1 || true
+          }
+          trap cleanup_disposable EXIT
+
+          docker network create --internal "$NET_NAME" >/dev/null
+
+          docker run -d \
+            --name "$PG_NAME" \
+            --network "$NET_NAME" \
+            -e POSTGRES_USER=checkpoint_verify \
+            -e POSTGRES_PASSWORD=checkpoint_verify_dummy \
+            -e POSTGRES_DB=checkpoint_verify \
+            postgres:16-alpine >/dev/null
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U checkpoint_verify -d checkpoint_verify >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          [ "$ready" -eq 1 ] || fail "disposable postgres never became ready"
+
+          cat "$NEW_BACKUP" | docker exec -i "$PG_NAME" pg_restore \
+            -U checkpoint_verify -d checkpoint_verify \
+            --no-owner --no-privileges --exit-on-error
+
+          count_table() {
+            docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
+              "SELECT CASE WHEN to_regclass('public.$1') IS NULL THEN -1 ELSE (SELECT COUNT(*) FROM public.$1) END;"
+          }
+
+          RESTORED_JOBS_COUNT="$(count_table jobs)"
+          RESTORED_COMPANIES_COUNT="$(count_table companies)"
+          RESTORED_LINKEDIN_QUERY_RUNS_COUNT="$(count_table linkedin_query_runs)"
+
+          [ "$RESTORED_JOBS_COUNT" -ge 0 ] || fail "jobs table missing from restored backup"
+          [ "$RESTORED_JOBS_COUNT" -gt 0 ] || fail "jobs table restored but empty"
+          [ "$RESTORED_COMPANIES_COUNT" -ge 0 ] || fail "companies table missing from restored backup"
+          [ "$RESTORED_LINKEDIN_QUERY_RUNS_COUNT" -ge 0 ] || fail "linkedin_query_runs table missing from restored backup"
+
+          docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
+
+          cleanup_disposable
+          trap - EXIT
+
+          echo "== re-verify production untouched =="
+
+          API_AFTER="$(snapshot_container jobpulse-api-prod)"
+          PG_AFTER="$(snapshot_container jobpulse-postgres-prod)"
+          FE_AFTER="$(snapshot_container jobpulse-frontend-prod)"
+
+          [ "$API_BASELINE" = "$API_AFTER" ] || fail "jobpulse-api-prod state changed during checkpoint"
+          [ "$PG_BASELINE" = "$PG_AFTER" ] || fail "jobpulse-postgres-prod state changed during checkpoint"
+          [ "$FE_BASELINE" = "$FE_AFTER" ] || fail "jobpulse-frontend-prod state changed during checkpoint"
+
+          curl -fsS http://127.0.0.1:8000/health >/dev/null || fail "post-checkpoint health check failed"
+
+          FINAL_GIT_STATUS="$(git status --short || true)"
+          [ "$FINAL_GIT_STATUS" = "$INITIAL_GIT_STATUS" ] || fail "repository working tree changed during checkpoint"
+
+          echo "===CHECKPOINT_MANIFEST_START==="
+          echo "REAL_ROLLBACK_GIT_SHA=$REAL_ROLLBACK_GIT_SHA"
+          echo "REAL_ROLLBACK_IMAGE_NAME=$REAL_ROLLBACK_IMAGE_NAME"
+          echo "REAL_ROLLBACK_IMAGE_ID=$REAL_ROLLBACK_IMAGE_ID"
+          echo "REAL_ROLLBACK_IMAGE_DIGEST=$REAL_ROLLBACK_IMAGE_DIGEST"
+          echo "REAL_BACKUP_PATH=$REAL_BACKUP_PATH"
+          echo "REAL_BACKUP_SIZE=$REAL_BACKUP_SIZE"
+          echo "REAL_BACKUP_SHA256=$REAL_BACKUP_SHA256"
+          echo "REAL_BACKUP_MODE=$REAL_BACKUP_MODE"
+          echo "REAL_BACKUP_CREATED_AT=$REAL_BACKUP_CREATED_AT"
+          echo "REAL_BACKUP_VALIDATED=yes"
+          echo "REAL_BACKUP_RESTORE_TESTED=yes"
+          echo "RESTORED_JOBS_COUNT=$RESTORED_JOBS_COUNT"
+          echo "RESTORED_COMPANIES_COUNT=$RESTORED_COMPANIES_COUNT"
+          echo "RESTORED_LINKEDIN_QUERY_RUNS_COUNT=$RESTORED_LINKEDIN_QUERY_RUNS_COUNT"
+          echo "===CHECKPOINT_MANIFEST_END==="
+          echo "REAL_PRODUCTION_ROLLBACK_READY"
+          REMOTE
+          SSH_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$SSH_EXIT" -ne 0 ] || ! grep -q '^REAL_PRODUCTION_ROLLBACK_READY$' "$OUTPUT_FILE"; then
+            echo "REAL_PRODUCTION_ROLLBACK_NOT_READY"
+            {
+              echo "## Production Rollback Checkpoint"
+              echo
+              echo "**Result: REAL_PRODUCTION_ROLLBACK_NOT_READY**"
+              echo
+              echo '```'
+              tail -n 40 "$OUTPUT_FILE"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## Production Rollback Checkpoint"
+            echo
+            echo '```'
+            sed -n '/===CHECKPOINT_MANIFEST_START===/,/===CHECKPOINT_MANIFEST_END===/p' "$OUTPUT_FILE" | sed '1d;$d'
+            echo '```'
+            echo
+            echo "**Result: REAL_PRODUCTION_ROLLBACK_READY**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "REAL_PRODUCTION_ROLLBACK_READY"
