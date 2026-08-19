@@ -117,9 +117,24 @@ jobs:
 
           [ -d "$BACKUP_DIR" ] || fail "canonical backup dir missing: $BACKUP_DIR"
 
+          echo "backup runner identity:"
+          id
+
+          echo "backup directory:"
+          stat -c 'path=%n mode=%a owner=%U group=%G' "$BACKUP_DIR"
+
+          echo "backup filesystem:"
+          df -h "$BACKUP_DIR"
+
+          [ -w "$BACKUP_DIR" ] || fail "backup directory is not writable by checkpoint SSH user: $BACKUP_DIR"
+
           DB_SERVICE="db"
           DB_USER="jobpulse_user"
           DB_NAME="jobpulse"
+
+          docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+            pg_isready -U "$DB_USER" -d "$DB_NAME" \
+            || fail "production PostgreSQL is not ready for checkpoint backup"
 
           # Inline hardened backup creation (no retention/rotation of any kind:
           # this workflow must never delete or rotate pre-existing backups).
@@ -138,18 +153,24 @@ jobs:
           }
           trap cleanup_backup_tmp EXIT
 
-          (
+          if ! (
             umask 077
             docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-              pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner --no-privileges > "$TMP_DUMP"
-          )
+              pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner --no-privileges \
+              > "$TMP_DUMP"
+          ); then
+            fail "pg_dump or creation of temporary backup file failed"
+          fi
           test -s "$TMP_DUMP" || fail "temporary dump is empty"
 
-          (
+          if ! (
             umask 077
-            cat "$TMP_DUMP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" pg_restore -l > "$TMP_LIST"
-          )
-          test -s "$TMP_LIST" || fail "temporary dump failed pg_restore --list validation before promotion"
+            docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+              pg_restore -l < "$TMP_DUMP" > "$TMP_LIST"
+          ); then
+            fail "temporary dump failed pg_restore --list validation"
+          fi
+          test -s "$TMP_LIST" || fail "temporary pg_restore list is empty"
 
           chmod 600 "$TMP_DUMP" "$TMP_LIST" || fail "failed to set restrictive permissions on temporary backup files"
 
