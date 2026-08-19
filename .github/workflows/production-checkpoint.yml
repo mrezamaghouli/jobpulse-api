@@ -77,9 +77,25 @@ jobs:
           curl -fsS http://127.0.0.1:8000/health >/dev/null || fail "initial health check failed"
 
           snapshot_container() {
-            docker inspect "$1" --format \
-              '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
-              2>/dev/null || fail "cannot inspect container: $1"
+            local name="$1"
+            local base
+            local health
+
+            base="$(
+              docker inspect "$name" --format \
+                '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}'
+            )" || fail "cannot inspect container: $name"
+
+            health="$(
+              docker ps \
+                --filter "name=$name" \
+                --format '{{.HealthStatus}}' |
+                head -n 1
+            )"
+
+            [ -n "$health" ] || health="n/a"
+
+            printf '%s|%s\n' "$base" "$health"
           }
 
           API_BASELINE="$(snapshot_container jobpulse-api-prod)"
