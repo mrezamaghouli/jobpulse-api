@@ -50,9 +50,21 @@ jobs:
           set +e
           ssh -i ~/.ssh/jobpulse_checkpoint_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
             "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' | tee "$OUTPUT_FILE"
-          set -euo pipefail
+          set -Eeuo pipefail
 
           RUN_ID="${RUN_ID:?RUN_ID is required}"
+
+          # Generic failure tracer: fires on any command that trips set -e,
+          # including inside functions (requires -E). Reports rc/line/command
+          # only -- never env or secret values -- so it is safe to leave on.
+          report_err() {
+            local rc=$?
+            local line="$1"
+            local cmd="$2"
+            echo "CHECKPOINT_ERROR_TRACE: rc=${rc} line=${line} cmd=${cmd}" >&2
+            return "$rc"
+          }
+          trap 'report_err "$LINENO" "$BASH_COMMAND"' ERR
 
           fail() {
             echo "CHECKPOINT_FAILED: $*" >&2
@@ -126,6 +138,21 @@ jobs:
           echo "backup filesystem:"
           df -h "$BACKUP_DIR"
 
+          echo "existing checkpoint artifacts (read-only listing, most recent 20):"
+          ARTIFACT_LISTING="$(
+            find "$BACKUP_DIR" -maxdepth 1 -type f -name '*_checkpoint.dump*' \
+              -printf '%T@ %f bytes=%s mode=%m owner=%U:%G time=%TY-%Tm-%TdT%TH:%TM:%TSZ\n' 2>/dev/null \
+              | sort -rn \
+              | head -n 20 \
+              | cut -d' ' -f2- \
+              || true
+          )"
+          if [ -n "$ARTIFACT_LISTING" ]; then
+            echo "$ARTIFACT_LISTING"
+          else
+            echo "(none found)"
+          fi
+
           [ -w "$BACKUP_DIR" ] || fail "backup directory is not writable by checkpoint SSH user: $BACKUP_DIR"
 
           DB_SERVICE="db"
@@ -135,6 +162,8 @@ jobs:
           docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
             pg_isready -U "$DB_USER" -d "$DB_NAME" \
             || fail "production PostgreSQL is not ready for checkpoint backup"
+
+          echo "checkpoint_stage=postgres_ready"
 
           # Inline hardened backup creation (no retention/rotation of any kind:
           # this workflow must never delete or rotate pre-existing backups).
@@ -163,6 +192,8 @@ jobs:
           fi
           test -s "$TMP_DUMP" || fail "temporary dump is empty"
 
+          echo "checkpoint_stage=pg_dump_ok bytes=$(stat -c%s "$TMP_DUMP")"
+
           if ! (
             umask 077
             docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
@@ -172,14 +203,23 @@ jobs:
           fi
           test -s "$TMP_LIST" || fail "temporary pg_restore list is empty"
 
+          echo "checkpoint_stage=pg_restore_list_ok bytes=$(stat -c%s "$TMP_LIST")"
+
           chmod 600 "$TMP_DUMP" "$TMP_LIST" || fail "failed to set restrictive permissions on temporary backup files"
+
+          echo "checkpoint_stage=temp_permissions_ok"
 
           # Atomic, no-clobber promotion: ln fails loudly (EEXIST) instead of
           # silently overwriting if a same-named backup already exists.
           ln "$TMP_DUMP" "$NEW_BACKUP" || fail "failed to atomically promote backup (target may already exist): $NEW_BACKUP"
           rm -f "$TMP_DUMP"
+
+          echo "checkpoint_stage=dump_promoted path=$NEW_BACKUP"
+
           ln "$TMP_LIST" "$LIST_FILE" || fail "failed to atomically promote backup TOC listing (target may already exist): $LIST_FILE"
           rm -f "$TMP_LIST"
+
+          echo "checkpoint_stage=list_promoted path=$LIST_FILE"
 
           trap - EXIT
 
@@ -188,6 +228,8 @@ jobs:
 
           LIST_MODE_BITS="$(stat -c '%a' "$LIST_FILE")"
           [ "$LIST_MODE_BITS" = "600" ] || fail "backup TOC listing does not have exact mode 600: $LIST_MODE_BITS"
+
+          echo "checkpoint_stage=backup_modes_ok"
 
           stat -c '%a %U:%G %n' "$NEW_BACKUP"
 
@@ -200,6 +242,8 @@ jobs:
           chmod 600 "$SHA_FILE" || fail "failed to set restrictive permissions on checksum file"
           SHA_MODE_BITS="$(stat -c '%a' "$SHA_FILE")"
           [ "$SHA_MODE_BITS" = "600" ] || fail "checksum file does not have exact mode 600: $SHA_MODE_BITS"
+
+          echo "checkpoint_stage=checksum_ok"
 
           cat > "$MANIFEST_FILE" <<JSON
           {
@@ -217,6 +261,8 @@ jobs:
           chmod 600 "$MANIFEST_FILE" || fail "failed to set restrictive permissions on manifest file"
           MANIFEST_MODE_BITS="$(stat -c '%a' "$MANIFEST_FILE")"
           [ "$MANIFEST_MODE_BITS" = "600" ] || fail "manifest file does not have exact mode 600: $MANIFEST_MODE_BITS"
+
+          echo "checkpoint_stage=manifest_ok"
 
           REAL_BACKUP_PATH="$NEW_BACKUP"
           REAL_BACKUP_MODE="pg_dump custom (-Fc --no-owner --no-privileges)"
