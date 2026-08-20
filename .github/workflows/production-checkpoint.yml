@@ -49,7 +49,7 @@ jobs:
 
           set +e
           ssh -i ~/.ssh/jobpulse_checkpoint_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' | tee "$OUTPUT_FILE"
+            "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' 2>&1 | tee "$OUTPUT_FILE"
           set -Eeuo pipefail
 
           RUN_ID="${RUN_ID:?RUN_ID is required}"
@@ -159,15 +159,28 @@ jobs:
           DB_USER="jobpulse_user"
           DB_NAME="jobpulse"
 
-          docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-            pg_isready -U "$DB_USER" -d "$DB_NAME" \
-            || fail "production PostgreSQL is not ready for checkpoint backup"
+          echo "checkpoint_stage=before_pg_isready"
+
+          PG_READY_RC=0
+          if docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+            pg_isready -U "$DB_USER" -d "$DB_NAME"; then
+            PG_READY_RC=0
+          else
+            PG_READY_RC=$?
+          fi
+
+          echo "checkpoint_stage=pg_isready_result rc=$PG_READY_RC"
+
+          if [ "$PG_READY_RC" -ne 0 ]; then
+            fail "production PostgreSQL readiness command failed with rc=$PG_READY_RC"
+          fi
 
           echo "checkpoint_stage=postgres_ready"
 
           # Inline hardened backup creation (no retention/rotation of any kind:
           # this workflow must never delete or rotate pre-existing backups).
           TS="$(date -u +"%Y%m%dT%H%M%SZ")"
+          echo "checkpoint_stage=timestamp_created ts=$TS"
           TMP_DUMP="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.tmp"
           TMP_LIST="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.list.tmp"
           NEW_BACKUP="$BACKUP_DIR/${DB_NAME}_${TS}_checkpoint.dump"
