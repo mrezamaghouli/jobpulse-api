@@ -1,0 +1,59 @@
+# Local dev/testing overlay ONLY -- adds a Tor instance and points the
+# existing api/collector services at it. Not used unless explicitly
+# included:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tor.yml up
+#
+# Disable/remove: drop the -f docker-compose.tor.yml flag (or delete this
+# file). The base docker-compose.yml is untouched, and TOR_ENABLED
+# defaults to false, so nothing here changes default behavior.
+#
+# Requires TOR_CONTROL_PASSWORD set in your .env before use.
+services:
+  tor:
+    build:
+      context: ./docker/tor
+    container_name: jobpulse-tor
+    environment:
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?set TOR_CONTROL_PASSWORD in .env before using docker-compose.tor.yml}
+    expose:
+      - "9050"
+      - "9051"
+    healthcheck:
+      # Greps for Tor's own "Bootstrapped 100%" log line (see
+      # docker/tor/torrc.base) rather than just checking the SocksPort
+      # TCP listener -- the listener opens well before bootstrap
+      # finishes, so a plain port-open check would report healthy while
+      # Tor still can't route SOCKS traffic. Generous retries/interval
+      # because first-run bootstrap (no cached consensus yet) can take
+      # significantly longer than a typical container healthcheck.
+      test: ["CMD", "grep", "-q", "Bootstrapped 100%", "/var/log/tor/notices.log"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    restart: unless-stopped
+
+  api:
+    environment:
+      - TOR_ENABLED=true
+      - TOR_SOCKS_HOST=tor
+      - TOR_SOCKS_PORT=9050
+      - TOR_CONTROL_HOST=tor
+      - TOR_CONTROL_PORT=9051
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?set TOR_CONTROL_PASSWORD in .env before using docker-compose.tor.yml}
+    depends_on:
+      tor:
+        condition: service_healthy
+
+  collector:
+    environment:
+      - TOR_ENABLED=true
+      - TOR_SOCKS_HOST=tor
+      - TOR_SOCKS_PORT=9050
+      - TOR_CONTROL_HOST=tor
+      - TOR_CONTROL_PORT=9051
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?set TOR_CONTROL_PASSWORD in .env before using docker-compose.tor.yml}
+    depends_on:
+      tor:
+        condition: service_healthy
