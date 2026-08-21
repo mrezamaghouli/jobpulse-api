@@ -39,15 +39,29 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import scripts.tor.circuit_manager as cm
+from scripts.tor.local_http_simulator import (
+    LocalHttpSimulator,
+    SimulatedConnectionFailure,
+    SimulatedTimeout,
+    always_403,
+    always_timeout,
+    rate_limited_after,
+)
 
 
 class FakeCursor:
-    def __init__(self, deny_lock_keys=None, last_newnym_at=None):
+    def __init__(self, deny_lock_keys=None, last_newnym_at=None, raise_on_sql_substring=None):
         self.executed = []
         self.deny_lock_keys = deny_lock_keys or set()
         self.last_newnym_at = last_newnym_at
+        # When set, execute() raises RuntimeError the moment a statement
+        # containing this substring runs -- used to prove emit_event()'s
+        # transactional rollback (see test_emit_event_rolls_back_*).
+        self.raise_on_sql_substring = raise_on_sql_substring
 
     def execute(self, sql, params=None):
+        if self.raise_on_sql_substring and self.raise_on_sql_substring in sql:
+            raise RuntimeError(f"simulated failure executing statement containing {self.raise_on_sql_substring!r}")
         self.executed.append((sql, params))
 
     def fetchone(self):
@@ -70,9 +84,13 @@ class FakeCursor:
 
 
 class FakeConnection:
-    def __init__(self, deny_lock_keys=None, last_newnym_at=None):
-        self.cursor_obj = FakeCursor(deny_lock_keys=deny_lock_keys, last_newnym_at=last_newnym_at)
+    def __init__(self, deny_lock_keys=None, last_newnym_at=None, raise_on_sql_substring=None):
+        self.cursor_obj = FakeCursor(
+            deny_lock_keys=deny_lock_keys, last_newnym_at=last_newnym_at,
+            raise_on_sql_substring=raise_on_sql_substring,
+        )
         self.commit_count = 0
+        self.rollback_count = 0
         self.closed = False
 
     def cursor(self):
@@ -80,6 +98,9 @@ class FakeConnection:
 
     def commit(self):
         self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
 
     def close(self):
         self.closed = True
@@ -90,10 +111,14 @@ class FakeConnection:
 
 
 def statuses_set(fake_conn):
-    """Every status value this connection's UPDATE statements set, in order."""
+    """Every status value this connection's UPDATE statements ACTUALLY
+    set, in order -- skips UPDATE tor_circuits statements that don't
+    touch the status column at all (e.g. verify_circuit()'s success/
+    failure paths and _record_genuine_failure(quarantine=False), which
+    by design never change status)."""
     result = []
     for sql, params in fake_conn.executed:
-        if sql.strip().startswith("UPDATE tor_circuits"):
+        if sql.strip().startswith("UPDATE tor_circuits") and "status = %s" in sql:
             result.append(params[0])
     return result
 
@@ -624,7 +649,8 @@ def test_get_circuit_state_returns_none_when_absent():
 def test_get_circuit_state_returns_persisted_fields():
     fake_conn = FakeConnection()
     fake_conn.cursor_obj.fetchone = lambda: (
-        "default", cm.STATUS_READY, 0, "1.2.3.4", None, None
+        "default", cm.STATUS_READY, 0, "1.2.3.4", None, None,
+        0, 0, None, None, None,
     )
 
     with mock.patch.object(cm, "psycopg2") as fake_psycopg2:
@@ -639,6 +665,11 @@ def test_get_circuit_state_returns_persisted_fields():
         "last_exit_ip": "1.2.3.4",
         "last_rotated_at": None,
         "cooldown_until": None,
+        "failure_count": 0,
+        "consecutive_failure_count": 0,
+        "last_error_category": None,
+        "last_verified_at": None,
+        "updated_at": None,
     }
 
 
@@ -688,3 +719,1081 @@ def test_ddl_unique_constraint_matches_on_conflict_target():
 
     assert "instance_key VARCHAR(200) NOT NULL UNIQUE" in cm.CREATE_TOR_INSTANCES_TABLE_SQL
     assert "ON CONFLICT (instance_key) DO NOTHING" in inspect.getsource(cm._ensure_instance_row)
+
+
+# =====================================================================
+# Phase 2 DDL: schema evolution must be idempotent
+# =====================================================================
+
+def test_ddl_observability_columns_use_add_column_if_not_exists():
+    for column in (
+        "failure_count INTEGER NOT NULL DEFAULT 0",
+        "consecutive_failure_count INTEGER NOT NULL DEFAULT 0",
+        "last_error_category VARCHAR(100)",
+        "last_verified_at TIMESTAMPTZ",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column}" in cm.ALTER_TOR_CIRCUITS_ADD_OBSERVABILITY_COLUMNS_SQL, column
+
+
+def test_ensure_tor_circuits_table_runs_the_alter_every_time():
+    """Running ensure_tor_circuits_table() must be safe against a
+    database that already has the Phase 2 columns -- ADD COLUMN IF NOT
+    EXISTS makes repeated runs a no-op rather than an error."""
+    fake_conn = FakeConnection()
+    cm.ensure_tor_circuits_table(fake_conn)
+    cm.ensure_tor_circuits_table(fake_conn)
+
+    alter_calls = [sql for sql, _ in fake_conn.executed if "ADD COLUMN IF NOT EXISTS" in sql]
+    assert len(alter_calls) == 2
+
+
+def test_ddl_events_table_is_idempotent_and_bounded_shape():
+    assert "CREATE TABLE IF NOT EXISTS tor_circuit_events" in cm.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL
+    assert "event_type VARCHAR(50) NOT NULL" in cm.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL
+    assert "detail JSONB NOT NULL DEFAULT '{}'::jsonb" in cm.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL
+    assert "created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP" in cm.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL
+
+
+def test_ddl_events_indexes_cover_bounded_inspection_queries():
+    for index_target in ("created_at", "circuit_key", "event_type"):
+        assert f"ON tor_circuit_events ({index_target})" in cm.CREATE_TOR_CIRCUIT_EVENTS_INDEXES_SQL
+
+
+# =====================================================================
+# emit_event: allowlist, secret-safety, size cap
+# =====================================================================
+
+def test_emit_event_rejects_unknown_event_type():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(fake_conn, "not_an_approved_event_type", circuit_key="default")
+    assert fake_conn.executed == []
+
+
+def test_emit_event_rejects_unknown_detail_field():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_SUCCESS, circuit_key="default",
+                detail={"control_password": "leaked"},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_rejects_oversized_detail():
+    fake_conn = FakeConnection()
+    huge_reason = "x" * 3000
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+                detail={"reason_code": huge_reason},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_accepts_all_approved_event_types():
+    for event_type in cm._ALLOWED_EVENT_TYPES:
+        fake_conn = FakeConnection()
+        with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+            cm.emit_event(fake_conn, event_type, circuit_key="default")
+        insert_calls = [sql for sql, _ in fake_conn.executed if "INSERT INTO tor_circuit_events" in sql]
+        assert len(insert_calls) == 1, event_type
+
+
+def test_emit_event_accepts_allowlisted_detail_fields():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(
+            fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default", instance_key="inst",
+            detail={
+                "error_category": cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE,
+                "duration_seconds": 1.23,
+                "attempt_count": 3,
+                "reason_code": "control_port_unreachable",
+            },
+        )
+    sql, params = fake_conn.executed[-2]  # insert happens before the prune's DELETE
+    assert "INSERT INTO tor_circuit_events" in sql
+    assert params[0] == cm.EVENT_ROTATION_FAILED
+    assert params[1] == "default"
+    assert params[2] == "inst"
+
+
+def test_emit_event_never_stores_exit_ip_field():
+    """The exit IP already lives on tor_circuits.last_exit_ip -- the
+    event detail allowlist must not have a field that could duplicate
+    it into an unbounded, growing event history."""
+    assert "exit_ip" not in cm._ALLOWED_EVENT_DETAIL_FIELDS
+    assert "ip" not in cm._ALLOWED_EVENT_DETAIL_FIELDS
+
+
+def test_emit_event_detail_allowlist_has_no_secret_shaped_fields():
+    forbidden_substrings = ("password", "cookie", "session", "header", "token", "auth")
+    for field in cm._ALLOWED_EVENT_DETAIL_FIELDS:
+        for forbidden in forbidden_substrings:
+            assert forbidden not in field.lower(), field
+
+
+# =====================================================================
+# emit_event: bounded retention
+# =====================================================================
+
+def test_emit_event_prunes_after_insert_using_configured_max_rows():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=42):
+        cm.emit_event(fake_conn, cm.EVENT_RECOVERED, circuit_key="default")
+
+    delete_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("DELETE FROM tor_circuit_events")
+    ]
+    assert len(delete_calls) == 1
+    _, params = delete_calls[0]
+    assert params[0] == 42
+
+
+def test_get_tor_event_max_rows_is_clamped_to_a_sane_range(monkeypatch):
+    import app.config as config
+
+    monkeypatch.setenv("TOR_EVENT_MAX_ROWS", "1")
+    assert config.get_tor_event_max_rows() == 100  # clamped up to the minimum
+
+    monkeypatch.setenv("TOR_EVENT_MAX_ROWS", "999999999")
+    assert config.get_tor_event_max_rows() == 100000  # clamped down to the maximum
+
+    monkeypatch.setenv("TOR_EVENT_MAX_ROWS", "5000")
+    assert config.get_tor_event_max_rows() == 5000
+
+
+# =====================================================================
+# verify_circuit: never NEWNYM, never draining, explicit failure rules
+# =====================================================================
+
+def test_verify_circuit_requires_verify_fn():
+    with pytest.raises(ValueError):
+        cm.verify_circuit(circuit_key="default", verify_fn=None)
+
+
+def test_verify_circuit_success_updates_exit_ip_and_last_verified_at():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        result = cm.verify_circuit(circuit_key="default", verify_fn=lambda: "9.9.9.9")
+
+    assert not fake_newnym.called, "verify_circuit must never send NEWNYM"
+    assert result["exit_ip"] == "9.9.9.9"
+    assert result["last_verified_at"] is not None
+
+    # Never marks draining, never sets `status` at all.
+    assert statuses_set(fake_conn) == []
+
+    update_calls = [sql for sql, _ in fake_conn.executed if sql.strip().startswith("UPDATE tor_circuits")]
+    assert len(update_calls) == 1
+    assert "last_exit_ip = %s" in update_calls[0]
+    assert "last_verified_at = %s" in update_calls[0]
+    assert "consecutive_failure_count = 0" in update_calls[0]
+    assert "last_error_category = NULL" in update_calls[0]
+    assert "status" not in update_calls[0]
+
+
+def test_verify_circuit_releases_lock_on_success():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        cm.verify_circuit(circuit_key="default", verify_fn=lambda: "1.1.1.1")
+
+    assert unlock_call_count(fake_conn, "default") == 1
+
+
+def test_verify_circuit_failure_increments_failure_counters_but_does_not_quarantine():
+    fake_conn = FakeConnection()
+
+    def failing_verify():
+        raise RuntimeError("simulated verification failure")
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(RuntimeError):
+            cm.verify_circuit(circuit_key="default", verify_fn=failing_verify)
+
+    assert not fake_newnym.called
+
+    # No status transition of any kind -- never quarantined.
+    assert statuses_set(fake_conn) == []
+
+    update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_circuits")
+    ]
+    assert len(update_calls) == 1
+    sql, params = update_calls[0]
+    assert "failure_count = failure_count + 1" in sql
+    assert "consecutive_failure_count = consecutive_failure_count + 1" in sql
+    assert "last_error_category = %s" in sql
+    assert params[0] == cm.ERROR_CATEGORY_VERIFICATION_FAILED
+
+    assert unlock_call_count(fake_conn, "default") == 1
+
+
+def test_verify_circuit_raises_when_circuit_lock_already_held():
+    fake_conn = FakeConnection(deny_lock_keys={cm._advisory_lock_key("default")})
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(cm.CircuitLockError):
+            cm.verify_circuit(circuit_key="default", verify_fn=lambda: "1.2.3.4")
+
+
+# =====================================================================
+# quarantine_circuit / recover_circuit: operator actions, not failures
+# =====================================================================
+
+def test_quarantine_circuit_sets_status_without_touching_failure_counters():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        result = cm.quarantine_circuit(circuit_key="default", reason_code="manual_test")
+
+    assert result["status"] == cm.STATUS_QUARANTINED
+    assert statuses_set(fake_conn) == [cm.STATUS_QUARANTINED]
+
+    update_calls = [sql for sql, _ in fake_conn.executed if sql.strip().startswith("UPDATE tor_circuits")]
+    assert len(update_calls) == 1
+    assert "failure_count" not in update_calls[0]
+    assert unlock_call_count(fake_conn, "default") == 1
+
+
+def test_recover_circuit_sets_status_ready_without_touching_failure_counters():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        result = cm.recover_circuit(circuit_key="default")
+
+    assert result["status"] == cm.STATUS_READY
+    assert statuses_set(fake_conn) == [cm.STATUS_READY]
+
+    update_calls = [sql for sql, _ in fake_conn.executed if sql.strip().startswith("UPDATE tor_circuits")]
+    assert len(update_calls) == 1
+    assert "failure_count" not in update_calls[0]
+    assert unlock_call_count(fake_conn, "default") == 1
+
+
+def test_quarantine_and_recover_never_send_newnym():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        cm.quarantine_circuit(circuit_key="default")
+        cm.recover_circuit(circuit_key="default")
+
+    assert not fake_newnym.called
+
+
+# =====================================================================
+# rotate_circuit: Phase 2 failure-counter semantics
+# =====================================================================
+
+def test_rotate_circuit_genuine_control_port_failure_increments_failure_counters():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(
+             cm, "request_new_identity",
+             side_effect=cm.CircuitRotationError("control port unreachable"),
+         ):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(cm.CircuitRotationError):
+            cm.rotate_circuit(circuit_key="default")
+
+    failure_update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_circuits") and "failure_count = failure_count + 1" in sql
+    ]
+    assert len(failure_update_calls) == 1
+    sql, params = failure_update_calls[0]
+    assert "consecutive_failure_count = consecutive_failure_count + 1" in sql
+    assert params[0] == cm.STATUS_QUARANTINED
+    assert params[1] == cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE
+
+
+def test_rotate_circuit_verify_fn_failure_increments_failure_counters_with_verification_category():
+    fake_conn = FakeConnection()
+
+    def failing_verify():
+        raise RuntimeError("exit IP check failed")
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity"):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(RuntimeError):
+            cm.rotate_circuit(circuit_key="default", verify_fn=failing_verify)
+
+    failure_update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_circuits") and "failure_count = failure_count + 1" in sql
+    ]
+    assert len(failure_update_calls) == 1
+    _, params = failure_update_calls[0]
+    assert params[1] == cm.ERROR_CATEGORY_VERIFICATION_FAILED
+
+
+def test_rotate_circuit_verified_success_resets_consecutive_failures_and_sets_last_verified_at():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity"):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        cm.rotate_circuit(circuit_key="default", verify_fn=lambda: "5.6.7.8")
+
+    success_update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_circuits") and "last_verified_at = %s" in sql
+    ]
+    assert len(success_update_calls) == 1
+    sql, params = success_update_calls[0]
+    assert "consecutive_failure_count = 0" in sql
+    assert "last_error_category = NULL" in sql
+    assert "status = %s" in sql
+    assert params[0] == cm.STATUS_READY
+
+
+def test_rotate_circuit_unverified_success_never_touches_last_verified_at_or_failure_state():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity"):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        cm.rotate_circuit(circuit_key="default")
+
+    for sql, _ in fake_conn.executed:
+        if sql.strip().startswith("UPDATE tor_circuits"):
+            assert "last_verified_at" not in sql
+            assert "failure_count" not in sql
+
+
+def test_rotate_circuit_instance_busy_never_touches_failure_counters():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(
+             cm, "request_new_identity",
+             side_effect=cm.TorInstanceBusyError("instance busy"),
+         ):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(cm.TorInstanceBusyError):
+            cm.rotate_circuit(circuit_key="default")
+
+    for sql, _ in fake_conn.executed:
+        if sql.strip().startswith("UPDATE tor_circuits"):
+            assert "failure_count" not in sql
+    assert statuses_set(fake_conn) == [cm.STATUS_DRAINING, cm.STATUS_READY]
+
+
+def test_rotate_circuit_cooldown_never_touches_failure_counters():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(
+             cm, "request_new_identity",
+             side_effect=cm.NewnymCooldownError("cooldown active"),
+         ):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(cm.NewnymCooldownError):
+            cm.rotate_circuit(circuit_key="default")
+
+    for sql, _ in fake_conn.executed:
+        if sql.strip().startswith("UPDATE tor_circuits"):
+            assert "failure_count" not in sql
+
+
+def test_rotate_circuit_lock_contention_never_touches_failure_counters():
+    fake_conn = FakeConnection(deny_lock_keys={cm._advisory_lock_key("default")})
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(cm.CircuitLockError):
+            cm.rotate_circuit(circuit_key="default")
+
+    assert not fake_newnym.called
+    for sql, _ in fake_conn.executed:
+        if sql.strip().startswith("UPDATE tor_circuits"):
+            assert "failure_count" not in sql
+
+
+# =====================================================================
+# request_new_identity: Phase 2 lock_contended / cooldown_blocked events
+# =====================================================================
+
+def test_request_new_identity_emits_lock_contended_when_instance_busy(monkeypatch):
+    monkeypatch.setenv("TOR_CONTROL_HOST", "127.0.0.1")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+
+    instance_key = cm._instance_lock_key("127.0.0.1", 9051)
+    fake_conn = FakeConnection(deny_lock_keys={cm._advisory_lock_key(instance_key)})
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(cm.TorInstanceBusyError):
+            cm.request_new_identity(fake_conn)
+
+    insert_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if "INSERT INTO tor_circuit_events" in sql
+    ]
+    assert len(insert_calls) == 1
+    _, params = insert_calls[0]
+    assert params[0] == cm.EVENT_LOCK_CONTENDED
+    assert params[2] == instance_key  # instance_key column
+
+
+def test_request_new_identity_emits_cooldown_blocked_when_persisted_cooldown_exceeds_max(monkeypatch):
+    monkeypatch.setenv("TOR_CONTROL_HOST", "127.0.0.1")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+    monkeypatch.setenv("TOR_NEWNYM_MIN_INTERVAL_SECONDS", "100")
+
+    fake_conn = FakeConnection(last_newnym_at=cm._utc_now())
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(cm.NewnymCooldownError):
+            cm.request_new_identity(fake_conn, max_wait_seconds=1)
+
+    insert_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if "INSERT INTO tor_circuit_events" in sql
+    ]
+    assert len(insert_calls) == 1
+    _, params = insert_calls[0]
+    assert params[0] == cm.EVENT_COOLDOWN_BLOCKED
+
+
+# =====================================================================
+# is_draining_stale
+# =====================================================================
+
+def test_is_draining_stale_true_when_past_threshold(monkeypatch):
+    monkeypatch.setenv("TOR_STALE_DRAINING_THRESHOLD_SECONDS", "60")
+    now = cm._utc_now()
+    old = now - timedelta(seconds=120)
+    assert cm.is_draining_stale(old, now=now) is True
+
+
+def test_is_draining_stale_false_when_within_threshold(monkeypatch):
+    monkeypatch.setenv("TOR_STALE_DRAINING_THRESHOLD_SECONDS", "300")
+    now = cm._utc_now()
+    recent = now - timedelta(seconds=5)
+    assert cm.is_draining_stale(recent, now=now) is False
+
+
+def test_is_draining_stale_false_when_updated_at_is_none():
+    assert cm.is_draining_stale(None) is False
+
+
+# =====================================================================
+# CRITICAL BOUNDARY (Phase 2 design, section K): a 429/403/timeout/
+# connection-failure from the LOCAL simulator must NEVER, by itself,
+# trigger rotate_circuit()/request_new_identity()/any NEWNYM logic.
+#
+# Each test below builds a plain, Tor-verification-shaped verify_fn
+# (takes no arguments, returns an exit IP string, or raises) backed by
+# the simulator's output, and calls verify_circuit() with it EXPLICITLY
+# -- exactly as a real caller would. request_new_identity is mocked so
+# these tests can assert, directly and unambiguously, that NEWNYM was
+# never invoked no matter what the simulator produced.
+# =====================================================================
+
+def _verify_fn_from_simulator(simulator):
+    """Tor-verification-shaped callable: non-2xx or a simulator
+    exception both surface as a plain raised error, matching how
+    scripts/tor/verify_tor_connectivity.py's real check_exit_ip()/
+    parse_tor_ip_check_response() raise TorVerificationError on
+    anything that isn't a trusted, verified Tor exit IP."""
+    def _verify():
+        response = simulator.next_response()
+        if response.status_code != 200:
+            raise RuntimeError(f"simulated non-200 response: {response.status_code}")
+        return "203.0.113.1"
+    return _verify
+
+
+def test_simulated_429_does_not_trigger_rotation():
+    fake_conn = FakeConnection()
+    simulator = rate_limited_after(0)  # 429 immediately
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(RuntimeError, match="429"):
+            cm.verify_circuit(circuit_key="default", verify_fn=_verify_fn_from_simulator(simulator))
+
+    assert not fake_newnym.called, "a simulated 429 must never trigger NEWNYM/rotation"
+
+
+def test_simulated_403_does_not_trigger_rotation():
+    fake_conn = FakeConnection()
+    simulator = always_403()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(RuntimeError, match="403"):
+            cm.verify_circuit(circuit_key="default", verify_fn=_verify_fn_from_simulator(simulator))
+
+    assert not fake_newnym.called, "a simulated 403 must never trigger NEWNYM/rotation"
+
+
+def test_simulated_timeout_does_not_trigger_rotation():
+    fake_conn = FakeConnection()
+    simulator = always_timeout()
+
+    def verify_fn():
+        simulator.next_response()  # raises SimulatedTimeout
+        return "unreachable"
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(SimulatedTimeout):
+            cm.verify_circuit(circuit_key="default", verify_fn=verify_fn)
+
+    assert not fake_newnym.called, "a simulated timeout must never trigger NEWNYM/rotation"
+
+
+def test_simulated_connection_failure_does_not_trigger_rotation():
+    fake_conn = FakeConnection()
+
+    def verify_fn():
+        raise SimulatedConnectionFailure("simulated connection failure")
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(SimulatedConnectionFailure):
+            cm.verify_circuit(circuit_key="default", verify_fn=verify_fn)
+
+    assert not fake_newnym.called, "a simulated connection failure must never trigger NEWNYM/rotation"
+
+
+def test_simulated_failure_records_verification_failed_but_never_quarantines():
+    """The verification-failure path (proven separately) never
+    quarantines -- restated here specifically for a SIMULATOR-backed
+    verify_fn, to close the loop between 'the simulator can produce a
+    429' and 'a 429 must never escalate to a status change either.'"""
+    fake_conn = FakeConnection()
+    simulator = always_403()
+
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity"):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        with pytest.raises(RuntimeError):
+            cm.verify_circuit(circuit_key="default", verify_fn=_verify_fn_from_simulator(simulator))
+
+    assert statuses_set(fake_conn) == [], "a simulated verification failure must never change circuit status"
+
+
+# =====================================================================
+# record_bootstrap_started / record_bootstrap_ready / record_bootstrap_failed
+# =====================================================================
+
+def test_record_bootstrap_started_sets_checking_and_emits_event():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.record_bootstrap_started(fake_conn, "instance-a")
+
+    update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_instances")
+    ]
+    assert len(update_calls) == 1
+    sql, params = update_calls[0]
+    assert "bootstrap_status = %s" in sql
+    assert params[0] == cm.BOOTSTRAP_STATUS_CHECKING
+
+    insert_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if "INSERT INTO tor_circuit_events" in sql
+    ]
+    assert len(insert_calls) == 1
+    assert insert_calls[0][1][0] == cm.EVENT_BOOTSTRAP_STARTED
+
+
+def test_record_bootstrap_ready_sets_ready_and_clears_error_category():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.record_bootstrap_ready(fake_conn, "instance-a")
+
+    update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_instances")
+    ]
+    assert len(update_calls) == 1
+    sql, params = update_calls[0]
+    assert params[0] == cm.BOOTSTRAP_STATUS_READY
+    assert "last_bootstrap_ready_at = CURRENT_TIMESTAMP" in sql
+    assert "last_bootstrap_error_category = NULL" in sql
+
+    insert_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if "INSERT INTO tor_circuit_events" in sql
+    ]
+    assert insert_calls[0][1][0] == cm.EVENT_BOOTSTRAP_READY
+
+
+def test_record_bootstrap_failed_sets_failed_with_error_category():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.record_bootstrap_failed(fake_conn, "instance-a", cm.ERROR_CATEGORY_BOOTSTRAP_INCOMPLETE)
+
+    update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_instances")
+    ]
+    assert len(update_calls) == 1
+    sql, params = update_calls[0]
+    assert params[0] == cm.BOOTSTRAP_STATUS_FAILED
+    assert params[1] == cm.ERROR_CATEGORY_BOOTSTRAP_INCOMPLETE
+
+    insert_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if "INSERT INTO tor_circuit_events" in sql
+    ]
+    assert insert_calls[0][1][0] == cm.EVENT_BOOTSTRAP_FAILED
+
+
+def test_record_bootstrap_functions_never_send_newnym():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000), \
+         mock.patch.object(cm, "request_new_identity") as fake_newnym:
+        cm.record_bootstrap_started(fake_conn, "instance-a")
+        cm.record_bootstrap_ready(fake_conn, "instance-a")
+        cm.record_bootstrap_failed(fake_conn, "instance-a", cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE)
+
+    assert not fake_newnym.called
+
+
+# =====================================================================
+# Instance readiness schema: ALTER is idempotent, columns present
+# =====================================================================
+
+def test_ddl_bootstrap_columns_use_add_column_if_not_exists():
+    for column in (
+        "bootstrap_status VARCHAR(50) NOT NULL DEFAULT 'unknown'",
+        "last_bootstrap_checked_at TIMESTAMPTZ",
+        "last_bootstrap_ready_at TIMESTAMPTZ",
+        "last_bootstrap_error_category VARCHAR(100)",
+    ):
+        assert f"ADD COLUMN IF NOT EXISTS {column}" in cm.ALTER_TOR_INSTANCES_ADD_BOOTSTRAP_COLUMNS_SQL, column
+
+
+def test_ensure_tor_instances_table_runs_the_alter_every_time():
+    fake_conn = FakeConnection()
+    cm.ensure_tor_instances_table(fake_conn)
+    cm.ensure_tor_instances_table(fake_conn)
+
+    alter_calls = [sql for sql, _ in fake_conn.executed if "ADD COLUMN IF NOT EXISTS bootstrap_status" in sql]
+    assert len(alter_calls) == 2
+
+
+def test_bootstrap_status_default_is_unknown_not_ready():
+    """The schema DEFAULT itself must never silently claim readiness for
+    a freshly-created row."""
+    assert "DEFAULT 'unknown'" in cm.ALTER_TOR_INSTANCES_ADD_BOOTSTRAP_COLUMNS_SQL
+    assert "DEFAULT 'ready'" not in cm.ALTER_TOR_INSTANCES_ADD_BOOTSTRAP_COLUMNS_SQL
+
+
+# =====================================================================
+# emit_event: value-level detail validation (not just field names)
+# =====================================================================
+
+def test_emit_event_rejects_unknown_error_category():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+                detail={"error_category": "totally_made_up_category"},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_rejects_non_string_error_category():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+                detail={"error_category": 12345},
+            )
+    assert fake_conn.executed == []
+
+
+@pytest.mark.parametrize("bad_reason_code", [
+    "has spaces",
+    "UPPERCASE",
+    "https://evil.example.com/steal",
+    "control-password=hunter2",
+    "semi;colon",
+    "a" * 65,
+    "",
+    "line\nbreak",
+    "tab\tchar",
+    "unicode separator",
+])
+def test_emit_event_rejects_unsafe_reason_code_values(bad_reason_code):
+    """Field-name allowlisting alone is not enough -- reason_code's
+    VALUE must be a normalized machine-readable token. Free-form prose,
+    URLs, secrets, or control characters must never reach the database
+    just because the field NAME is approved."""
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_LOCK_CONTENDED, circuit_key="default",
+                detail={"reason_code": bad_reason_code},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_accepts_well_formed_reason_code():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(
+            fake_conn, cm.EVENT_LOCK_CONTENDED, circuit_key="default",
+            detail={"reason_code": "circuit_lock_held"},
+        )
+    insert_calls = [sql for sql, _ in fake_conn.executed if "INSERT INTO tor_circuit_events" in sql]
+    assert len(insert_calls) == 1
+
+
+@pytest.mark.parametrize("bad_duration", [
+    -1.0,
+    -0.001,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    3600.01,
+    "1.5",
+    True,
+    None,
+])
+def test_emit_event_rejects_unsafe_duration_seconds_values(bad_duration):
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_SUCCESS, circuit_key="default",
+                detail={"duration_seconds": bad_duration},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_accepts_valid_duration_seconds_int_and_float():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(fake_conn, cm.EVENT_ROTATION_SUCCESS, detail={"duration_seconds": 0})
+    fake_conn2 = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(fake_conn2, cm.EVENT_ROTATION_SUCCESS, detail={"duration_seconds": 12.5})
+
+
+@pytest.mark.parametrize("bad_attempt_count", [-1, 1001, 1.5, "3", True, None])
+def test_emit_event_rejects_unsafe_attempt_count_values(bad_attempt_count):
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+                detail={"attempt_count": bad_attempt_count},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_accepts_valid_attempt_count():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(fake_conn, cm.EVENT_ROTATION_FAILED, detail={"attempt_count": 3})
+
+
+def test_emit_event_rejects_non_primitive_value_via_value_validator():
+    """A non-primitive object for an approved field name (duration_seconds)
+    is rejected by _validate_event_detail's own type check -- it never
+    reaches json.dumps() at all, which is the strongest possible
+    guarantee (rejected before serialization is even attempted, not
+    merely handled correctly once there)."""
+    class Unserializable:
+        def __str__(self):
+            return "secret-leak-attempt"
+
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(ValueError):
+            cm.emit_event(
+                fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+                detail={"duration_seconds": Unserializable()},
+            )
+    assert fake_conn.executed == []
+
+
+def test_emit_event_json_dumps_call_has_no_default_str_fallback():
+    """Regression guard at the source level: every allowed detail field
+    is now value-validated to a JSON-native primitive before
+    serialization (see _validate_event_detail), so json.dumps() itself
+    no longer needs -- and must not use -- a default=str escape hatch
+    that could silently coerce an unvalidated object into a string."""
+    import inspect
+    source = inspect.getsource(cm.emit_event)
+    # The function's own docstring legitimately DISCUSSES default=str in
+    # prose (explaining why it was removed) -- check the actual CODE
+    # (after the docstring), not the whole source text, for the call.
+    code_only = ast_body_source(cm.emit_event)
+    assert "default=str" not in code_only
+    assert "json.dumps(detail)" in code_only
+
+
+def ast_body_source(func) -> str:
+    """Source of `func`'s body only, excluding its docstring -- lets a
+    source-level regression test check actual code without also
+    matching prose in the docstring that discusses the very thing being
+    guarded against."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    func_node = tree.body[0]
+    body = func_node.body
+
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]  # drop the docstring node
+
+    return "\n".join(ast.get_source_segment(source, node) for node in body)
+
+
+def test_emit_event_max_sized_legitimate_detail_stays_under_size_cap():
+    """Every field is now individually value-validated and bounded
+    (reason_code <= 64 chars, error_category from a short fixed enum,
+    duration_seconds/attempt_count numeric) -- a maximally-sized, fully
+    legitimate combination of all four allowed fields must never itself
+    trip the byte cap. The size cap remains as defense-in-depth (kept
+    per design) for any future field whose value-level bound might be
+    looser than these four."""
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(
+            fake_conn, cm.EVENT_ROTATION_FAILED, circuit_key="default",
+            detail={
+                "reason_code": "a" * 64,
+                "error_category": cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE,
+                "duration_seconds": 3600,
+                "attempt_count": 1000,
+            },
+        )
+    insert_calls = [sql for sql, _ in fake_conn.executed if "INSERT INTO tor_circuit_events" in sql]
+    assert len(insert_calls) == 1
+
+
+def test_emit_event_size_cap_constant_still_present():
+    assert cm._MAX_EVENT_DETAIL_BYTES == 2048
+
+
+# =====================================================================
+# emit_event: transactional insert + prune
+# =====================================================================
+
+def test_emit_event_commits_insert_and_prune_together_on_success():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.emit_event(fake_conn, cm.EVENT_RECOVERED, circuit_key="default")
+
+    assert fake_conn.commit_count == 1, "INSERT and prune DELETE must share exactly one commit"
+    assert fake_conn.rollback_count == 0
+
+
+def test_emit_event_rolls_back_when_prune_fails_and_insert_is_not_left_committed():
+    """Deliberately makes the prune DELETE fail and proves the preceding
+    INSERT was never committed on its own -- INSERT+DELETE+COMMIT must
+    behave as one atomic unit."""
+    fake_conn = FakeConnection(raise_on_sql_substring="DELETE FROM tor_circuit_events")
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            cm.emit_event(fake_conn, cm.EVENT_RECOVERED, circuit_key="default")
+
+    # The INSERT was attempted (it appears in the fake's executed log --
+    # the fake only raises on the LATER DELETE, matching a real DB where
+    # the INSERT itself succeeds within the transaction before the
+    # prune step fails), but crucially it was never COMMITTED: no
+    # commit() call happened, and rollback() was called exactly once --
+    # this is what actually proves the INSERT was not left durably
+    # persisted, since a real database only makes a statement's effects
+    # visible to other connections after COMMIT.
+    insert_calls = [sql for sql, _ in fake_conn.executed if "INSERT INTO tor_circuit_events" in sql]
+    assert len(insert_calls) == 1, "the INSERT should have been attempted before the DELETE failed"
+    assert fake_conn.commit_count == 0, "commit must never happen if the prune step failed"
+    assert fake_conn.rollback_count == 1, "rollback must be called so the INSERT is not left committed"
+
+
+def test_emit_event_rolls_back_when_insert_itself_fails():
+    fake_conn = FakeConnection(raise_on_sql_substring="INSERT INTO tor_circuit_events")
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            cm.emit_event(fake_conn, cm.EVENT_RECOVERED, circuit_key="default")
+
+    assert fake_conn.commit_count == 0
+    assert fake_conn.rollback_count == 1
+
+
+# =====================================================================
+# Shared validators: _validate_error_category / _validate_reason_code
+# =====================================================================
+
+def test_validate_error_category_accepts_all_approved_categories():
+    for category in cm._ALLOWED_ERROR_CATEGORIES:
+        cm._validate_error_category(category)  # must not raise
+
+
+def test_validate_error_category_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        cm._validate_error_category("not_a_real_category")
+
+
+def test_validate_reason_code_accepts_well_formed_value():
+    cm._validate_reason_code("circuit_lock_held")  # must not raise
+
+
+@pytest.mark.parametrize("bad_value", ["has spaces", "UPPER", "a" * 65, "", None, 123])
+def test_validate_reason_code_rejects_unsafe_values(bad_value):
+    with pytest.raises(ValueError):
+        cm._validate_reason_code(bad_value)
+
+
+def test_validate_event_detail_delegates_to_shared_validators():
+    """Source-level guard: _validate_event_detail must call the SAME
+    shared helpers quarantine_circuit()/record_bootstrap_failed() use,
+    not a second hand-maintained copy of the same rules."""
+    import inspect
+    source = inspect.getsource(cm._validate_event_detail)
+    assert "_validate_error_category(" in source
+    assert "_validate_reason_code(" in source
+
+
+# =====================================================================
+# quarantine_circuit(reason_code=...): validated BEFORE any mutation
+# =====================================================================
+
+@pytest.mark.parametrize("bad_reason_code", ["has spaces", "UPPERCASE", "a" * 65, ""])
+def test_quarantine_circuit_rejects_unsafe_reason_code_before_any_mutation(bad_reason_code):
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2:
+        with pytest.raises(ValueError):
+            cm.quarantine_circuit(circuit_key="default", reason_code=bad_reason_code)
+
+    # Validation happens before psycopg2.connect() is even called --
+    # zero DB round-trip of any kind for an invalid reason_code.
+    assert not fake_psycopg2.connect.called
+
+
+def test_quarantine_circuit_accepts_well_formed_reason_code():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        result = cm.quarantine_circuit(circuit_key="default", reason_code="operator_manual_test")
+
+    assert result["status"] == cm.STATUS_QUARANTINED
+    assert statuses_set(fake_conn) == [cm.STATUS_QUARANTINED]
+
+
+def test_quarantine_circuit_none_reason_code_is_not_validated_or_required():
+    fake_conn = FakeConnection()
+    with mock.patch.object(cm, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        fake_psycopg2.connect.return_value = fake_conn
+
+        result = cm.quarantine_circuit(circuit_key="default")  # reason_code=None (default)
+
+    assert result["status"] == cm.STATUS_QUARANTINED
+
+
+# =====================================================================
+# record_bootstrap_failed(error_category=...): validated BEFORE mutation
+# =====================================================================
+
+def test_record_bootstrap_failed_rejects_unknown_error_category_before_any_mutation():
+    fake_conn = FakeConnection()
+
+    with pytest.raises(ValueError):
+        cm.record_bootstrap_failed(fake_conn, "instance-a", "not_a_real_category")
+
+    # Zero mutation of any kind -- not even ensure_tor_instances_table's
+    # own CREATE/ALTER should have run.
+    assert fake_conn.executed == []
+    assert fake_conn.commit_count == 0
+
+
+def test_record_bootstrap_failed_accepts_approved_error_category():
+    fake_conn = FakeConnection()
+
+    with mock.patch.object(cm, "get_tor_event_max_rows", return_value=1000):
+        cm.record_bootstrap_failed(fake_conn, "instance-a", cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE)
+
+    update_calls = [
+        (sql, params) for sql, params in fake_conn.executed
+        if sql.strip().startswith("UPDATE tor_instances")
+    ]
+    assert len(update_calls) == 1
+    assert update_calls[0][1][1] == cm.ERROR_CATEGORY_CONTROL_PORT_FAILURE

@@ -29,16 +29,27 @@ Usage:
 import argparse
 import json
 
+import psycopg2
 from playwright.sync_api import sync_playwright
 from stem.control import Controller
 
 from app.config import (
+    get_postgres_config,
     get_tor_control_host,
     get_tor_control_password,
     get_tor_control_port,
     get_tor_ip_check_url,
 )
-from scripts.tor.circuit_manager import DEFAULT_CIRCUIT_KEY, rotate_circuit
+from scripts.tor.circuit_manager import (
+    DEFAULT_CIRCUIT_KEY,
+    ERROR_CATEGORY_BOOTSTRAP_INCOMPLETE,
+    ERROR_CATEGORY_CONTROL_PORT_FAILURE,
+    _instance_lock_key,
+    record_bootstrap_failed,
+    record_bootstrap_ready,
+    record_bootstrap_started,
+    rotate_circuit,
+)
 from scripts.tor.tor_client import get_proxy_config
 
 
@@ -53,24 +64,55 @@ class TorVerificationError(RuntimeError):
 
 def check_bootstrap_status() -> str:
     """Raises RuntimeError (with the raw phase text) if Tor has not
-    reported PROGRESS=100 yet. Returns the raw phase text on success."""
-    control_password = get_tor_control_password()
+    reported PROGRESS=100 yet. Returns the raw phase text on success.
 
-    with Controller.from_port(
-        address=get_tor_control_host(),
-        port=get_tor_control_port(),
-    ) as controller:
-        if control_password:
-            controller.authenticate(password=control_password)
-        else:
-            controller.authenticate()
+    Also persists this bootstrap observation via the control-plane side
+    (scripts/tor/circuit_manager.py's record_bootstrap_started/ready/
+    failed) -- NEVER via the docker/tor container itself, which stays
+    PostgreSQL-credential-free. Only a normalized error_category ever
+    reaches the database; the raw phase text / exception here is for the
+    caller (this function's return value / raised exception) only, and
+    is never itself written to tor_circuit_events.
 
-        phase = controller.get_info("status/bootstrap-phase", "")
+    This function is invoked explicitly (CLI `main()` below, or a
+    direct call) -- never automatically from collector traffic, and
+    never as a side effect of ordinary job-search requests.
+    """
+    control_host = get_tor_control_host()
+    control_port = get_tor_control_port()
+    instance_key = _instance_lock_key(control_host, control_port)
 
-    if "PROGRESS=100" not in phase:
-        raise RuntimeError(f"Tor has not finished bootstrapping yet: {phase!r}")
+    connection = psycopg2.connect(**get_postgres_config())
 
-    return phase
+    try:
+        record_bootstrap_started(connection, instance_key)
+
+        control_password = get_tor_control_password()
+
+        try:
+            with Controller.from_port(
+                address=control_host,
+                port=control_port,
+            ) as controller:
+                if control_password:
+                    controller.authenticate(password=control_password)
+                else:
+                    controller.authenticate()
+
+                phase = controller.get_info("status/bootstrap-phase", "")
+        except Exception:
+            record_bootstrap_failed(connection, instance_key, ERROR_CATEGORY_CONTROL_PORT_FAILURE)
+            raise
+
+        if "PROGRESS=100" not in phase:
+            record_bootstrap_failed(connection, instance_key, ERROR_CATEGORY_BOOTSTRAP_INCOMPLETE)
+            raise RuntimeError(f"Tor has not finished bootstrapping yet: {phase!r}")
+
+        record_bootstrap_ready(connection, instance_key)
+        return phase
+
+    finally:
+        connection.close()
 
 
 def check_exit_ip() -> str:

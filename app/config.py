@@ -136,3 +136,24 @@ def get_tor_newnym_max_wait_seconds():
     NewnymCooldownError instead. Never exceeded -- this is what keeps
     the wait bounded rather than an unbounded/blocking sleep."""
     return _get_int_env_value("TOR_NEWNYM_MAX_WAIT_SECONDS", 5)
+
+
+def get_tor_event_max_rows():
+    """Phase 2: bounds tor_circuit_events retention (see
+    scripts/tor/circuit_manager.py emit_event()'s synchronous pruning --
+    not a background cleanup daemon). Clamped to [100, 100000] regardless
+    of the configured value, so a misconfigured env var can neither
+    disable retention (unbounded row growth) nor prune events before
+    anything has a chance to read them."""
+    raw = _get_int_env_value("TOR_EVENT_MAX_ROWS", 1000)
+    return max(100, min(raw, 100000))
+
+
+def get_tor_stale_draining_threshold_seconds():
+    """Phase 2: how long a circuit may sit in STATUS_DRAINING before
+    observability (scripts/tor/observability.py) reports it as stale --
+    almost certainly a rotation that started but never finished (e.g. a
+    crash mid-NEWNYM). Purely observational: reaching this threshold
+    never auto-recovers the circuit -- only an explicit
+    recover_circuit() call does (see scripts/tor/circuit_manager.py)."""
+    return _get_int_env_value("TOR_STALE_DRAINING_THRESHOLD_SECONDS", 300)
