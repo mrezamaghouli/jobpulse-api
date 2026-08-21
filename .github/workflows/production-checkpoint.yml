@@ -163,7 +163,7 @@ jobs:
 
           PG_READY_RC=0
           if docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-            pg_isready -U "$DB_USER" -d "$DB_NAME"; then
+            pg_isready -U "$DB_USER" -d "$DB_NAME" < /dev/null; then
             PG_READY_RC=0
           else
             PG_READY_RC=$?
@@ -199,7 +199,7 @@ jobs:
             umask 077
             docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
               pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner --no-privileges \
-              > "$TMP_DUMP"
+              < /dev/null > "$TMP_DUMP"
           ); then
             fail "pg_dump or creation of temporary backup file failed"
           fi
