@@ -49,10 +49,22 @@ jobs:
 
           set +e
           ssh -i ~/.ssh/jobpulse_checkpoint_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' | tee "$OUTPUT_FILE"
-          set -euo pipefail
+            "RUN_ID='${{ github.run_id }}' bash -s" <<'REMOTE' 2>&1 | tee "$OUTPUT_FILE"
+          set -Eeuo pipefail
 
           RUN_ID="${RUN_ID:?RUN_ID is required}"
+
+          # Generic failure tracer: fires on any command that trips set -e,
+          # including inside functions (requires -E). Reports rc/line/command
+          # only -- never env or secret values -- so it is safe to leave on.
+          report_err() {
+            local rc=$?
+            local line="$1"
+            local cmd="$2"
+            echo "CHECKPOINT_ERROR_TRACE: rc=${rc} line=${line} cmd=${cmd}" >&2
+            return "$rc"
+          }
+          trap 'report_err "$LINENO" "$BASH_COMMAND"' ERR
 
           fail() {
             echo "CHECKPOINT_FAILED: $*" >&2
@@ -126,19 +138,49 @@ jobs:
           echo "backup filesystem:"
           df -h "$BACKUP_DIR"
 
+          echo "existing checkpoint artifacts (read-only listing, most recent 20):"
+          ARTIFACT_LISTING="$(
+            find "$BACKUP_DIR" -maxdepth 1 -type f -name '*_checkpoint.dump*' \
+              -printf '%T@ %f bytes=%s mode=%m owner=%U:%G time=%TY-%Tm-%TdT%TH:%TM:%TSZ\n' 2>/dev/null \
+              | sort -rn \
+              | head -n 20 \
+              | cut -d' ' -f2- \
+              || true
+          )"
+          if [ -n "$ARTIFACT_LISTING" ]; then
+            echo "$ARTIFACT_LISTING"
+          else
+            echo "(none found)"
+          fi
+
           [ -w "$BACKUP_DIR" ] || fail "backup directory is not writable by checkpoint SSH user: $BACKUP_DIR"
 
           DB_SERVICE="db"
           DB_USER="jobpulse_user"
           DB_NAME="jobpulse"
 
-          docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
-            pg_isready -U "$DB_USER" -d "$DB_NAME" \
-            || fail "production PostgreSQL is not ready for checkpoint backup"
+          echo "checkpoint_stage=before_pg_isready"
+
+          PG_READY_RC=0
+          if docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+            pg_isready -U "$DB_USER" -d "$DB_NAME" < /dev/null; then
+            PG_READY_RC=0
+          else
+            PG_READY_RC=$?
+          fi
+
+          echo "checkpoint_stage=pg_isready_result rc=$PG_READY_RC"
+
+          if [ "$PG_READY_RC" -ne 0 ]; then
+            fail "production PostgreSQL readiness command failed with rc=$PG_READY_RC"
+          fi
+
+          echo "checkpoint_stage=postgres_ready"
 
           # Inline hardened backup creation (no retention/rotation of any kind:
           # this workflow must never delete or rotate pre-existing backups).
           TS="$(date -u +"%Y%m%dT%H%M%SZ")"
+          echo "checkpoint_stage=timestamp_created ts=$TS"
           TMP_DUMP="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.tmp"
           TMP_LIST="$BACKUP_DIR/.checkpoint_${DB_NAME}_${TS}.dump.list.tmp"
           NEW_BACKUP="$BACKUP_DIR/${DB_NAME}_${TS}_checkpoint.dump"
@@ -157,11 +199,13 @@ jobs:
             umask 077
             docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
               pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner --no-privileges \
-              > "$TMP_DUMP"
+              < /dev/null > "$TMP_DUMP"
           ); then
             fail "pg_dump or creation of temporary backup file failed"
           fi
           test -s "$TMP_DUMP" || fail "temporary dump is empty"
+
+          echo "checkpoint_stage=pg_dump_ok bytes=$(stat -c%s "$TMP_DUMP")"
 
           if ! (
             umask 077
@@ -172,14 +216,23 @@ jobs:
           fi
           test -s "$TMP_LIST" || fail "temporary pg_restore list is empty"
 
+          echo "checkpoint_stage=pg_restore_list_ok bytes=$(stat -c%s "$TMP_LIST")"
+
           chmod 600 "$TMP_DUMP" "$TMP_LIST" || fail "failed to set restrictive permissions on temporary backup files"
+
+          echo "checkpoint_stage=temp_permissions_ok"
 
           # Atomic, no-clobber promotion: ln fails loudly (EEXIST) instead of
           # silently overwriting if a same-named backup already exists.
           ln "$TMP_DUMP" "$NEW_BACKUP" || fail "failed to atomically promote backup (target may already exist): $NEW_BACKUP"
           rm -f "$TMP_DUMP"
+
+          echo "checkpoint_stage=dump_promoted path=$NEW_BACKUP"
+
           ln "$TMP_LIST" "$LIST_FILE" || fail "failed to atomically promote backup TOC listing (target may already exist): $LIST_FILE"
           rm -f "$TMP_LIST"
+
+          echo "checkpoint_stage=list_promoted path=$LIST_FILE"
 
           trap - EXIT
 
@@ -188,6 +241,8 @@ jobs:
 
           LIST_MODE_BITS="$(stat -c '%a' "$LIST_FILE")"
           [ "$LIST_MODE_BITS" = "600" ] || fail "backup TOC listing does not have exact mode 600: $LIST_MODE_BITS"
+
+          echo "checkpoint_stage=backup_modes_ok"
 
           stat -c '%a %U:%G %n' "$NEW_BACKUP"
 
@@ -200,6 +255,8 @@ jobs:
           chmod 600 "$SHA_FILE" || fail "failed to set restrictive permissions on checksum file"
           SHA_MODE_BITS="$(stat -c '%a' "$SHA_FILE")"
           [ "$SHA_MODE_BITS" = "600" ] || fail "checksum file does not have exact mode 600: $SHA_MODE_BITS"
+
+          echo "checkpoint_stage=checksum_ok"
 
           cat > "$MANIFEST_FILE" <<JSON
           {
@@ -218,17 +275,27 @@ jobs:
           MANIFEST_MODE_BITS="$(stat -c '%a' "$MANIFEST_FILE")"
           [ "$MANIFEST_MODE_BITS" = "600" ] || fail "manifest file does not have exact mode 600: $MANIFEST_MODE_BITS"
 
+          echo "checkpoint_stage=manifest_ok"
+
           REAL_BACKUP_PATH="$NEW_BACKUP"
           REAL_BACKUP_MODE="pg_dump custom (-Fc --no-owner --no-privileges)"
 
           echo "== validate backup =="
 
-          TOC="$(cat "$NEW_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" pg_restore --list)"
+          TOC="$(
+            docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+              pg_restore --list < "$NEW_BACKUP"
+          )"
           [ -n "$TOC" ] || fail "pg_restore --list produced no output"
 
+          echo "checkpoint_stage=toc_read_ok bytes=${#TOC}"
+
           for t in jobs companies linkedin_query_runs; do
-            echo "$TOC" | grep -qE "\\b${t}\\b" || fail "expected table missing from backup TOC: $t"
+            grep -qE "\\b${t}\\b" <<< "$TOC" \
+              || fail "expected table missing from backup TOC: $t"
           done
+
+          echo "checkpoint_stage=toc_tables_ok"
 
           echo "== disposable restore verification =="
 
@@ -261,9 +328,14 @@ jobs:
           done
           [ "$ready" -eq 1 ] || fail "disposable postgres never became ready"
 
-          cat "$NEW_BACKUP" | docker exec -i "$PG_NAME" pg_restore \
+          echo "checkpoint_stage=disposable_postgres_ready"
+
+          docker exec -i "$PG_NAME" pg_restore \
             -U checkpoint_verify -d checkpoint_verify \
-            --no-owner --no-privileges --exit-on-error
+            --no-owner --no-privileges --exit-on-error \
+            < "$NEW_BACKUP"
+
+          echo "checkpoint_stage=disposable_restore_ok"
 
           count_table() {
             docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
@@ -278,6 +350,8 @@ jobs:
           [ "$RESTORED_JOBS_COUNT" -gt 0 ] || fail "jobs table restored but empty"
           [ "$RESTORED_COMPANIES_COUNT" -ge 0 ] || fail "companies table missing from restored backup"
           [ "$RESTORED_LINKEDIN_QUERY_RUNS_COUNT" -ge 0 ] || fail "linkedin_query_runs table missing from restored backup"
+
+          echo "checkpoint_stage=restored_counts_ok jobs=$RESTORED_JOBS_COUNT companies=$RESTORED_COMPANIES_COUNT linkedin_query_runs=$RESTORED_LINKEDIN_QUERY_RUNS_COUNT"
 
           docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
