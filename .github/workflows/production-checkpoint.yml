@@ -282,12 +282,20 @@ jobs:
 
           echo "== validate backup =="
 
-          TOC="$(cat "$NEW_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" pg_restore --list)"
+          TOC="$(
+            docker compose -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+              pg_restore --list < "$NEW_BACKUP"
+          )"
           [ -n "$TOC" ] || fail "pg_restore --list produced no output"
 
+          echo "checkpoint_stage=toc_read_ok bytes=${#TOC}"
+
           for t in jobs companies linkedin_query_runs; do
-            echo "$TOC" | grep -qE "\\b${t}\\b" || fail "expected table missing from backup TOC: $t"
+            grep -qE "\\b${t}\\b" <<< "$TOC" \
+              || fail "expected table missing from backup TOC: $t"
           done
+
+          echo "checkpoint_stage=toc_tables_ok"
 
           echo "== disposable restore verification =="
 
@@ -320,9 +328,14 @@ jobs:
           done
           [ "$ready" -eq 1 ] || fail "disposable postgres never became ready"
 
-          cat "$NEW_BACKUP" | docker exec -i "$PG_NAME" pg_restore \
+          echo "checkpoint_stage=disposable_postgres_ready"
+
+          docker exec -i "$PG_NAME" pg_restore \
             -U checkpoint_verify -d checkpoint_verify \
-            --no-owner --no-privileges --exit-on-error
+            --no-owner --no-privileges --exit-on-error \
+            < "$NEW_BACKUP"
+
+          echo "checkpoint_stage=disposable_restore_ok"
 
           count_table() {
             docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
@@ -337,6 +350,8 @@ jobs:
           [ "$RESTORED_JOBS_COUNT" -gt 0 ] || fail "jobs table restored but empty"
           [ "$RESTORED_COMPANIES_COUNT" -ge 0 ] || fail "companies table missing from restored backup"
           [ "$RESTORED_LINKEDIN_QUERY_RUNS_COUNT" -ge 0 ] || fail "linkedin_query_runs table missing from restored backup"
+
+          echo "checkpoint_stage=restored_counts_ok jobs=$RESTORED_JOBS_COUNT companies=$RESTORED_COMPANIES_COUNT linkedin_query_runs=$RESTORED_LINKEDIN_QUERY_RUNS_COUNT"
 
           docker exec "$PG_NAME" psql -U checkpoint_verify -d checkpoint_verify -tAc \
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
