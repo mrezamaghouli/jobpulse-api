@@ -5,6 +5,18 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      run_real_tor:
+        description: >-
+          Run the live Tor integration job (tests/test_tor_real_integration.py
+          -- real Tor daemon bootstrap against the live Tor network). Leave
+          false for an ordinary manual CI run; this exists ONLY so that job
+          can be triggered deliberately, on demand, never as a side effect
+          of an ordinary push/PR/manual dispatch.
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   verify:
@@ -73,10 +85,14 @@ jobs:
         # Scoped, network-free suite covering the Phase 2 Tor
         # control-plane (scripts/tor/circuit_manager.py,
         # scripts/tor/observability.py, scripts/tor/local_http_simulator.py)
-        # plus the pre-existing Tor unit tests. Every test in these six
-        # files mocks psycopg2 and stem.control.Controller -- none opens
-        # a real database connection or contacts a real Tor process, and
-        # none performs live LinkedIn/network traffic. This is
+        # plus the pre-existing Tor unit tests, plus
+        # tests/test_tor_dark_launch_script.py (Phase 3), which executes
+        # the real scripts/tor/production_dark_launch.sh with fake
+        # docker/curl binaries placed first on PATH -- no real Docker, no
+        # real network. Every other file here mocks psycopg2 and
+        # stem.control.Controller -- none opens a real database
+        # connection or contacts a real Tor process, and none performs
+        # live LinkedIn/network traffic. This is
         # DELIBERATELY separate from a full-repository pytest run: the
         # repository has 7 known, pre-existing, environment-sensitive
         # failures (subprocess/signal/process-group behavior) unrelated
@@ -94,6 +110,8 @@ jobs:
             tests/test_tor_client_config.py \
             tests/test_tor_healthcheck_restart_safety.py \
             tests/test_verify_tor_connectivity.py \
+            tests/test_tor_production_dark_launch.py \
+            tests/test_tor_dark_launch_script.py \
             -v
 
       - name: Create dummy prod env files for compose validation
@@ -106,10 +124,39 @@ jobs:
           printf '%s\n' 'JOBPULSE_ADMIN_TOKEN=dummy-ci-admin-token' | sudo tee /opt/jobpulse/.admin.env >/dev/null
           printf '%s\n' 'dummy-ci-admin-token' | sudo tee /opt/jobpulse/.admin_token >/dev/null
           printf '%s\n' 'TELEGRAM_BOT_TOKEN=dummy' | sudo tee /opt/jobpulse/.telegram_alert.env >/dev/null
+          printf '%s\n' 'dummy-ci-tor-control-password' | sudo tee /opt/jobpulse/.tor_control_password >/dev/null
 
       - name: Validate Docker Compose config
         run: |
           docker compose -f docker-compose.prod.yml config
+
+      - name: Validate production Tor dark-launch overlay config
+        # Phase 3: proves the merged prod + tor overlay config resolves,
+        # adds only tor/tor-diagnostic on top of the untouched base
+        # services, publishes no 9050/9051 host ports, and leaves api's
+        # TOR_ENABLED at "false" with no depends_on pointing at tor. This
+        # is a config-resolution check only -- it starts no containers.
+        env:
+          JOBPULSE_TOR_IMAGE: ghcr.io/mrezamaghouli/jobpulse-tor:ci-dummy
+        run: |
+          docker compose -f docker-compose.prod.yml -f docker-compose.prod.tor.yml config
+
+          echo "-- asserting no host port publication for 9050/9051 --"
+          if docker compose -f docker-compose.prod.yml -f docker-compose.prod.tor.yml config --format json \
+            | python3 -c "import json,sys; c=json.load(sys.stdin); assert 'ports' not in c['services']['tor'], 'tor service must not publish ports'; print('OK: no published ports for tor service')"; then
+            :
+          else
+            echo "FAILED: tor service must not have a ports: mapping" >&2
+            exit 1
+          fi
+
+          echo "-- asserting api stays TOR_ENABLED=false and has no depends_on tor --"
+          docker compose -f docker-compose.prod.yml -f docker-compose.prod.tor.yml config --format json \
+            | python3 -c "import json,sys; c=json.load(sys.stdin); api=c['services']['api']; assert api['environment'].get('TOR_ENABLED')=='false', api['environment'].get('TOR_ENABLED'); assert 'tor' not in api.get('depends_on', {}), api.get('depends_on'); print('OK: api.TOR_ENABLED=false, no depends_on tor')"
+
+          echo "-- asserting tor-diagnostic only appears under the tor-ops profile --"
+          docker compose -f docker-compose.prod.yml -f docker-compose.prod.tor.yml config --format json \
+            | python3 -c "import json,sys; c=json.load(sys.stdin); assert 'tor-diagnostic' not in c['services'], 'tor-diagnostic must not appear without --profile tor-ops'; print('OK: tor-diagnostic absent from default config')"
 
       - name: Check production shell scripts
         run: |
@@ -416,3 +463,91 @@ jobs:
 
           print('PostgreSQL 16 Tor integration test executed for real with zero skips: OK')
           "
+
+  tor-real-integration:
+    name: Real Tor bootstrap integration (Phase 3 dark launch)
+    runs-on: ubuntu-latest
+    # Separate, real-Tor-daemon job -- deliberately NOT part of the fast
+    # `verify` job above. Builds the real docker/tor image, starts a real
+    # disposable container, and requires genuine outbound connectivity to
+    # the live Tor network to bootstrap -- exactly the kind of slower,
+    # network-dependent work that must never gate ordinary PR/push CI.
+    # tests/test_tor_real_integration.py is self-skipping unless
+    # RUN_REAL_TOR_INTEGRATION=1 is set (see that file's module-level
+    # skip marker), which this job sets explicitly.
+    #
+    # EXPLICIT OPT-IN GATE: this job must run ONLY on a deliberate manual
+    # workflow_dispatch with run_real_tor=true -- never as a side effect
+    # of an ordinary push to main, an ordinary pull_request, or even an
+    # ordinary manual dispatch that leaves the input at its false
+    # default. `inputs.run_real_tor` is only defined at all for a
+    # workflow_dispatch event, hence the `github.event_name ==
+    # 'workflow_dispatch' &&` guard first -- evaluating `inputs.run_real_tor`
+    # against a push/pull_request event, without that guard, would be
+    # comparing an undefined input to `true` (falsy) rather than
+    # necessarily short-circuiting, so the explicit event-name check is
+    # the actual, unambiguous gate, not a redundant belt-and-suspenders
+    # check.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_real_tor == true
+    #
+    # No LinkedIn traffic: the only external endpoint contacted is the
+    # neutral https://check.torproject.org/api/ip check (or
+    # TOR_IP_CHECK_URL override), routed through the disposable
+    # container's own SOCKS port via a throwaway curl container. No
+    # NEWNYM anywhere in this job.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run real Tor disposable-container integration suite
+        # `--junit-xml` + the parser below proves the suite was actually
+        # EXECUTED for real (skipped=0) rather than silently no-op'd by
+        # its own opt-in skip guard -- pytest's exit code alone can't
+        # distinguish "ran and passed" from "all skipped."
+        env:
+          RUN_REAL_TOR_INTEGRATION: "1"
+        run: |
+          python -m pytest tests/test_tor_real_integration.py -v -rs --junit-xml=tor-real-integration-report.xml
+
+          python -c "
+          import sys
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse('tor-real-integration-report.xml')
+          root = tree.getroot()
+          suite = root if root.tag == 'testsuite' else root.find('testsuite')
+
+          tests = int(suite.get('tests', 0))
+          skipped = int(suite.get('skipped', 0))
+          failures = int(suite.get('failures', 0))
+          errors = int(suite.get('errors', 0))
+
+          print(f'tests={tests} skipped={skipped} failures={failures} errors={errors}')
+
+          if tests == 0:
+              print('No tests were collected in tests/test_tor_real_integration.py -- treating as failure', file=sys.stderr)
+              sys.exit(1)
+          if skipped > 0:
+              print(f'{skipped} test(s) were unexpectedly SKIPPED in CI -- the real Tor integration suite must actually run here, never be skipped', file=sys.stderr)
+              sys.exit(1)
+          if failures > 0 or errors > 0:
+              sys.exit(1)
+
+          print('Real Tor disposable-container integration suite executed for real with zero skips: OK')
+          "
+
+      - name: Clean up any leftover Tor integration containers/images
+        if: always()
+        run: |
+          docker ps -a --filter "name=jobpulse-tor-it-" --format '{{.Names}}' | xargs -r docker rm -f
+          docker image rm jobpulse-tor-it:local 2>/dev/null || true

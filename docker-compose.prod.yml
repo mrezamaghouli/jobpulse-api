@@ -34,6 +34,14 @@ services:
       JOB_PROVIDER: postgres
       APP_ENV: production
       RATE_LIMIT_ENABLED: "true"
+      # Phase 3 dark-launch invariant, explicit rather than implicit:
+      # this literal wins over any TOR_ENABLED value from .env/env_file
+      # (Compose `environment:` overrides `env_file:`), and is unaffected
+      # by whether docker-compose.prod.tor.yml is applied alongside this
+      # file -- that overlay never redeclares this `api` service. Only
+      # the operator-invoked tor-diagnostic service (profile `tor-ops`,
+      # defined in docker-compose.prod.tor.yml) ever sets TOR_ENABLED=true.
+      TOR_ENABLED: "false"
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

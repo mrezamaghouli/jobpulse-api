@@ -1476,6 +1476,16 @@ def _parse_args():
     )
     recover_parser.add_argument("--circuit-id", default=DEFAULT_CIRCUIT_KEY)
 
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help=(
+            "Manually verify a circuit's current exit IP WITHOUT sending "
+            "NEWNYM (Phase 3 dark-launch preferred validation -- see "
+            "verify_circuit())."
+        ),
+    )
+    verify_parser.add_argument("--circuit-id", default=DEFAULT_CIRCUIT_KEY)
+
     return parser.parse_args()
 
 
@@ -1497,6 +1507,21 @@ def main():
     elif args.command == "recover":
         result = recover_circuit(circuit_key=args.circuit_id)
         print(f"Circuit '{args.circuit_id}' recovered: {result}")
+
+    elif args.command == "verify":
+        # Deferred import: scripts.tor.verify_tor_connectivity already
+        # imports FROM this module, so importing it at module top level
+        # here would be circular. check_exit_ip() is the same neutral,
+        # non-LinkedIn connectivity check that verify_tor_connectivity's
+        # own `--rotate` path passes to rotate_circuit() as verify_fn --
+        # reused here as verify_circuit()'s verify_fn instead, which
+        # NEVER sends NEWNYM (see verify_circuit()'s docstring). This is
+        # the preferred Phase 3 dark-launch validation path: confirm the
+        # circuit works without rotating it.
+        from scripts.tor.verify_tor_connectivity import check_exit_ip
+
+        result = verify_circuit(circuit_key=args.circuit_id, verify_fn=check_exit_ip)
+        print(f"Circuit '{args.circuit_id}' verified (no rotation): {result}")
 
 
 if __name__ == "__main__":

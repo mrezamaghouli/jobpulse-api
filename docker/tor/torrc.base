@@ -1,10 +1,12 @@
-# Local development/testing Tor instance for the experiment/tor-proxy-test
-# branch only. Not a production configuration.
+# Shared Tor daemon config for both the local dev/testing overlay
+# (docker-compose.tor.yml) and the production dark-launch overlay
+# (docker-compose.prod.tor.yml). This file only configures the Tor
+# process itself -- neither overlay is implied by anything here.
 #
 # ControlPort is bound to 0.0.0.0 here because it is only ever reachable
 # from other containers on the internal docker-compose network -- it is
-# never published to the host (see docker-compose.tor.yml, which uses
-# `expose`, not `ports`, for this service).
+# never published to the host in either overlay (both use `expose`, not
+# `ports`, for this service).
 SocksPort 0.0.0.0:9050
 ControlPort 0.0.0.0:9051
 DataDirectory /var/lib/tor
@@ -16,10 +18,10 @@ Log notice stdout
 # listener opens well before bootstrap completes).
 Log notice file /var/log/tor/notices.log
 
-# Container starts (and this entrypoint runs) as root so it can write
-# /etc/tor/torrc at boot; Tor binds the listener sockets above and then
-# drops privileges to this user internally. Root-owned DataDirectory
-# ownership would otherwise make Tor refuse to start -- see
+# Container starts (and this entrypoint runs) as root so it can write the
+# generated torrc under /run/tor at boot; Tor binds the listener sockets
+# above and then drops privileges to this user internally. Root-owned
+# DataDirectory ownership would otherwise make Tor refuse to start -- see
 # docker/tor/entrypoint.sh, which chowns /var/lib/tor to this same user
 # before Tor is exec'd.
 User debian-tor

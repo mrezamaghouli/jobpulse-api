@@ -113,7 +113,34 @@ def get_tor_control_port():
     return _get_int_env_value("TOR_CONTROL_PORT", 9051)
 
 
+def get_tor_control_password_file():
+    """Path to a file containing the plaintext ControlPort password (e.g.
+    a Docker/Compose secret mount such as /run/secrets/tor_control_password).
+    Preferred over TOR_CONTROL_PASSWORD in production: only a FILE PATH
+    (never the secret itself) needs to travel through the container
+    environment/`docker inspect`. See get_tor_control_password()."""
+    return get_env_value("TOR_CONTROL_PASSWORD_FILE", "").strip()
+
+
 def get_tor_control_password():
+    """Prefers TOR_CONTROL_PASSWORD_FILE when set (reads and returns its
+    contents, trailing whitespace stripped) -- this is the production
+    path, and never requires the plaintext password as an environment
+    variable value. Falls back to the TOR_CONTROL_PASSWORD environment
+    variable (local dev/CI convenience only) when no file is configured.
+    Never logs or echoes the resolved value; callers (e.g.
+    scripts/tor/circuit_manager.py) must keep the same discipline."""
+    password_file = get_tor_control_password_file()
+
+    if password_file:
+        try:
+            with open(password_file, "r") as file_handle:
+                return file_handle.read().strip()
+        except OSError as error:
+            raise RuntimeError(
+                f"TOR_CONTROL_PASSWORD_FILE is set but could not be read: {password_file}"
+            ) from error
+
     return get_env_value("TOR_CONTROL_PASSWORD", "")
 
 
