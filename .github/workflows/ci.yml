@@ -69,6 +69,33 @@ jobs:
           python -m py_compile scripts/build_linkedin_collection_targets.py
           python -m py_compile scripts/migrate_database.py
 
+      - name: Run focused Tor unit suite (no real Tor daemon, no network)
+        # Scoped, network-free suite covering the Phase 2 Tor
+        # control-plane (scripts/tor/circuit_manager.py,
+        # scripts/tor/observability.py, scripts/tor/local_http_simulator.py)
+        # plus the pre-existing Tor unit tests. Every test in these six
+        # files mocks psycopg2 and stem.control.Controller -- none opens
+        # a real database connection or contacts a real Tor process, and
+        # none performs live LinkedIn/network traffic. This is
+        # DELIBERATELY separate from a full-repository pytest run: the
+        # repository has 7 known, pre-existing, environment-sensitive
+        # failures (subprocess/signal/process-group behavior) unrelated
+        # to Tor, tracked separately and not gated on here -- adding a
+        # full-repo job in this pass would make PR CI red for reasons
+        # having nothing to do with the change being validated. The
+        # separate, real PostgreSQL 16 Tor integration job below
+        # (`tor-postgres-integration`) is what actually exercises this
+        # code against a live database.
+        run: |
+          PYTHONPATH=. python -m pytest \
+            tests/test_tor_circuit_manager.py \
+            tests/test_tor_observability.py \
+            tests/test_tor_local_simulator.py \
+            tests/test_tor_client_config.py \
+            tests/test_tor_healthcheck_restart_safety.py \
+            tests/test_verify_tor_connectivity.py \
+            -v
+
       - name: Create dummy prod env files for compose validation
         shell: bash
         run: |
@@ -228,4 +255,164 @@ jobs:
               sys.exit(1)
 
           print('PostgreSQL 16 integration test executed for real with zero skips: OK')
+          "
+
+
+  tor-postgres-integration:
+    name: PostgreSQL 16 Tor control-plane integration
+    runs-on: ubuntu-latest
+    # Runs ONLY tests/test_tor_circuit_manager_postgres_integration.py --
+    # real PostgreSQL 16 evidence for the Phase 2 Tor control-plane
+    # additions in scripts/tor/circuit_manager.py and
+    # scripts/tor/observability.py: idempotent schema creation, the
+    # ADD COLUMN IF NOT EXISTS Phase-1-to-Phase-2 upgrade path, bounded
+    # event retention, failure-counter persistence, real advisory-lock
+    # contention/release/crash-disconnect behavior, and the pg_locks
+    # busy-inspection mapping observability.py relies on. Scoped to a
+    # single file, against a disposable CI-provided database -- never
+    # production, never Docker directly (a GitHub Actions `services:`
+    # container, not this repo invoking Docker itself). No real Tor
+    # daemon is used or required: only stem.control.Controller is
+    # mocked where a NEWNYM exchange would otherwise be attempted: real
+    # PostgreSQL-side locking/schema/retention behavior does not need
+    # one, and Tor connectivity itself is proven separately in
+    # tests/test_verify_tor_connectivity.py (no PostgreSQL dependency).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jobpulse_tor_test
+          POSTGRES_PASSWORD: jobpulse_tor_test
+          POSTGRES_DB: jobpulse_tor_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobpulse_tor_test -d jobpulse_tor_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      JOBPULSE_TOR_TEST_POSTGRES_DSN: "postgresql://jobpulse_tor_test:jobpulse_tor_test@localhost:5432/jobpulse_tor_test"
+      # scripts/tor/circuit_manager.py's real functions (rotate_circuit,
+      # verify_circuit, quarantine_circuit, recover_circuit, emit_event,
+      # ...) each open their OWN connection via
+      # app.config.get_postgres_config() -- there is no test-DSN
+      # injection point in that module's public API (matching its
+      # Phase 1 design), so these must point at the SAME disposable
+      # database as JOBPULSE_TOR_TEST_POSTGRES_DSN above. POSTGRES_DB
+      # deliberately contains "test" -- the integration test file
+      # itself refuses to run otherwise (see its _require_disposable_
+      # postgres_env safety guard), specifically to prevent ever
+      # writing into this project's own default dev/prod-like database
+      # credentials by accident.
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: jobpulse_tor_test
+      POSTGRES_USER: jobpulse_tor_test
+      POSTGRES_PASSWORD: jobpulse_tor_test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpq-dev postgresql-client
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Preflight -- DSN set, psycopg2/stem importable, database reachable
+        # Same discipline as the postgres-upsert-integration job's own
+        # preflight: a bounded psycopg2 connection retry using the SAME
+        # driver and DSN the integration test itself uses, not merely
+        # `pg_isready`. Also confirms stem is importable, since several
+        # tests in this file patch stem.control.Controller.
+        run: |
+          python -c "
+          import os
+          import sys
+          import time
+
+          dsn = os.environ.get('JOBPULSE_TOR_TEST_POSTGRES_DSN', '')
+          if not dsn:
+              print('JOBPULSE_TOR_TEST_POSTGRES_DSN is not set or empty', file=sys.stderr)
+              sys.exit(1)
+          print('JOBPULSE_TOR_TEST_POSTGRES_DSN is set: OK')
+
+          try:
+              import psycopg2
+          except ImportError as exc:
+              print(f'psycopg2 import failed: {exc}', file=sys.stderr)
+              sys.exit(1)
+          print('psycopg2 import: OK')
+
+          try:
+              import stem
+          except ImportError as exc:
+              print(f'stem import failed: {exc}', file=sys.stderr)
+              sys.exit(1)
+          print('stem import: OK')
+
+          max_attempts = 30
+          delay_seconds = 1.0
+
+          for attempt in range(1, max_attempts + 1):
+              try:
+                  conn = psycopg2.connect(dsn, connect_timeout=5)
+                  conn.close()
+                  print(f'PostgreSQL reachable after {attempt} attempt(s): OK')
+                  sys.exit(0)
+              except Exception as exc:
+                  print(f'attempt {attempt}/{max_attempts} failed: {exc}')
+                  if attempt < max_attempts:
+                      time.sleep(delay_seconds)
+
+          print(f'PostgreSQL never became reachable within {max_attempts} attempts ({max_attempts * delay_seconds:.0f}s bound)', file=sys.stderr)
+          sys.exit(1)
+          "
+
+      - name: Run the PostgreSQL 16 Tor integration test only (fails if skipped)
+        # `--junit-xml` + the parser below is what proves the test file
+        # was actually EXECUTED for real (skipped=0), not merely that
+        # pytest exited 0 -- pytest's own exit code is 0 whether tests
+        # ran or were all skipped, so the exit code alone cannot detect
+        # "the DSN preflight passed but the test still didn't run."
+        run: |
+          PYTHONPATH=. python -m pytest tests/test_tor_circuit_manager_postgres_integration.py -v -rs --junit-xml=tor-pg-integration-report.xml
+
+          python -c "
+          import sys
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse('tor-pg-integration-report.xml')
+          root = tree.getroot()
+          suite = root if root.tag == 'testsuite' else root.find('testsuite')
+
+          tests = int(suite.get('tests', 0))
+          skipped = int(suite.get('skipped', 0))
+          failures = int(suite.get('failures', 0))
+          errors = int(suite.get('errors', 0))
+
+          print(f'tests={tests} skipped={skipped} failures={failures} errors={errors}')
+
+          if tests == 0:
+              print('No tests were collected in tests/test_tor_circuit_manager_postgres_integration.py -- treating as failure', file=sys.stderr)
+              sys.exit(1)
+          if skipped > 0:
+              print(f'{skipped} test(s) were unexpectedly SKIPPED in CI -- the PostgreSQL 16 Tor integration test must actually run here, never be skipped', file=sys.stderr)
+              sys.exit(1)
+          if failures > 0 or errors > 0:
+              sys.exit(1)
+
+          print('PostgreSQL 16 Tor integration test executed for real with zero skips: OK')
           "
