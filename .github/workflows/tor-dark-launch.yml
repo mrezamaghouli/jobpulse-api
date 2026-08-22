@@ -1,0 +1,136 @@
+name: Production Tor Dark Launch
+
+# ============================================================================
+# PHASE 3 DESIGN ONLY -- NOT TO BE DISPATCHED AS PART OF THIS TASK.
+#
+# This workflow is written so the manual dark-launch procedure exists as
+# reviewable, version-controlled code, not tribal knowledge. It has never
+# been run. Dispatching it is a separate, explicit, future decision by an
+# operator -- creating this file does not start, schedule, or authorize
+# any run of it.
+# ============================================================================
+#
+# workflow_dispatch ONLY -- this must never trigger automatically. It is
+# NOT wired to "Build JobPulse Tor Image" or "Deploy Production" the way
+# deploy.yml reacts to "Build JobPulse API Image": no `push`, no
+# `workflow_run`, no `schedule` trigger exists here at all. Building/
+# pushing a new Tor image (tor-image-build.yml) or deploying an
+# application change (deploy.yml) can never, by themselves, cause this
+# workflow to run.
+#
+# This workflow is deliberately THIN: all operational logic (secret
+# preconditions, GHCR auth, image pull + identity verification, tor-only
+# start, before/after API invariant checks, tor-only rollback on any
+# failure) lives in the version-controlled, directly-testable
+# scripts/tor/production_dark_launch.sh -- see
+# tests/test_tor_dark_launch_script.py, which executes that EXACT file
+# (never a duplicated/simplified copy) with fake docker/curl on PATH.
+# This job's only jobs are: validate the operator-supplied image
+# reference, establish SSH, and invoke the ALREADY-DEPLOYED copy of that
+# exact script at /opt/jobpulse/scripts/tor/production_dark_launch.sh on
+# the remote host (put there by the normal deploy pipeline, same as every
+# other scripts/ file -- this workflow never scp's/pushes it itself).
+#
+# Deliberately does NOT pipe the script body over the ssh session's
+# stdin (an earlier design did): doing so would leave stdin unavailable
+# for anything else, forcing GHCR_TOKEN_B64 into the ssh command line
+# itself, where it is a plain process argv substring on the remote host
+# for the life of that command (observable via `ps`/`/proc/<pid>/cmdline`
+# to any other local user/process with visibility into the process
+# table). Invoking the already-deployed path instead frees stdin to
+# carry GHCR_TOKEN_B64: the remote shell reads it into an env var via
+# `$(cat)` before exec'ing the script, so the token bytes are never a
+# command-line argument on the remote host. Residual exposure: once
+# assigned, the token is visible in that one remote bash (and its
+# `docker login` child) process's own environment -- e.g. via
+# /proc/<pid>/environ to the same user or root -- which is unavoidable
+# since docker login must receive it somehow; this eliminates only the
+# argv/`ps` exposure, not same-host root/same-user introspection.
+# TOR_IMAGE_B64 is NOT a secret (a strictly-validated image reference,
+# already gated by the step above) and stays in the ssh argv assignment.
+on:
+  workflow_dispatch:
+    inputs:
+      tor_image:
+        description: >-
+          Exact immutable Tor image to launch, e.g.
+          ghcr.io/mrezamaghouli/jobpulse-tor:<40-char-commit-sha>. Must be
+          pinned to a commit SHA tag -- "main"/"latest" are rejected.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-tor-dark-launch
+  cancel-in-progress: false
+
+jobs:
+  dark-launch:
+    runs-on: ubuntu-latest
+
+    env:
+      VM_HOST: "35.192.251.190"
+      VM_USER: "mrezamaghouli"
+      VM_PORT: "22"
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      TOR_IMAGE_INPUT: ${{ inputs.tor_image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "VM_SSH_KEY secret is missing"
+            exit 1
+          fi
+
+          # Must be ghcr.io/mrezamaghouli/jobpulse-tor:<40-hex-char-sha> --
+          # explicitly rejects "main"/"latest"/short SHAs/any other
+          # floating tag, any foreign registry or repository, and any
+          # value containing shell metacharacters or whitespace (the
+          # regex's fixed charset admits none), so a dark-launch run
+          # always names an exact, reviewable image. Revalidated again,
+          # independently, on the remote host by
+          # scripts/tor/production_dark_launch.sh itself -- this step
+          # must never be the only gate.
+          if ! [[ "$TOR_IMAGE_INPUT" =~ ^ghcr\.io/mrezamaghouli/jobpulse-tor:[0-9a-f]{40}$ ]]; then
+            echo "ERROR: tor_image must be ghcr.io/mrezamaghouli/jobpulse-tor:<40-char-commit-sha> (got: $TOR_IMAGE_INPUT)" >&2
+            exit 1
+          fi
+
+          echo "Validated tor_image: $TOR_IMAGE_INPUT"
+
+      - name: Run Tor dark-launch on production VM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_tor_launch_key
+          chmod 600 ~/.ssh/jobpulse_tor_launch_key
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          TOR_IMAGE_B64="$(printf '%s' "$TOR_IMAGE_INPUT" | base64 -w 0)"
+          GHCR_TOKEN_B64="$(printf '%s' "${GHCR_TOKEN:-}" | base64 -w 0)"
+
+          # Invokes the exact, already-deployed script file at
+          # /opt/jobpulse/scripts/tor/production_dark_launch.sh -- the
+          # same file exercised by tests/test_tor_dark_launch_script.py,
+          # never a duplicated/simplified copy. GHCR_TOKEN_B64 travels
+          # only over this ssh session's stdin (never the command line);
+          # the remote shell reads it into an env var via `$(cat)` before
+          # running the script. See the comment block above this job for
+          # why (avoids the token being a process argv substring on the
+          # remote host).
+          ssh -i ~/.ssh/jobpulse_tor_launch_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            "GHCR_TOKEN_B64=\"\$(cat)\" TOR_IMAGE_B64='$TOR_IMAGE_B64' /opt/jobpulse/scripts/tor/production_dark_launch.sh" \
+            <<< "$GHCR_TOKEN_B64"

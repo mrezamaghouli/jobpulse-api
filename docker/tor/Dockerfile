@@ -1,6 +1,11 @@
-# Local development/testing Tor instance for the experiment/tor-proxy-test
-# branch. Not built or referenced by the default docker-compose.yml or by
-# docker-compose.prod.yml -- only docker-compose.tor.yml uses this image.
+# Shared Tor daemon image for both the local dev/testing overlay
+# (docker-compose.tor.yml, which builds this Dockerfile directly) and
+# production (built and published as an immutable
+# ghcr.io/mrezamaghouli/jobpulse-tor:<tag> image by
+# .github/workflows/tor-image-build.yml, consumed by
+# docker-compose.prod.tor.yml -- production never uses `build:`). Not
+# built or referenced by the default docker-compose.yml or by
+# docker-compose.prod.yml itself.
 FROM debian:bookworm-slim
 
 RUN apt-get update \

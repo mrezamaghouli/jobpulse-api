@@ -14,7 +14,19 @@ bootstrapped at all.
 These are structural/configuration-level checks against the entrypoint
 script and compose healthcheck text, not a real Docker restart -- see
 the Phase 1 runtime validation report for the live restart test against
-the isolated Tor test container.
+the isolated Tor test container, and
+tests/test_tor_real_integration.py::test_real_container_restart_does_not_report_stale_health
+for the Phase 3 real-container proof of the same property.
+
+Phase 3 note: entrypoint.sh now generates the resolved paths from
+LOG_DIR/DATA_DIR/RUNTIME_DIR shell variables (RUNTIME_DIR/torrc moved off
+/etc/tor so the container can run with a read-only root filesystem --
+see docker/tor/README-secret-model.md and docker-compose.prod.tor.yml)
+rather than hardcoding the literal paths inline. These tests check both
+that the variables resolve to the same literal paths as before AND that
+the same ordering invariants (mkdir before truncate, truncate before
+chown, chown/chmod before `exec tor`) still hold against the new,
+variable-based script.
 """
 import re
 from pathlib import Path
@@ -26,7 +38,7 @@ COMPOSE_PATH = REPO_ROOT / "docker-compose.tor.yml"
 ENTRYPOINT_SOURCE = ENTRYPOINT_PATH.read_text()
 COMPOSE_SOURCE = COMPOSE_PATH.read_text()
 
-NOTICES_LOG = "/var/log/tor/notices.log"
+NOTICES_LOG = '"$LOG_DIR/notices.log"'
 
 
 def _index_of(substring: str, text: str = ENTRYPOINT_SOURCE) -> int:
@@ -67,13 +79,17 @@ def test_ownership_is_reapplied_after_truncation():
         "chown must run AFTER truncation so the recreated/truncated file "
         "ends up owned by debian-tor, not root"
     )
-    assert "/var/log/tor" in ENTRYPOINT_SOURCE[chown_index:chown_index + 80]
+    assert '"$LOG_DIR"' in ENTRYPOINT_SOURCE[chown_index:chown_index + 80]
+    # LOG_DIR must actually resolve to the real notices.log directory --
+    # a variable name alone proves nothing without pinning its value too.
+    assert "LOG_DIR=/var/log/tor" in ENTRYPOINT_SOURCE
 
 
 def test_data_directory_permissions_unchanged():
     """This fix must not weaken DataDirectory's mode -- Tor refuses to
     start if it isn't 700."""
-    assert "chmod 700 /var/lib/tor" in ENTRYPOINT_SOURCE
+    assert 'chmod 700 "$DATA_DIR"' in ENTRYPOINT_SOURCE
+    assert "DATA_DIR=/var/lib/tor" in ENTRYPOINT_SOURCE
 
 
 def test_fix_does_not_touch_control_port_authentication():

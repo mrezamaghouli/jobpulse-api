@@ -1,0 +1,183 @@
+# Production Tor dark-launch overlay (Phase 3).
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.tor.yml \
+#     up -d --no-build tor
+#
+# Adds a Tor daemon to the production stack for bootstrap/health/restart/
+# secret-handling/control-plane validation. Deliberately does NOT
+# redefine api/db/frontend: this overlay adds only the `tor` service (plus
+# an optional, never-auto-started `tor-diagnostic` operator service under
+# the `tor-ops` profile) -- api/db/frontend's compose definitions,
+# environment, health, and startup ordering in docker-compose.prod.yml
+# are completely untouched whether or not this overlay is applied. api's
+# TOR_ENABLED stays "false" (see docker-compose.prod.yml) and api has no
+# depends_on pointing at this service.
+#
+# Security settings below (read_only, cap_drop/cap_add, tmpfs mounts)
+# were arrived at experimentally against a real container built from
+# docker/tor/Dockerfile (Tor 0.4.9.11 / debian:bookworm-slim), not
+# assumed -- see the inline notes on each setting. Confirmed: container
+# reaches Bootstrapped 100%, ControlPort auth succeeds, the root
+# filesystem is genuinely read-only (write attempts outside the tmpfs
+# mounts fail), and restarting the container does not report stale
+# health from a previous process's bootstrap line.
+#
+# Requires TOR_CONTROL_PASSWORD_FILE's target to exist on the host --
+# production convention: /opt/jobpulse/.tor_control_password, mode 600,
+# owned by the production user. That real file is never created by this
+# repository/task.
+services:
+  tor:
+    # Immutable, prebuilt image only -- no `build:` in production. Built
+    # and pushed by .github/workflows/tor-image-build.yml as
+    # ghcr.io/mrezamaghouli/jobpulse-tor:<tag>. Fails closed (refuses to
+    # start) if JOBPULSE_TOR_IMAGE is not set -- no `latest`/`main`
+    # default for an actual production rollout, so an operator can never
+    # accidentally launch an unpinned image by forgetting to set this.
+    image: ${JOBPULSE_TOR_IMAGE:?JOBPULSE_TOR_IMAGE is required, e.g. ghcr.io/mrezamaghouli/jobpulse-tor:<commit-sha>}
+    container_name: jobpulse-tor-prod
+    restart: unless-stopped
+
+    # Secret model (see docker/tor/README-secret-model.md): only a FILE
+    # PATH travels through the environment/`docker inspect` -- never the
+    # plaintext password. The real secret file
+    # (/opt/jobpulse/.tor_control_password, mode 600) is bind-mounted
+    # read-only at a fixed, conventional path.
+    environment:
+      TOR_CONTROL_PASSWORD_FILE: /run/secrets/tor_control_password
+    volumes:
+      - /opt/jobpulse/.tor_control_password:/run/secrets/tor_control_password:ro
+
+    expose:
+      - "9050"
+      - "9051"
+    # Deliberately no `ports:` -- 9050/9051 are reachable only from other
+    # containers on this compose project's internal Docker network, never
+    # from the host's public interfaces. Confirmed via
+    # `docker compose config` (see tests/test_tor_production_dark_launch.py)
+    # that no `ports:` mapping is present for this service.
+
+    healthcheck:
+      # Same discipline as the existing dev overlay: greps for the
+      # CURRENT process's own "Bootstrapped 100%" line, not just a TCP
+      # connect -- and docker/tor/entrypoint.sh truncates notices.log on
+      # every start specifically so a restarted container can never read
+      # as healthy from a PREVIOUS process's bootstrap line. Verified
+      # experimentally: `docker restart` on a running, healthy container
+      # drops health to "starting" and only returns to "healthy" once the
+      # new process re-bootstraps to 100% -- never reports healthy from
+      # the stale log line still present on the tmpfs mount across a
+      # restart (mounts persist across restart; only the entrypoint's
+      # explicit truncation prevents the stale read).
+      test: ["CMD", "grep", "-q", "Bootstrapped 100%", "/var/log/tor/notices.log"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+    # --- Hardening, experimentally verified against a real container ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Minimum capability set that actually boots Tor under `read_only:
+    # true` -- determined by trial, not assumed:
+    #   CHOWN, DAC_OVERRIDE, FOWNER -- entrypoint.sh's `chown -R
+    #     debian-tor:debian-tor ...` and subsequent `chmod 700
+    #     /var/lib/tor` (dropping ALL alone made both fail: chown needs
+    #     CHOWN, and chmod-ing a directory no longer owned by root once
+    #     it's been chowned to debian-tor needs FOWNER; the secret file
+    #     bind mount, owned by the host user rather than root, also needs
+    #     DAC_OVERRIDE for entrypoint.sh's root process to read it under
+    #     `cap_drop: ALL`).
+    #   SETUID, SETGID -- Tor's own internal privilege drop from root (it
+    #     binds the SocksPort/ControlPort listeners as root, per
+    #     torrc.base, then drops to the `debian-tor` user) requires these;
+    #     without them Tor cannot complete its own setuid/setgid call.
+    # NET_BIND_SERVICE is deliberately NOT added: 9050/9051 are
+    # unprivileged (>1024) ports, and omitting it was confirmed not to
+    # block startup.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+
+    read_only: true
+    tmpfs:
+      # /run/tor holds the torrc generated at boot (moved off
+      # /etc/tor/torrc so /etc itself can stay part of the read-only
+      # image layer -- see docker/tor/entrypoint.sh).
+      - /run/tor:mode=0755
+      - /var/lib/tor:mode=0700
+      - /var/log/tor:mode=0755
+
+    # No privileged mode, no host networking, no Docker socket, no
+    # unrelated production secrets/volumes -- this service's only mounts
+    # are the two tmpfs paths above and the single read-only secret file
+    # bind mount.
+    mem_limit: 128m
+    cpus: 0.5
+
+  # ---------------------------------------------------------------------
+  # Operator-only diagnostic, gated behind an explicit Compose profile so
+  # it NEVER starts as part of `up`, `up -d`, or `up -d tor` -- only
+  # `docker compose ... --profile tor-ops run --rm tor-diagnostic`
+  # (or `up` with --profile tor-ops explicitly passed) will start it, and
+  # only for the single diagnostic run before it exits.
+  #
+  # Reuses the existing JobPulse API image (same Python/Playwright/stem/
+  # Phase 2 module environment scripts/tor/production_dark_launch_check.py
+  # needs) rather than building a separate diagnostic image.
+  # ---------------------------------------------------------------------
+  tor-diagnostic:
+    profiles:
+      - tor-ops
+    image: ${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}
+    container_name: jobpulse-tor-diagnostic
+    restart: "no"
+    depends_on:
+      tor:
+        condition: service_healthy
+
+    # This is the ONLY place TOR_ENABLED=true is ever set anywhere in the
+    # production compose graph -- api/db/frontend (docker-compose.prod.yml)
+    # and the tor service above never set it. Scoped to this one-off,
+    # explicitly-invoked diagnostic container only.
+    environment:
+      TOR_ENABLED: "true"
+      TOR_SOCKS_HOST: tor
+      TOR_SOCKS_PORT: "9050"
+      TOR_CONTROL_HOST: tor
+      TOR_CONTROL_PORT: "9051"
+      TOR_CONTROL_PASSWORD_FILE: /run/secrets/tor_control_password
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      # Neutral connectivity check only -- never a LinkedIn URL. Operators
+      # may override via .env if they prefer a different neutral endpoint.
+      TOR_IP_CHECK_URL: ${TOR_IP_CHECK_URL:-https://check.torproject.org/api/ip}
+
+    volumes:
+      - /opt/jobpulse/.tor_control_password:/run/secrets/tor_control_password:ro
+    env_file:
+      # Only PostgreSQL connection details (needed for Phase 2 bootstrap
+      # persistence) -- deliberately NOT .api_keys.env or
+      # /opt/jobpulse/.admin.env, which api itself uses and which this
+      # diagnostic has no reason to see.
+      - .env
+
+    command: ["python", "-m", "scripts.tor.production_dark_launch_check"]
+
+    # No ports, no Docker socket. Never calls collector code -- this
+    # image's default command (running the API server) is overridden
+    # above; nothing here executes app/main.py or any collector module.
+    #
+    # NOTE (open item, not yet experimentally verified in this task):
+    # check_exit_ip()'s Playwright/Chromium launch may need adjustments
+    # (e.g. shared-memory size, sandbox flags) under a locked-down
+    # container profile. This service intentionally does NOT set
+    # read_only/cap_drop here until that is verified against the real
+    # jobpulse-api image + Playwright/Chromium combination -- see the
+    # Phase 3 report's open items. Tracked as a follow-up, not shipped
+    # as an untested claim.
