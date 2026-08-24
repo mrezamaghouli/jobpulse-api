@@ -88,11 +88,14 @@ jobs:
         # plus the pre-existing Tor unit tests, plus
         # tests/test_tor_dark_launch_script.py (Phase 3), which executes
         # the real scripts/tor/production_dark_launch.sh with fake
-        # docker/curl binaries placed first on PATH -- no real Docker, no
-        # real network. Every other file here mocks psycopg2 and
-        # stem.control.Controller -- none opens a real database
-        # connection or contacts a real Tor process, and none performs
-        # live LinkedIn/network traffic. This is
+        # docker/curl binaries placed first on PATH, plus
+        # tests/test_tor_secret_provision.py (Phase 3.1), which executes
+        # the real .github/scripts/tor/provision_production_secret.sh
+        # with fake docker/curl/stat/git/ln binaries placed first on PATH
+        # -- no real Docker, no real network. Every other file here mocks
+        # psycopg2 and stem.control.Controller -- none opens a real
+        # database connection or contacts a real Tor process, and none
+        # performs live LinkedIn/network traffic. This is
         # DELIBERATELY separate from a full-repository pytest run: the
         # repository has 7 known, pre-existing, environment-sensitive
         # failures (subprocess/signal/process-group behavior) unrelated
@@ -112,6 +115,7 @@ jobs:
             tests/test_verify_tor_connectivity.py \
             tests/test_tor_production_dark_launch.py \
             tests/test_tor_dark_launch_script.py \
+            tests/test_tor_secret_provision.py \
             -v
 
       - name: Create dummy prod env files for compose validation
