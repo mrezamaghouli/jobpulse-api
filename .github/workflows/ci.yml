@@ -91,8 +91,14 @@ jobs:
         # docker/curl binaries placed first on PATH, plus
         # tests/test_tor_secret_provision.py (Phase 3.1), which executes
         # the real .github/scripts/tor/provision_production_secret.sh
-        # with fake docker/curl/stat/git/ln binaries placed first on PATH
-        # -- no real Docker, no real network. Every other file here mocks
+        # with fake docker/curl/stat/git/ln binaries placed first on PATH,
+        # plus tests/test_production_runtime_diagnostic.py (Phase 3.1A),
+        # a static audit of the read-only
+        # production-runtime-diagnostic.yml workflow (workflow_dispatch
+        # trigger shape, secrets usage, forbidden-command absence,
+        # metadata-only docker inspect templates, bash -n syntax on the
+        # extracted remote script) -- no real Docker, no real network,
+        # no SSH. Every other file here mocks
         # psycopg2 and stem.control.Controller -- none opens a real
         # database connection or contacts a real Tor process, and none
         # performs live LinkedIn/network traffic. This is
@@ -116,6 +122,7 @@ jobs:
             tests/test_tor_production_dark_launch.py \
             tests/test_tor_dark_launch_script.py \
             tests/test_tor_secret_provision.py \
+            tests/test_production_runtime_diagnostic.py \
             -v
 
       - name: Create dummy prod env files for compose validation
