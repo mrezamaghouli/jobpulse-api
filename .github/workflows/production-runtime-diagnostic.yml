@@ -1,0 +1,200 @@
+name: Production Runtime Diagnostic
+
+# ============================================================================
+# PHASE 3.1A -- READ-ONLY PRODUCTION FRONTEND / CONTAINER DIAGNOSIS.
+#
+# This workflow gathers evidence about the state of production containers
+# (in particular jobpulse-frontend-prod) so a human can classify what is
+# actually running there. It NEVER starts/stops/restarts/creates/removes
+# any container, NEVER runs `docker compose up/down`, NEVER touches Tor,
+# NEVER reads any secret file, and NEVER mutates the git working tree or
+# filesystem on the production VM. workflow_dispatch ONLY -- no push,
+# pull_request, workflow_run, or schedule trigger exists here, so this can
+# never run as a side effect of ordinary CI or of docker-build.yml /
+# tor-image-build.yml / deploy.yml.
+#
+# Only secrets.VM_SSH_KEY is used here, purely to establish SSH transport.
+# Every remote command is read-only: `git status`/`git rev-parse`,
+# `docker compose ... config|ps`, `docker ps`, `docker inspect` restricted
+# to a small metadata format string (name/id/image id/status/StartedAt/
+# RestartCount/health -- never .Config.Env or any secret/mount content),
+# and two plain `curl` health probes.
+# ============================================================================
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-runtime-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    env:
+      VM_HOST: "35.192.251.190"
+      VM_USER: "mrezamaghouli"
+      VM_PORT: "22"
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+
+    steps:
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "VM_SSH_KEY secret is missing"
+            exit 1
+          fi
+
+      - name: Run read-only production runtime diagnostic
+        id: diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_diagnostic_key
+          chmod 600 ~/.ssh/jobpulse_diagnostic_key
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          OUTPUT_FILE="$(mktemp)"
+
+          set +e
+          ssh -i ~/.ssh/jobpulse_diagnostic_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            bash -s <<'REMOTE' 2>&1 | tee "$OUTPUT_FILE"
+          # No `set -e`: this is a pure evidence-gathering pass. A single
+          # missing container or a failed probe must not abort the rest of
+          # the diagnostic -- every section below reports its own result
+          # instead of letting the script die partway through.
+          set -uo pipefail
+
+          cd /opt/jobpulse || { echo "DIAG_ERROR: cannot cd to /opt/jobpulse"; exit 1; }
+
+          COMPOSE_FILE="docker-compose.prod.yml"
+          # Not a secret -- the currently expected deployed Phase 3 SHA,
+          # for evidence-only comparison against the VM's actual checkout.
+          # Never used to fetch/reset/checkout/pull; a mismatch is reported,
+          # not corrected.
+          EXPECTED_PRODUCTION_SHA="5dffbd669eec52f5283503bb6409a430509175a0"
+
+          echo "===DIAGNOSTIC_START==="
+
+          echo "== identity =="
+          hostname
+          ACTUAL_PRODUCTION_SHA="$(git rev-parse HEAD)"
+          echo "$ACTUAL_PRODUCTION_SHA"
+          git status --short
+
+          echo "== expected vs actual production SHA (evidence only) =="
+          echo "production_sha_expected=$EXPECTED_PRODUCTION_SHA"
+          echo "production_sha_actual=$ACTUAL_PRODUCTION_SHA"
+          if [ "$ACTUAL_PRODUCTION_SHA" = "$EXPECTED_PRODUCTION_SHA" ]; then
+            echo "production_sha_match=yes"
+          else
+            echo "production_sha_match=no"
+          fi
+
+          echo "== compose: declared services =="
+          docker compose -f "$COMPOSE_FILE" config --services
+          echo "compose_config_rc=$?"
+
+          echo "== compose: ps -a =="
+          docker compose -f "$COMPOSE_FILE" ps -a
+          echo "compose_ps_rc=$?"
+
+          echo "== docker: ps -a (all containers) =="
+          docker ps -a \
+            --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+
+          echo "== frontend resolved through compose service id =="
+          FRONTEND_COMPOSE_ID="$(docker compose -f "$COMPOSE_FILE" ps -a -q frontend)"
+          if [ -n "$FRONTEND_COMPOSE_ID" ]; then
+            echo "frontend_compose_id=$FRONTEND_COMPOSE_ID"
+          else
+            echo "frontend_compose_id=NONE"
+          fi
+
+          echo "== frontend search by compose service label =="
+          docker ps -a \
+            --filter 'label=com.docker.compose.service=frontend' \
+            --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}'
+
+          echo "== jobpulse-named containers =="
+          docker ps -a \
+            --filter 'name=jobpulse' \
+            --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'
+
+          echo "== port 80 occupant evidence =="
+          docker ps -a \
+            --filter 'publish=80' \
+            --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'
+
+          echo "== metadata-only container inspection =="
+          # Deliberately restricted format string: name/id/image id/status/
+          # StartedAt/RestartCount/health only. Never .Config.Env, never any
+          # environment variable, never mount/secret contents.
+          inspect_metadata() {
+            local name="$1"
+            if docker inspect "$name" --format '{{.Id}}' >/dev/null 2>&1; then
+              docker inspect "$name" --format \
+                'name={{.Name}} id={{.Id}} image_id={{.Image}} status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}'
+            else
+              echo "name=$name status=NOT_FOUND"
+            fi
+          }
+          inspect_metadata jobpulse-api-prod
+          inspect_metadata jobpulse-postgres-prod
+          inspect_metadata jobpulse-frontend-prod
+
+          echo "== read-only health checks =="
+          API_RC=0
+          curl -fsS http://127.0.0.1:8000/health || API_RC=$?
+          echo "api_health_rc=$API_RC"
+
+          FRONTEND_RC=0
+          curl -sS -o /dev/null -w 'frontend_http_status=%{http_code}\n' \
+            http://127.0.0.1/ || FRONTEND_RC=$?
+          echo "frontend_curl_rc=$FRONTEND_RC"
+
+          echo "===DIAGNOSTIC_END==="
+          echo "PRODUCTION_RUNTIME_DIAGNOSTIC_COMPLETE"
+          REMOTE
+          SSH_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$SSH_EXIT" -ne 0 ] || ! grep -q '^PRODUCTION_RUNTIME_DIAGNOSTIC_COMPLETE$' "$OUTPUT_FILE"; then
+            echo "PRODUCTION_RUNTIME_DIAGNOSTIC_INCOMPLETE"
+            {
+              echo "## Production Runtime Diagnostic"
+              echo
+              echo "**Result: PRODUCTION_RUNTIME_DIAGNOSTIC_INCOMPLETE**"
+              echo
+              echo '```'
+              cat "$OUTPUT_FILE"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## Production Runtime Diagnostic"
+            echo
+            echo '```'
+            sed -n '/===DIAGNOSTIC_START===/,/===DIAGNOSTIC_END===/p' "$OUTPUT_FILE"
+            echo '```'
+            echo
+            echo "**Result: PRODUCTION_RUNTIME_DIAGNOSTIC_COMPLETE**"
+            echo
+            echo "This report is evidence only. Classification (frontend present"
+            echo "normally / renamed / missing / another container on port 80 /"
+            echo "inconsistent Compose metadata / other) is a human judgment call"
+            echo "based on the sections above -- this workflow does not guess."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "PRODUCTION_RUNTIME_DIAGNOSTIC_COMPLETE"
