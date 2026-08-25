@@ -139,11 +139,18 @@ jobs:
           # Deliberately restricted format string: name/id/image id/status/
           # StartedAt/RestartCount/health only. Never .Config.Env, never any
           # environment variable, never mount/secret contents.
+          # `{{with (index .State "Health")}}` looks up "Health" as a map
+          # key and only enters the block if present -- unlike
+          # `{{if .State.Health}}`, which errors ("map has no entry for
+          # key Health") on Docker versions where a container with no
+          # HEALTHCHECK omits the key entirely rather than zero-valuing it
+          # (observed against jobpulse-frontend-prod, an nginx:alpine
+          # container with no HEALTHCHECK configured).
           inspect_metadata() {
             local name="$1"
             if docker inspect "$name" --format '{{.Id}}' >/dev/null 2>&1; then
               docker inspect "$name" --format \
-                'name={{.Name}} id={{.Id}} image_id={{.Image}} status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}'
+                'name={{.Name}} id={{.Id}} image_id={{.Image}} status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} health={{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}'
             else
               echo "name=$name status=NOT_FOUND"
             fi
