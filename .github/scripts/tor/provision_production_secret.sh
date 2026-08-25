@@ -108,8 +108,13 @@ echo "checkpoint_stage=production_sha_ok sha=$CURRENT_SHA"
 # =====================================================================
 snapshot_container() {
   local name="$1"
+  # `{{with (index .State "Health")}}` looks up "Health" as a map key and
+  # only enters the block if the key is present -- unlike
+  # `{{if .State.Health}}`, which errors ("map has no entry for key
+  # Health") on Docker versions where a container with no HEALTHCHECK
+  # omits the key entirely rather than setting it to a zero value.
   docker inspect "$name" --format \
-    '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' \
+    '{{.Id}}|{{.Image}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}|{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}' \
     2>/dev/null || fail "cannot inspect container: $name"
 }
 

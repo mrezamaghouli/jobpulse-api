@@ -204,13 +204,38 @@ def test_workflow_inspect_format_restricted_to_allowed_metadata_fields():
 
     allowed_gostruct_fields = ("{{.Name}}", "{{.Id}}", "{{.Image}}", "{{.State.Status}}",
                                 "{{.State.StartedAt}}", "{{.RestartCount}}",
-                                "{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}")
+                                '{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}')
     for field in allowed_gostruct_fields:
         assert field in template, field
 
     # No env/mount/secret-shaped field made it into the template.
     for forbidden_field in ("Env", "Mounts", "Binds", "Secrets"):
         assert forbidden_field not in template, forbidden_field
+
+
+def test_workflow_health_template_uses_safe_absent_key_lookup_not_unsafe_if():
+    """Phase 3.1B regression guard: the first real production diagnostic
+    run showed `{{if .State.Health}}` errors with "map has no entry for
+    key Health" on this Docker version when a container (e.g.
+    jobpulse-frontend-prod, nginx:alpine with no HEALTHCHECK) omits the
+    Health key entirely rather than zero-valuing it. Neither the unsafe
+    `{{if .State.Health}}` form nor an unguarded `{{with .State.Health}}`
+    (same problem, since it still accesses .State.Health as a struct
+    field rather than doing a map-key lookup) may reappear -- only the
+    safe `{{with (index .State "Health")}}` map lookup."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "{{if .State.Health}}" not in code
+    assert "{{with .State.Health}}" not in code
+    assert 'index .State "Health"' in code
+
+
+def test_workflow_frontend_metadata_line_can_report_health_na():
+    """The fixed template must be able to represent a healthcheck-less
+    container's health as `n/a` (via the `{{else}}` branch), the exact
+    representation that failed to emit at all in the first production run
+    due to the unsafe template."""
+    source = WORKFLOW_PATH.read_text()
+    assert 'health={{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}' in source
 
 
 def test_workflow_inspects_exactly_the_three_expected_containers():

@@ -87,6 +87,8 @@ SCENARIO_TO_CHANGED_NAME = {
 if args and args[0] == "inspect":
     name = args[1]
     fmt = args[3] if len(args) > 3 and args[2] == "--format" else None
+    if scenario == "frontend_inspect_fails" and name == "jobpulse-frontend-prod":
+        sys.exit(1)
     n = next_count(f"inspect_calls_{name}")
     value = BASE_VALUES.get(name, "unknown")
     changed_name = SCENARIO_TO_CHANGED_NAME.get(scenario)
@@ -622,10 +624,43 @@ def test_script_never_invokes_tor_control_or_mutation_commands():
 
 
 def test_script_health_safe_inspect_template_present():
-    """Section 11: frontend containers without a healthcheck must be
-    reported as n/a instead of causing a Go-template failure."""
+    """Phase 3.1B: frontend containers without a HEALTHCHECK must be
+    reported as n/a instead of causing a Go-template failure.
+    `{{if .State.Health}}` (and the unguarded `{{with .State.Health}}`)
+    errors with "map has no entry for key Health" on Docker versions
+    where a container with no HEALTHCHECK omits the key entirely rather
+    than zero-valuing it -- confirmed against production's
+    jobpulse-frontend-prod (nginx:alpine, no HEALTHCHECK), which is
+    exactly what originally made this script's snapshot_container() fail
+    before the secret decision block. `{{with (index .State "Health")}}`
+    performs a safe map-key lookup instead, entering the block only if
+    the key is actually present."""
     source = SCRIPT_PATH.read_text()
-    assert "{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}" in source
+    code = _code_only(source)
+    assert "{{if .State.Health}}" not in code
+    assert "{{with .State.Health}}" not in code
+    assert 'index .State "Health"' in source
+    assert '{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}' in source
+
+
+def test_script_snapshot_still_reports_id_image_status_started_restart():
+    """The Health-key fix must not drop any other snapshot field."""
+    source = SCRIPT_PATH.read_text()
+    for field in ("{{.Id}}", "{{.Image}}", "{{.State.Status}}",
+                  "{{.State.StartedAt}}", "{{.RestartCount}}"):
+        assert field in source, field
+
+
+def test_container_inspect_failure_still_fails_closed(harness):
+    """A genuinely failing/missing-container inspect (not merely an
+    absent Health key, which the fix above now handles) must still abort
+    the whole script before any secret is created."""
+    root = harness.new_root()
+    result, _ = harness.run(root, scenario="frontend_inspect_fails")
+
+    assert result.returncode != 0
+    assert "cannot inspect container: jobpulse-frontend-prod" in result.stderr
+    assert not _secret_path(root).exists()
 
 
 def test_script_uses_hardlink_not_mv_or_cp_to_publish():
