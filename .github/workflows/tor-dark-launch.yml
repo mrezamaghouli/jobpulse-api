@@ -48,6 +48,26 @@ name: Production Tor Dark Launch
 # argv/`ps` exposure, not same-host root/same-user introspection.
 # TOR_IMAGE_B64 is NOT a secret (a strictly-validated image reference,
 # already gated by the step above) and stays in the ssh argv assignment.
+#
+# --- Phase 3.2B pinning ---------------------------------------------------
+# docker-compose.prod.tor.yml's `tor-diagnostic` service resolves its image
+# as `${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}`, and
+# its `TOR_IP_CHECK_URL` as `${TOR_IP_CHECK_URL:-https://check.torproject.org/api/ip}`.
+# Compose only falls back to those mutable defaults when the shell
+# environment does NOT already define the variable -- so this workflow
+# must always supply both explicitly, or the diagnostic could silently
+# run the floating `:main` API image, or a `TOR_IP_CHECK_URL` overridden
+# by production's own .env, neither of which is acceptable for the first
+# production dark launch. PRODUCTION_API_IMAGE is a fixed, non-secret,
+# strictly-validated constant -- NOT derived from `github.sha`/main (the
+# GitHub runner's checkout may be newer than what's actually deployed;
+# production is intentionally still pinned to Phase 3's
+# 5dffbd669eec52f5283503bb6409a430509175a0) and NOT a workflow_dispatch
+# input (an operator-editable field here could target the wrong image by
+# typo, exactly like EXPECTED_PRODUCTION_SHA in tor-secret-provision.yml).
+# TOR_DARK_LAUNCH_IP_CHECK_URL is likewise fixed, not an input: the first
+# production dark launch must always probe the same well-known neutral
+# endpoint, never an operator-supplied URL.
 on:
   workflow_dispatch:
     inputs:
@@ -77,6 +97,10 @@ jobs:
       VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       TOR_IMAGE_INPUT: ${{ inputs.tor_image }}
+      # Not secrets -- see the "Phase 3.2B pinning" header comment above.
+      # Fixed constants, deliberately never workflow_dispatch inputs.
+      PRODUCTION_API_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:5dffbd669eec52f5283503bb6409a430509175a0"
+      TOR_DARK_LAUNCH_IP_CHECK_URL: "https://check.torproject.org/api/ip"
 
     steps:
       - name: Checkout repository
@@ -108,10 +132,60 @@ jobs:
 
           echo "Validated tor_image: $TOR_IMAGE_INPUT"
 
+          # PRODUCTION_API_IMAGE/TOR_DARK_LAUNCH_IP_CHECK_URL are fixed
+          # constants above, not operator input -- validated anyway as a
+          # regression guard, same discipline as the tor_image check.
+          if ! [[ "$PRODUCTION_API_IMAGE" =~ ^ghcr\.io/mrezamaghouli/jobpulse-api:[0-9a-f]{40}$ ]]; then
+            echo "ERROR: PRODUCTION_API_IMAGE must be ghcr.io/mrezamaghouli/jobpulse-api:<40-char-commit-sha> (got: $PRODUCTION_API_IMAGE)" >&2
+            exit 1
+          fi
+          if [ "$PRODUCTION_API_IMAGE" != "ghcr.io/mrezamaghouli/jobpulse-api:5dffbd669eec52f5283503bb6409a430509175a0" ]; then
+            echo "ERROR: PRODUCTION_API_IMAGE must be pinned to the currently deployed production SHA 5dffbd669eec52f5283503bb6409a430509175a0 (got: $PRODUCTION_API_IMAGE)" >&2
+            exit 1
+          fi
+          echo "Validated PRODUCTION_API_IMAGE: $PRODUCTION_API_IMAGE"
+
+          if [ "$TOR_DARK_LAUNCH_IP_CHECK_URL" != "https://check.torproject.org/api/ip" ]; then
+            echo "ERROR: TOR_DARK_LAUNCH_IP_CHECK_URL must be exactly https://check.torproject.org/api/ip (got: $TOR_DARK_LAUNCH_IP_CHECK_URL)" >&2
+            exit 1
+          fi
+          echo "Validated TOR_DARK_LAUNCH_IP_CHECK_URL: $TOR_DARK_LAUNCH_IP_CHECK_URL"
+
       - name: Run Tor dark-launch on production VM
         shell: bash
         run: |
           set -euo pipefail
+
+          # --- Operator-facing DB side-effect notice (non-secret, no DB
+          # credentials) -- printed to this GitHub Actions log BEFORE the
+          # production SSH connection is even established, so an operator
+          # reading the log has the correct semantics up front. The
+          # already-deployed scripts/tor/production_dark_launch.sh
+          # contains one legacy diagnostic-failure message whose wording
+          # about the database is not fully accurate -- this notice
+          # corrects that at the workflow level without modifying that
+          # deployed script in this pass.
+          cat <<'NOTICE'
+          ============================================================
+          Dark-launch diagnostic DB side-effect notice:
+
+          The Tor dark-launch diagnostic (tor-diagnostic service,
+          scripts/tor/production_dark_launch_check.py) MAY persist Tor
+          control-plane bootstrap observability in PostgreSQL:
+            - tor_instances       (bootstrap status/timestamps)
+            - tor_circuit_events  (bounded-retention lifecycle events)
+
+          It must NOT mutate business/job data:
+            - jobs
+            - companies
+            - linkedin_query_runs
+            - any collector/job-ingestion execution
+
+          Tor rollback (on any dark-launch failure) removes ONLY the tor
+          container/service -- it does NOT revert the Tor control-plane
+          observability records above.
+          ============================================================
+          NOTICE
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -131,6 +205,18 @@ jobs:
           # running the script. See the comment block above this job for
           # why (avoids the token being a process argv substring on the
           # remote host).
+          #
+          # JOBPULSE_API_IMAGE/TOR_IP_CHECK_URL are set here in the remote
+          # shell environment, exactly like TOR_IMAGE_B64 -- non-secret,
+          # strictly-validated fixed constants, safe as plain ssh argv
+          # assignments. docker compose (invoked inside
+          # production_dark_launch.sh) only falls back to
+          # docker-compose.prod.tor.yml's `:main`/production-.env-derived
+          # defaults when a variable is UNSET in its process environment,
+          # so explicitly setting both here -- not merely hoping
+          # production's .env happens to agree -- is what actually pins
+          # the tor-diagnostic container's API image and neutral URL for
+          # this run.
           ssh -i ~/.ssh/jobpulse_tor_launch_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            "GHCR_TOKEN_B64=\"\$(cat)\" TOR_IMAGE_B64='$TOR_IMAGE_B64' /opt/jobpulse/scripts/tor/production_dark_launch.sh" \
+            "GHCR_TOKEN_B64=\"\$(cat)\" TOR_IMAGE_B64='$TOR_IMAGE_B64' JOBPULSE_API_IMAGE='$PRODUCTION_API_IMAGE' TOR_IP_CHECK_URL='$TOR_DARK_LAUNCH_IP_CHECK_URL' /opt/jobpulse/scripts/tor/production_dark_launch.sh" \
             <<< "$GHCR_TOKEN_B64"

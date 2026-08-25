@@ -777,3 +777,467 @@ def test_only_the_real_tor_job_carries_the_opt_in_gate():
         if name != "tor-real-integration" and "run_real_tor" in str(job.get("if", ""))
     ]
     assert not offenders, f"unexpected run_real_tor gate on job(s): {offenders}"
+
+
+# ---------------------------------------------------------------------
+# 6. Static audit: Production Tor Dark Launch workflow pinning (Phase
+#    3.2B). docker-compose.prod.tor.yml's tor-diagnostic service resolves
+#    `${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}` and
+#    `${TOR_IP_CHECK_URL:-https://check.torproject.org/api/ip}` -- Compose
+#    only falls back to those mutable defaults when the variable is UNSET
+#    in the process environment, so the workflow must always supply both
+#    explicitly. These tests prove the workflow does so, without touching
+#    scripts/tor/production_dark_launch.sh or docker-compose.prod.tor.yml
+#    (the already-deployed production paths) -- see also
+#    tests/test_tor_dark_launch_script.py, which proves those files'
+#    behavior independently and is untouched by this change.
+# ---------------------------------------------------------------------
+DARK_LAUNCH_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tor-dark-launch.yml"
+PINNED_PRODUCTION_SHA = "5dffbd669eec52f5283503bb6409a430509175a0"
+PINNED_API_IMAGE = f"ghcr.io/mrezamaghouli/jobpulse-api:{PINNED_PRODUCTION_SHA}"
+PINNED_IP_CHECK_URL = "https://check.torproject.org/api/ip"
+
+
+def _load_dark_launch_workflow():
+    import yaml
+
+    return yaml.safe_load(DARK_LAUNCH_WORKFLOW_PATH.read_text())
+
+
+def _dark_launch_on_block(workflow):
+    # PyYAML (1.1 resolver) parses the bare `on:` key as boolean True.
+    return workflow["on"] if "on" in workflow else workflow[True]
+
+
+def _dark_launch_code_only():
+    """Strip full-line `#` comments so substring checks below don't
+    false-positive on explanatory prose (e.g. this file's own header
+    comment naming the mutable `:main` fallback tag it exists to avoid)."""
+    return "\n".join(
+        line for line in DARK_LAUNCH_WORKFLOW_PATH.read_text().splitlines()
+        if not line.strip().startswith("#")
+    )
+
+
+def test_dark_launch_workflow_is_workflow_dispatch_only():
+    workflow = _load_dark_launch_workflow()
+    on_block = _dark_launch_on_block(workflow)
+    assert set(on_block.keys()) == {"workflow_dispatch"}
+
+
+def test_dark_launch_workflow_source_has_no_other_trigger_keys():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    for forbidden in ("push:", "pull_request:", "workflow_run:", "schedule:"):
+        assert forbidden not in source, forbidden
+
+
+def test_dark_launch_tor_image_input_still_strictly_immutable():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert r'^ghcr\.io/mrezamaghouli/jobpulse-tor:[0-9a-f]{40}$' in source
+
+
+def test_dark_launch_workflow_only_declares_tor_image_as_operator_input():
+    """PRODUCTION_API_IMAGE / TOR_DARK_LAUNCH_IP_CHECK_URL must be fixed
+    job-level constants, never operator-editable workflow_dispatch
+    inputs -- an operator-editable field here could target the wrong API
+    image or a non-neutral URL by typo, exactly the failure mode
+    EXPECTED_PRODUCTION_SHA in tor-secret-provision.yml already avoids."""
+    workflow = _load_dark_launch_workflow()
+    on_block = _dark_launch_on_block(workflow)
+    inputs = on_block["workflow_dispatch"]["inputs"]
+    assert set(inputs.keys()) == {"tor_image"}
+
+
+def test_dark_launch_production_api_image_is_exact_and_immutable():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert f'PRODUCTION_API_IMAGE: "{PINNED_API_IMAGE}"' in source
+    # Never the floating tag this pinning exists to avoid -- excluding
+    # explanatory comment prose, which legitimately names it.
+    assert "jobpulse-api:main" not in _dark_launch_code_only()
+
+
+def test_dark_launch_production_api_image_tag_is_exactly_deployed_sha():
+    assert PINNED_API_IMAGE == f"ghcr.io/mrezamaghouli/jobpulse-api:{PINNED_PRODUCTION_SHA}"
+    assert PINNED_PRODUCTION_SHA not in DARK_LAUNCH_WORKFLOW_PATH.read_text().split(
+        "PRODUCTION_API_IMAGE"
+    )[0], "sanity: PINNED_PRODUCTION_SHA must actually appear in the PRODUCTION_API_IMAGE value"
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert re.search(
+        r'PRODUCTION_API_IMAGE:\s*"ghcr\.io/mrezamaghouli/jobpulse-api:' + PINNED_PRODUCTION_SHA + r'"',
+        source,
+    )
+
+
+def test_dark_launch_workflow_validates_production_api_image_before_ssh():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert r'^ghcr\.io/mrezamaghouli/jobpulse-api:[0-9a-f]{40}$' in source
+    assert f'"$PRODUCTION_API_IMAGE" != "{PINNED_API_IMAGE}"' in source
+    # The validation step must run before the SSH step -- proven by
+    # ordering: "Validate inputs and secrets" appears earlier in the file
+    # than "Run Tor dark-launch on production VM".
+    assert source.index("Validate inputs and secrets") < source.index(
+        "Run Tor dark-launch on production VM"
+    )
+
+
+def test_dark_launch_workflow_passes_jobpulse_api_image_to_remote_process():
+    """Proves the SSH invocation itself sets JOBPULSE_API_IMAGE in the
+    remote process environment -- the actual mechanism that overrides
+    docker-compose.prod.tor.yml's `:main` fallback, not merely a
+    validated-but-unused local variable."""
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert "JOBPULSE_API_IMAGE='$PRODUCTION_API_IMAGE'" in source
+
+
+def test_dark_launch_workflow_never_relies_on_diagnostic_main_fallback():
+    """No path in the official workflow may invoke the remote script
+    without JOBPULSE_API_IMAGE set -- i.e. there is exactly one ssh
+    invocation of production_dark_launch.sh, and it always carries
+    JOBPULSE_API_IMAGE."""
+    code = _dark_launch_code_only()
+    ssh_invocations = code.count("/opt/jobpulse/scripts/tor/production_dark_launch.sh")
+    assert ssh_invocations == 1
+    assert "JOBPULSE_API_IMAGE=" in code
+
+
+def test_dark_launch_neutral_url_is_exactly_check_torproject_org():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert f'TOR_DARK_LAUNCH_IP_CHECK_URL: "{PINNED_IP_CHECK_URL}"' in source
+    assert f'"$TOR_DARK_LAUNCH_IP_CHECK_URL" != "{PINNED_IP_CHECK_URL}"' in source
+
+
+def test_dark_launch_workflow_passes_ip_check_url_to_remote_process():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert "TOR_IP_CHECK_URL='$TOR_DARK_LAUNCH_IP_CHECK_URL'" in source
+
+
+def test_dark_launch_neutral_url_is_not_an_operator_controlled_input():
+    """The pinned URL must be a fixed job-level env value, never sourced
+    from `inputs.*` -- an arbitrary operator-supplied URL must not be
+    possible for the first production dark launch."""
+    workflow = _load_dark_launch_workflow()
+    job = workflow["jobs"]["dark-launch"]
+    env = job["env"]
+    assert env["TOR_DARK_LAUNCH_IP_CHECK_URL"] == PINNED_IP_CHECK_URL
+    assert "inputs." not in str(env["TOR_DARK_LAUNCH_IP_CHECK_URL"])
+
+    on_block = _dark_launch_on_block(workflow)
+    inputs = on_block["workflow_dispatch"]["inputs"]
+    assert "tor_ip_check_url" not in {k.lower() for k in inputs}
+    assert "diagnostic_url" not in {k.lower() for k in inputs}
+
+
+def test_dark_launch_ghcr_token_still_travels_via_stdin_not_argv():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    # GHCR_TOKEN_B64 must be read from stdin (`$(cat)`) inside the remote
+    # command string, never assigned a literal value in that same string.
+    assert 'GHCR_TOKEN_B64=\\"\\$(cat)\\"' in source
+    assert "<<< \"$GHCR_TOKEN_B64\"" in source
+    assert "GHCR_TOKEN_B64='" not in source  # never a literal argv assignment
+
+
+def test_dark_launch_workflow_introduces_no_new_secrets():
+    referenced_secrets = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", DARK_LAUNCH_WORKFLOW_PATH.read_text()))
+    assert referenced_secrets == {"VM_SSH_KEY", "GHCR_TOKEN"}
+
+
+def test_dark_launch_workflow_never_references_tor_enabled():
+    """PRODUCTION_API_IMAGE/TOR_DARK_LAUNCH_IP_CHECK_URL pinning must not
+    touch anything TOR_ENABLED-related -- keeps this workflow out of
+    _ALLOWED_TOR_ENABLED_SETTERS above, since it still never references
+    that literal at all."""
+    assert "TOR_ENABLED" not in DARK_LAUNCH_WORKFLOW_PATH.read_text()
+
+
+def test_dark_launch_workflow_permissions_and_concurrency_unchanged():
+    workflow = _load_dark_launch_workflow()
+    assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["concurrency"] == {
+        "group": "jobpulse-production-tor-dark-launch",
+        "cancel-in-progress": False,
+    }
+
+
+@requires_docker_compose
+def test_dark_launch_process_env_pinning_overrides_hostile_production_env(compose_validation_dir):
+    """Real `docker compose config` regression proof (not merely a static
+    text assertion) that the Phase 3.2B pinning actually works the way
+    docker-compose.prod.tor.yml's `${VAR:-default}` substitution requires:
+    Docker Compose resolves `${VAR}` from the shell/process environment
+    BEFORE falling back to a `.env` file in the project directory, so a
+    process env value always wins over a conflicting `.env` value -- it
+    is never merely "whichever happens to be defined last" or something
+    `.env` could override.
+
+    Writes a HOSTILE .env into the compose project directory (exactly
+    what a production .env attacker/misconfiguration could contain:
+    `jobpulse-api:main` and a non-approved diagnostic URL), then runs
+    `docker compose config` with PRODUCTION_API_IMAGE/
+    TOR_DARK_LAUNCH_IP_CHECK_URL's pinned values set as real process env
+    vars -- exactly what tor-dark-launch.yml's ssh invocation does on the
+    remote host via `JOBPULSE_API_IMAGE='...' TOR_IP_CHECK_URL='...' ...`.
+    Starts no container."""
+    import os
+
+    hostile_env_content = (
+        "JOBPULSE_API_IMAGE=ghcr.io/mrezamaghouli/jobpulse-api:main\n"
+        "TOR_IP_CHECK_URL=https://example.invalid/not-approved\n"
+    )
+    (compose_validation_dir / ".env").write_text(hostile_env_content)
+
+    # tor-diagnostic sits behind the tor-ops Compose profile (never
+    # auto-started) -- `docker compose config` only resolves it into
+    # `services` when that profile is active, via COMPOSE_PROFILES.
+    process_env = os.environ.copy()
+    process_env["JOBPULSE_TOR_IMAGE"] = "ghcr.io/mrezamaghouli/jobpulse-tor:test-sha"
+    process_env["JOBPULSE_API_IMAGE"] = PINNED_API_IMAGE
+    process_env["TOR_IP_CHECK_URL"] = PINNED_IP_CHECK_URL
+    process_env["COMPOSE_PROFILES"] = "tor-ops"
+
+    config = _run_compose_config(
+        compose_validation_dir, "docker-compose.prod.tor.yml", env=process_env,
+    )
+
+    tor_diagnostic = config["services"]["tor-diagnostic"]
+    assert tor_diagnostic["image"] == PINNED_API_IMAGE
+    assert tor_diagnostic["environment"]["TOR_IP_CHECK_URL"] == PINNED_IP_CHECK_URL
+
+    # Sanity: prove the hostile .env value was actually in play (not just
+    # an inert file) -- without the process-env override, Compose would
+    # have resolved to it instead. This guards against the test silently
+    # passing for the wrong reason (e.g. a typo that made the .env file
+    # never get read at all).
+    unpinned_env = os.environ.copy()
+    unpinned_env["JOBPULSE_TOR_IMAGE"] = "ghcr.io/mrezamaghouli/jobpulse-tor:test-sha"
+    unpinned_env["COMPOSE_PROFILES"] = "tor-ops"
+    unpinned_config = _run_compose_config(
+        compose_validation_dir, "docker-compose.prod.tor.yml", env=unpinned_env,
+    )
+    unpinned_diagnostic = unpinned_config["services"]["tor-diagnostic"]
+    assert unpinned_diagnostic["image"] == "ghcr.io/mrezamaghouli/jobpulse-api:main"
+    assert unpinned_diagnostic["environment"]["TOR_IP_CHECK_URL"] == "https://example.invalid/not-approved"
+
+
+# ---------------------------------------------------------------------
+# 7. Accurate Tor control-plane DB write-path documentation (Phase 3.2B
+#    correction). The dark-launch diagnostic is NOT fully database-
+#    read-only: check_bootstrap_status() intentionally persists Phase 2
+#    Tor bootstrap/control-plane observability. These tests trace the
+#    EXACT write path from the deployed diagnostic entrypoint down to the
+#    literal SQL table names, and prove no business-data table or
+#    collector/ingestion code is ever reachable from it -- replacing the
+#    inaccurate "database untouched" characterization with real evidence.
+# ---------------------------------------------------------------------
+import inspect
+
+import scripts.tor.circuit_manager as circuit_manager_module
+import scripts.tor.verify_tor_connectivity as verify_tor_connectivity_module
+
+_BUSINESS_DATA_TABLES = ("jobs", "companies", "linkedin_query_runs")
+_TOR_CONTROL_PLANE_TABLES = ("tor_instances", "tor_circuit_events")
+
+
+def test_record_bootstrap_functions_only_write_tor_control_plane_tables():
+    """record_bootstrap_started/ready/failed (called by
+    check_bootstrap_status(), in turn called by
+    production_dark_launch_check.py's diagnostic) must only ever
+    reference tor_instances/tor_circuit_events in their own source --
+    never jobs/companies/linkedin_query_runs. Uses inspect.getsource() on
+    the exact three functions so this fails loudly if a future edit adds
+    a write to any other table, rather than trusting a one-time manual
+    trace to stay correct forever."""
+    for name in ("record_bootstrap_started", "record_bootstrap_ready", "record_bootstrap_failed"):
+        func = getattr(circuit_manager_module, name)
+        source = inspect.getsource(func)
+
+        for table in _BUSINESS_DATA_TABLES:
+            assert table not in source, f"{name}() must never reference {table}"
+
+        assert any(table in source for table in _TOR_CONTROL_PLANE_TABLES), (
+            f"{name}() is expected to write to one of {_TOR_CONTROL_PLANE_TABLES}"
+        )
+
+
+def test_record_bootstrap_functions_full_operation_set_is_control_plane_only():
+    """Phase 3.2B correction: the write path is not merely 'one UPDATE
+    per table' -- each record_bootstrap_* call also (a) ensures the
+    tor_instances/tor_circuit_events schema exists (CREATE TABLE IF NOT
+    EXISTS, via ensure_tor_instances_table/ensure_tor_circuit_events_table),
+    (b) upserts the instance row (_ensure_instance_row, INSERT ... ON
+    CONFLICT DO NOTHING), (c) UPDATEs tor_instances, and (d) emits a
+    bounded-retention event via emit_event() (INSERT into
+    tor_circuit_events + a prune DELETE in the same transaction). All
+    four operation kinds are acknowledged here explicitly -- none of them
+    reach a business-data table."""
+    for name in ("record_bootstrap_started", "record_bootstrap_ready", "record_bootstrap_failed"):
+        func = getattr(circuit_manager_module, name)
+        source = inspect.getsource(func)
+
+        # (a) schema-ensure DDL
+        assert "ensure_tor_instances_table(" in source
+        assert "ensure_tor_circuit_events_table(" in source
+        # (b) row upsert
+        assert "_ensure_instance_row(" in source
+        # (c) UPDATE tor_instances
+        assert "UPDATE tor_instances" in source
+        # (d) bounded-retention event emission
+        assert "emit_event(" in source
+
+    # The actual DDL lives in module-level SQL string constants, executed
+    # (not inlined) by ensure_tor_instances_table()/
+    # ensure_tor_circuit_events_table().
+    assert "CREATE TABLE IF NOT EXISTS tor_instances" in circuit_manager_module.CREATE_TOR_INSTANCES_TABLE_SQL
+    assert "CREATE TABLE IF NOT EXISTS tor_circuit_events" in circuit_manager_module.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL
+
+    emit_event_source = inspect.getsource(circuit_manager_module.emit_event)
+    assert "INSERT INTO tor_circuit_events" in emit_event_source
+    # The bounded-retention prune DELETE is a separate helper, called by
+    # emit_event() in the same transaction as the INSERT above.
+    assert "_prune_tor_circuit_events_in_transaction(" in emit_event_source
+    prune_source = inspect.getsource(circuit_manager_module._prune_tor_circuit_events_in_transaction)
+    assert "DELETE FROM tor_circuit_events" in prune_source
+
+    # None of the above operations, across any of the source/DDL blocks
+    # inspected in this test, ever reference a business-data table.
+    for source in (
+        circuit_manager_module.CREATE_TOR_INSTANCES_TABLE_SQL,
+        circuit_manager_module.CREATE_TOR_CIRCUIT_EVENTS_TABLE_SQL,
+        emit_event_source,
+        prune_source,
+        *(inspect.getsource(getattr(circuit_manager_module, n))
+          for n in ("record_bootstrap_started", "record_bootstrap_ready", "record_bootstrap_failed")),
+    ):
+        for table in _BUSINESS_DATA_TABLES:
+            assert table not in source
+
+
+def test_check_bootstrap_status_only_calls_record_bootstrap_functions():
+    """Pins the exact write-path entrypoint: check_bootstrap_status()
+    (called directly by production_dark_launch_check.py) must only ever
+    call record_bootstrap_started/ready/failed for persistence -- no
+    other circuit_manager write function (e.g. the circuit-tracking
+    UPDATE tor_circuits path used elsewhere in that module)."""
+    source = inspect.getsource(verify_tor_connectivity_module.check_bootstrap_status)
+    for name in ("record_bootstrap_started", "record_bootstrap_ready", "record_bootstrap_failed"):
+        assert f"{name}(" in source
+
+    # Negative: this function must not itself touch tor_circuits (the
+    # separate per-circuit tracking table used by collection-path code,
+    # not by this dark-launch diagnostic).
+    assert "tor_circuits" not in source
+
+
+def test_production_dark_launch_check_never_imports_business_data_modules():
+    """Static import-level guard: the diagnostic entrypoint must never
+    import anything from a collector/ingestion/business-data module --
+    proves there is no code PATH into jobs/companies/linkedin_query_runs
+    from this diagnostic, not merely that its current call graph happens
+    not to reach one."""
+    check_script_path = REPO_ROOT / "scripts" / "tor" / "production_dark_launch_check.py"
+    source = check_script_path.read_text()
+
+    forbidden_import_substrings = (
+        "collector", "ingest", "linkedin_plan_collect", "run_collection_cycle",
+        "run_production_collection", "seed_priority_coverage_queue",
+        "process_search_demand_queue",
+    )
+    import_lines = [
+        line for line in source.splitlines()
+        if line.strip().startswith("import ") or line.strip().startswith("from ")
+    ]
+    for line in import_lines:
+        for forbidden in forbidden_import_substrings:
+            assert forbidden not in line, f"unexpected import in production_dark_launch_check.py: {line}"
+
+
+def test_inspect_instance_diagnostic_read_path_is_read_only():
+    """observability.inspect_instance() (used by the diagnostic ONLY on
+    the failure path, to read back the already-persisted error category)
+    must never itself write -- no INSERT/UPDATE/DELETE in its source."""
+    import scripts.tor.observability as observability_module
+
+    source = inspect.getsource(observability_module.inspect_instance)
+    for forbidden in ("INSERT INTO", "UPDATE ", "DELETE FROM"):
+        assert forbidden not in source
+
+
+def test_no_misleading_fully_database_read_only_claim_in_dark_launch_tests():
+    """Phase 3.2B correction: the dark-launch diagnostic intentionally
+    persists Tor control-plane observability (tor_instances,
+    tor_circuit_events) via check_bootstrap_status() -- it is NOT fully
+    database-read-only. This test/this file and the workflow file must
+    never claim otherwise; container mutation isolation (api/db/frontend
+    never restarted/recreated/stopped) and DB control-plane observability
+    are two different facts and must not be conflated. The one known
+    instance of this inaccurate phrasing lives in the already-deployed
+    scripts/tor/production_dark_launch.sh (a single fail() message on the
+    diagnostic-failure path) -- out of scope for this pass per the
+    Phase 3.2B task boundary (that file is not modified here to avoid
+    expanding this fix into the already-deployed production script), and
+    is reported separately rather than silently left uncorrected."""
+    misleading_phrases = ("database untouched", "no database mutation", "database read-only", "database is read-only")
+    for path in (
+        REPO_ROOT / "tests" / "test_tor_production_dark_launch.py",
+        REPO_ROOT / "tests" / "test_tor_dark_launch_script.py",
+        DARK_LAUNCH_WORKFLOW_PATH,
+    ):
+        text = path.read_text()
+        if path.name == "test_tor_production_dark_launch.py":
+            # Section 7 above (from its header comment through end of
+            # file) legitimately discusses/corrects this exact phrase --
+            # exclude that whole self-referential block from the scan so
+            # it doesn't false-positive on its own explanation. Anything
+            # BEFORE section 7 (the rest of this file) is still scanned.
+            marker = "# 7. Accurate Tor control-plane DB write-path documentation"
+            text = text[: text.index(marker)]
+        text = text.lower()
+        for phrase in misleading_phrases:
+            assert phrase not in text, f"{path.name} must not claim '{phrase}' for the full dark-launch diagnostic"
+
+
+# ---------------------------------------------------------------------
+# 8. Operator-facing runtime DB side-effect notice (Phase 3.2B hardening
+#    pass). Proves tor-dark-launch.yml prints an accurate, non-secret
+#    notice to the GitHub Actions log BEFORE the SSH connection is
+#    established, distinguishing Tor control-plane observability from
+#    business data, and stating that Tor rollback does not revert the
+#    observability records.
+# ---------------------------------------------------------------------
+def test_dark_launch_workflow_contains_db_side_effect_notice():
+    code = _dark_launch_code_only()
+    assert "tor_instances" in code
+    assert "tor_circuit_events" in code
+
+
+def test_dark_launch_notice_distinguishes_control_plane_from_business_data():
+    code = _dark_launch_code_only()
+    for business_table in ("jobs", "companies", "linkedin_query_runs"):
+        assert business_table in code, f"notice must name {business_table} as data that must not be mutated"
+
+
+def test_dark_launch_notice_states_rollback_does_not_revert_observability():
+    code = _dark_launch_code_only()
+    assert "not revert" in code.lower()
+
+
+def test_dark_launch_notice_appears_before_ssh_key_setup():
+    """The notice must print to the log before the production SSH
+    connection is even established -- proven by ordering: the notice
+    heredoc precedes `mkdir -p ~/.ssh` (the first SSH-setup command) in
+    the 'Run Tor dark-launch on production VM' step."""
+    code = _dark_launch_code_only()
+    assert code.index("tor_instances") < code.index('mkdir -p ~/.ssh')
+
+
+def test_dark_launch_notice_contains_no_db_credentials_or_secrets():
+    code = _dark_launch_code_only()
+    for forbidden in ("POSTGRES_PASSWORD", "PGPASSWORD", "postgresql://", "jobpulse_password"):
+        assert forbidden not in code
+
+
+def test_dark_launch_notice_is_a_static_heredoc_not_secret_interpolated():
+    """The notice must be a plain, quoted heredoc (`<<'NOTICE'`) -- no
+    variable expansion inside it -- so it can never accidentally
+    interpolate a secret value (VM_SSH_KEY, GHCR_TOKEN) into the log."""
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert "<<'NOTICE'" in source
