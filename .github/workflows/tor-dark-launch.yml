@@ -75,7 +75,13 @@ on:
         description: >-
           Exact immutable Tor image to launch, e.g.
           ghcr.io/mrezamaghouli/jobpulse-tor:<40-char-commit-sha>. Must be
-          pinned to a commit SHA tag -- "main"/"latest" are rejected.
+          pinned to a commit SHA tag -- "main"/"latest" are rejected. For
+          the first production dark launch this must equal
+          EXPECTED_TOR_IMAGE below exactly.
+        required: true
+        type: string
+      confirm:
+        description: 'Type LAUNCH_TOR_DARK to confirm'
         required: true
         type: string
 
@@ -97,10 +103,22 @@ jobs:
       VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       TOR_IMAGE_INPUT: ${{ inputs.tor_image }}
+      CONFIRM_INPUT: ${{ inputs.confirm }}
       # Not secrets -- see the "Phase 3.2B pinning" header comment above.
       # Fixed constants, deliberately never workflow_dispatch inputs.
       PRODUCTION_API_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:5dffbd669eec52f5283503bb6409a430509175a0"
       TOR_DARK_LAUNCH_IP_CHECK_URL: "https://check.torproject.org/api/ip"
+      # Phase 3.2C: the FIRST production dark launch must target the
+      # exact, currently-observed production checkout and its
+      # correspondingly-built Tor image -- not merely "a" validly-shaped
+      # SHA. Not derived from github.sha: the GitHub runner's checkout is
+      # intentionally newer than what's actually deployed (production
+      # remains pinned to Phase 3's 5dffbd669eec52f5283503bb6409a430509175a0
+      # until a separate, explicit deploy decision moves it). Both are
+      # fixed constants, never workflow_dispatch inputs, for the same
+      # typo-safety reason as PRODUCTION_API_IMAGE above.
+      EXPECTED_PRODUCTION_SHA: "5dffbd669eec52f5283503bb6409a430509175a0"
+      EXPECTED_TOR_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
     steps:
       - name: Checkout repository
@@ -110,6 +128,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          if [ "$CONFIRM_INPUT" != "LAUNCH_TOR_DARK" ]; then
+            echo "ERROR: confirm input must be exactly LAUNCH_TOR_DARK (got: $CONFIRM_INPUT)" >&2
+            exit 1
+          fi
 
           if [ -z "${VM_SSH_KEY:-}" ]; then
             echo "VM_SSH_KEY secret is missing"
@@ -127,6 +150,17 @@ jobs:
           # must never be the only gate.
           if ! [[ "$TOR_IMAGE_INPUT" =~ ^ghcr\.io/mrezamaghouli/jobpulse-tor:[0-9a-f]{40}$ ]]; then
             echo "ERROR: tor_image must be ghcr.io/mrezamaghouli/jobpulse-tor:<40-char-commit-sha> (got: $TOR_IMAGE_INPUT)" >&2
+            exit 1
+          fi
+
+          # Phase 3.2C: the regex above accepts ANY validly-shaped SHA --
+          # exact equality against EXPECTED_TOR_IMAGE is what actually
+          # pins the FIRST dark launch to the one Tor image that was
+          # really built from the currently-deployed production commit.
+          # A different, otherwise-valid 40-hex-char SHA must be rejected
+          # here.
+          if [ "$TOR_IMAGE_INPUT" != "$EXPECTED_TOR_IMAGE" ]; then
+            echo "ERROR: tor_image must be exactly $EXPECTED_TOR_IMAGE for the first production dark launch (got: $TOR_IMAGE_INPUT)" >&2
             exit 1
           fi
 
@@ -217,6 +251,34 @@ jobs:
           # production's .env happens to agree -- is what actually pins
           # the tor-diagnostic container's API image and neutral URL for
           # this run.
+          #
+          # Phase 3.2C: BEFORE any of that, this SAME remote shell session
+          # (one ssh invocation, one bash -c process on the VM -- not a
+          # separate SSH round-trip that could race) runs a preflight
+          # gate: (1) production's actual git HEAD must equal
+          # EXPECTED_PRODUCTION_SHA -- the earlier manual/workflow-level
+          # SHA observations are not relied on for this decision, only a
+          # live `git rev-parse HEAD` on the VM itself; (2) none of the
+          # exact tracked dark-launch-critical files may differ from
+          # HEAD (read-only `git diff --quiet HEAD -- <files>`,
+          # deliberately scoped to only those files rather than requiring
+          # the whole working tree clean -- production has known,
+          # legitimate untracked runtime paths such as state/). Either
+          # failure prints a non-secret error and exits non-zero WITHOUT
+          # ever reaching production_dark_launch.sh -- no docker login,
+          # no pull, no Tor start.
           ssh -i ~/.ssh/jobpulse_tor_launch_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            "GHCR_TOKEN_B64=\"\$(cat)\" TOR_IMAGE_B64='$TOR_IMAGE_B64' JOBPULSE_API_IMAGE='$PRODUCTION_API_IMAGE' TOR_IP_CHECK_URL='$TOR_DARK_LAUNCH_IP_CHECK_URL' /opt/jobpulse/scripts/tor/production_dark_launch.sh" \
+            "set -e
+          cd /opt/jobpulse || { echo 'TOR_DARK_LAUNCH_PREFLIGHT_FAILED: cannot cd to /opt/jobpulse' >&2; exit 1; }
+          ACTUAL_PRODUCTION_SHA=\$(git rev-parse HEAD)
+          if [ \"\$ACTUAL_PRODUCTION_SHA\" != '$EXPECTED_PRODUCTION_SHA' ]; then
+            echo \"TOR_DARK_LAUNCH_PREFLIGHT_FAILED: production SHA mismatch -- expected $EXPECTED_PRODUCTION_SHA, found \$ACTUAL_PRODUCTION_SHA\" >&2
+            exit 1
+          fi
+          if ! git diff --quiet HEAD -- scripts/tor/production_dark_launch.sh scripts/tor/production_dark_launch_check.py docker-compose.prod.yml docker-compose.prod.tor.yml; then
+            echo 'TOR_DARK_LAUNCH_PREFLIGHT_FAILED: tracked dark-launch-critical file(s) differ from HEAD -- refusing to proceed' >&2
+            exit 1
+          fi
+          echo TOR_DARK_LAUNCH_PREFLIGHT_OK
+          GHCR_TOKEN_B64=\"\$(cat)\" TOR_IMAGE_B64='$TOR_IMAGE_B64' JOBPULSE_API_IMAGE='$PRODUCTION_API_IMAGE' TOR_IP_CHECK_URL='$TOR_DARK_LAUNCH_IP_CHECK_URL' /opt/jobpulse/scripts/tor/production_dark_launch.sh" \
             <<< "$GHCR_TOKEN_B64"

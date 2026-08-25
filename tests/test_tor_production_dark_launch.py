@@ -841,11 +841,16 @@ def test_dark_launch_workflow_only_declares_tor_image_as_operator_input():
     job-level constants, never operator-editable workflow_dispatch
     inputs -- an operator-editable field here could target the wrong API
     image or a non-neutral URL by typo, exactly the failure mode
-    EXPECTED_PRODUCTION_SHA in tor-secret-provision.yml already avoids."""
+    EXPECTED_PRODUCTION_SHA in tor-secret-provision.yml already avoids.
+    Phase 3.2C adds `confirm` as a second, deliberate operator input (see
+    test_dark_launch_workflow_inputs_are_exactly_tor_image_and_confirm) --
+    `tor_image` remains the only IMAGE-shaped input; this test's original
+    purpose (no image/URL-pinning-related input beyond tor_image) still
+    holds."""
     workflow = _load_dark_launch_workflow()
     on_block = _dark_launch_on_block(workflow)
     inputs = on_block["workflow_dispatch"]["inputs"]
-    assert set(inputs.keys()) == {"tor_image"}
+    assert set(inputs.keys()) == {"tor_image", "confirm"}
 
 
 def test_dark_launch_production_api_image_is_exact_and_immutable():
@@ -1241,3 +1246,384 @@ def test_dark_launch_notice_is_a_static_heredoc_not_secret_interpolated():
     interpolate a secret value (VM_SSH_KEY, GHCR_TOKEN) into the log."""
     source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
     assert "<<'NOTICE'" in source
+
+
+# ---------------------------------------------------------------------
+# 9. First-dark-launch execution guards (Phase 3.2C): a required
+#    `confirm` input, exact production-SHA and exact-Tor-image pinning
+#    beyond the format regex, and -- the meaty part -- a remote preflight
+#    gate that runs INSIDE THE SAME ssh session as production_dark_launch.sh,
+#    before it, verifying the VM's actual `git rev-parse HEAD` and the
+#    exact tracked dark-launch-critical files against HEAD. The ordering/
+#    fail-closed tests below don't just read the YAML text -- they run
+#    the outer "Run Tor dark-launch on production VM" step for real
+#    (with `ssh`/`ssh-keyscan` stubbed so no real network/SSH occurs) so
+#    bash performs its own real variable substitution, capture exactly
+#    the command string that would be sent to the VM, then execute THAT
+#    captured command against a real, disposable git repo standing in
+#    for /opt/jobpulse (the literal `/opt/jobpulse` path is textually
+#    substituted for the disposable repo's path -- the only accommodation
+#    made for sandboxing; the preflight logic itself is untouched, exact,
+#    real text pulled from the current workflow file). No fake docker/
+#    curl needed: the preflight itself never calls either, and the
+#    downstream production_dark_launch.sh is stood in for by a tiny
+#    recorder script that never touches Docker.
+# ---------------------------------------------------------------------
+PINNED_TOR_IMAGE = f"ghcr.io/mrezamaghouli/jobpulse-tor:{PINNED_PRODUCTION_SHA}"
+
+_DARK_LAUNCH_CRITICAL_FILES = (
+    "scripts/tor/production_dark_launch.sh",
+    "scripts/tor/production_dark_launch_check.py",
+    "docker-compose.prod.yml",
+    "docker-compose.prod.tor.yml",
+)
+
+
+def test_dark_launch_workflow_inputs_are_exactly_tor_image_and_confirm():
+    workflow = _load_dark_launch_workflow()
+    on_block = _dark_launch_on_block(workflow)
+    inputs = on_block["workflow_dispatch"]["inputs"]
+    assert set(inputs.keys()) == {"tor_image", "confirm"}
+    assert inputs["confirm"]["required"] is True
+    assert inputs["confirm"]["type"] == "string"
+
+
+def test_dark_launch_confirm_must_equal_launch_tor_dark():
+    code = _dark_launch_code_only()
+    assert 'CONFIRM_INPUT" != "LAUNCH_TOR_DARK"' in code
+
+
+def test_dark_launch_confirm_checked_before_any_other_validation():
+    """Matches the tor-secret-provision.yml discipline: confirm is the
+    very first check in the validation step, before even the SSH-key
+    presence check."""
+    code = _dark_launch_code_only()
+    assert code.index('CONFIRM_INPUT" != "LAUNCH_TOR_DARK"') < code.index("VM_SSH_KEY secret is missing")
+
+
+def test_dark_launch_expected_production_sha_is_exact():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert f'EXPECTED_PRODUCTION_SHA: "{PINNED_PRODUCTION_SHA}"' in source
+
+
+def test_dark_launch_expected_tor_image_is_exact():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert f'EXPECTED_TOR_IMAGE: "{PINNED_TOR_IMAGE}"' in source
+
+
+def test_dark_launch_expected_production_sha_not_derived_from_github_sha():
+    code = _dark_launch_code_only()
+    assert "github.sha" not in code
+
+
+def test_dark_launch_tor_image_regex_still_present():
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert r'^ghcr\.io/mrezamaghouli/jobpulse-tor:[0-9a-f]{40}$' in source
+
+
+def test_dark_launch_tor_image_exact_equality_validation_exists():
+    """The regex alone would accept a DIFFERENT, otherwise-valid 40-hex
+    SHA -- exact equality against EXPECTED_TOR_IMAGE is the additional
+    guard that pins the first dark launch to the one real build."""
+    code = _dark_launch_code_only()
+    assert 'TOR_IMAGE_INPUT" != "$EXPECTED_TOR_IMAGE"' in code
+    # Ordering: regex check must run before the exact-equality check
+    # (regex rejects malformed input with a format-specific message;
+    # equality then narrows further).
+    assert code.index(r'jobpulse-tor:[0-9a-f]{40}$') < code.index('TOR_IMAGE_INPUT" != "$EXPECTED_TOR_IMAGE"')
+
+
+def test_dark_launch_neither_expected_constant_is_a_workflow_dispatch_input():
+    workflow = _load_dark_launch_workflow()
+    on_block = _dark_launch_on_block(workflow)
+    inputs = on_block["workflow_dispatch"]["inputs"]
+    assert "expected_production_sha" not in {k.lower() for k in inputs}
+    assert "expected_tor_image" not in {k.lower() for k in inputs}
+
+
+def test_dark_launch_tracked_file_drift_check_covers_exactly_the_critical_files():
+    code = _dark_launch_code_only()
+    match = re.search(r"git diff --quiet HEAD -- ([^\n;]+)", code)
+    assert match, "expected a `git diff --quiet HEAD -- <files>` invocation"
+    listed_files = match.group(1).split()
+    assert listed_files == list(_DARK_LAUNCH_CRITICAL_FILES)
+
+
+def test_dark_launch_preflight_does_not_require_full_working_tree_clean():
+    """Must be a scoped `git diff --quiet HEAD -- <exact files>`, never a
+    bare `git status`/`git diff --quiet` (no path args) that would also
+    fail on production's known untracked runtime paths like state/."""
+    code = _dark_launch_code_only()
+    assert "git status" not in code
+    assert "git diff --quiet HEAD --" in code
+    assert "git diff --quiet HEAD\n" not in code
+
+
+def test_dark_launch_preflight_runs_in_same_ssh_session_before_script():
+    """Ordering proof at the text level: the SHA check and file-drift
+    check both appear inside the SAME double-quoted ssh command-string
+    argument as the final production_dark_launch.sh invocation (not a
+    separate ssh call), and both precede it textually within that one
+    argument."""
+    code = _dark_launch_code_only()
+    ssh_arg_match = re.search(r'ssh -i.*?"(set -e.*?production_dark_launch\.sh)"', code, re.DOTALL)
+    assert ssh_arg_match, "expected the preflight + launch to share one ssh command-string argument"
+    remote_arg = ssh_arg_match.group(1)
+    assert "git rev-parse HEAD" in remote_arg
+    assert "git diff --quiet HEAD --" in remote_arg
+    assert remote_arg.index("git rev-parse HEAD") < remote_arg.index("git diff --quiet HEAD --")
+    assert remote_arg.index("git diff --quiet HEAD --") < remote_arg.index("production_dark_launch.sh")
+
+
+def _capture_remote_command(tmp_path, extra_step_env=None):
+    """Runs the REAL 'Run Tor dark-launch on production VM' step from the
+    current workflow file, with `ssh`/`ssh-keyscan` stubbed so bash does
+    its own real substitution and no network/SSH occurs, and returns the
+    exact command string that would have been sent to the VM."""
+    import os
+
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    lines = source.splitlines()
+
+    def extract_run_blocks(lines):
+        blocks = []
+        i = 0
+        while i < len(lines):
+            if lines[i].strip() == "run: |":
+                indent = len(lines[i]) - len(lines[i].lstrip(" "))
+                body_indent = None
+                body = []
+                j = i + 1
+                while j < len(lines):
+                    line = lines[j]
+                    if line.strip() == "":
+                        body.append("")
+                        j += 1
+                        continue
+                    cur_indent = len(line) - len(line.lstrip(" "))
+                    if cur_indent <= indent:
+                        break
+                    if body_indent is None:
+                        body_indent = cur_indent
+                    body.append(line[body_indent:] if len(line) >= body_indent else line)
+                    j += 1
+                blocks.append("\n".join(body))
+                i = j
+            else:
+                i += 1
+        return blocks
+
+    blocks = extract_run_blocks(lines)
+    assert len(blocks) == 2, f"expected exactly 2 run blocks, found {len(blocks)}"
+    launch_step_script = tmp_path / "_outer_launch_step.sh"
+    launch_step_script.write_text(blocks[1])
+
+    stub_dir = tmp_path / "_stub_bin"
+    stub_dir.mkdir()
+    capture_file = tmp_path / "_captured_remote_command.txt"
+
+    ssh_stub = stub_dir / "ssh"
+    ssh_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "for ((i=1; i<=$#; i++)); do last=\"${!i}\"; done\n"
+        f"printf '%s' \"$last\" > '{capture_file}'\n"
+        "exit 0\n"
+    )
+    ssh_stub.chmod(0o755)
+
+    keyscan_stub = stub_dir / "ssh-keyscan"
+    keyscan_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    keyscan_stub.chmod(0o755)
+
+    fake_home = tmp_path / "_fake_home"
+    fake_home.mkdir()
+
+    env = os.environ.copy()
+    env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
+    env.update({
+        "VM_HOST": "dummy-host",
+        "VM_USER": "dummy-user",
+        "VM_PORT": "22",
+        "VM_SSH_KEY": "dummy-ssh-key",
+        "GHCR_TOKEN": "dummy-ghcr-token",
+        "TOR_IMAGE_INPUT": PINNED_TOR_IMAGE,
+        "PRODUCTION_API_IMAGE": PINNED_API_IMAGE,
+        "TOR_DARK_LAUNCH_IP_CHECK_URL": PINNED_IP_CHECK_URL,
+        "EXPECTED_PRODUCTION_SHA": PINNED_PRODUCTION_SHA,
+    })
+    if extra_step_env:
+        env.update(extra_step_env)
+
+    result = subprocess.run(
+        ["bash", str(launch_step_script)], env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"outer launch step itself failed: {result.stderr}"
+    assert capture_file.is_file(), "ssh stub was never invoked"
+    return capture_file.read_text()
+
+
+@pytest.fixture
+def fake_production_repo(tmp_path):
+    """A disposable git repo standing in for /opt/jobpulse, with the four
+    dark-launch-critical tracked files committed. Returns (repo_dir, sha)."""
+    repo_dir = tmp_path / "fake_opt_jobpulse"
+    repo_dir.mkdir()
+
+    def run_git(*args):
+        subprocess.run(["git", *args], cwd=str(repo_dir), check=True, capture_output=True)
+
+    run_git("init", "-q")
+    run_git("config", "user.email", "test@example.com")
+    run_git("config", "user.name", "Test")
+
+    (repo_dir / "scripts" / "tor").mkdir(parents=True)
+    recorder = repo_dir / "scripts" / "tor" / "production_dark_launch.sh"
+    recorder.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo PRODUCTION_DARK_LAUNCH_SH_INVOKED\n"
+        "cat > /dev/null\n"  # consume the GHCR_TOKEN_B64 stdin, like the real script would
+        "exit 0\n"
+    )
+    recorder.chmod(0o755)
+    (repo_dir / "scripts" / "tor" / "production_dark_launch_check.py").write_text("# stand-in\n")
+    (repo_dir / "docker-compose.prod.yml").write_text("services: {}\n")
+    (repo_dir / "docker-compose.prod.tor.yml").write_text("services: {}\n")
+
+    run_git("add", "-A")
+    run_git("commit", "-q", "-m", "initial")
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_dir), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return repo_dir, sha
+
+
+def _run_captured_command_against_fake_repo(command_text, fake_repo_dir, expected_sha_for_pass=None):
+    """Substitutes the hardcoded /opt/jobpulse path for the disposable
+    fake repo's path (the only accommodation made for sandboxing) and
+    executes the exact captured command, feeding dummy GHCR token bytes
+    on stdin exactly like the real ssh <<< redirection does."""
+    localized = command_text.replace("/opt/jobpulse", str(fake_repo_dir))
+    result = subprocess.run(
+        ["bash", "-c", localized], input="ZHVtbXk=", capture_output=True, text=True, timeout=30,
+    )
+    return result
+
+
+@requires_docker_compose  # reuses the same subprocess/git-availability discipline as section 3; git itself is required, not docker, but this keeps the marker consistent with "requires a real external CLI"
+def test_remote_preflight_blocks_script_on_production_sha_mismatch(tmp_path, fake_production_repo):
+    fake_repo_dir, actual_sha = fake_production_repo
+    # actual_sha != PINNED_PRODUCTION_SHA (a fresh disposable repo's
+    # commit SHA can never coincidentally equal the real pinned value).
+    assert actual_sha != PINNED_PRODUCTION_SHA
+
+    command_text = _capture_remote_command(tmp_path)
+    result = _run_captured_command_against_fake_repo(command_text, fake_repo_dir)
+
+    assert result.returncode != 0
+    assert "TOR_DARK_LAUNCH_PREFLIGHT_FAILED" in result.stderr
+    assert "production SHA mismatch" in result.stderr
+    assert "PRODUCTION_DARK_LAUNCH_SH_INVOKED" not in result.stdout
+
+
+def test_remote_preflight_blocks_script_on_tracked_file_drift(tmp_path, fake_production_repo):
+    fake_repo_dir, actual_sha = fake_production_repo
+    # Dirty one of the four critical tracked files (uncommitted change).
+    (fake_repo_dir / "docker-compose.prod.tor.yml").write_text("services: {}\n# drifted\n")
+
+    command_text = _capture_remote_command(tmp_path, extra_step_env={"EXPECTED_PRODUCTION_SHA": actual_sha})
+    result = _run_captured_command_against_fake_repo(command_text, fake_repo_dir)
+
+    assert result.returncode != 0
+    assert "TOR_DARK_LAUNCH_PREFLIGHT_FAILED" in result.stderr
+    assert "tracked dark-launch-critical file(s) differ from HEAD" in result.stderr
+    assert "PRODUCTION_DARK_LAUNCH_SH_INVOKED" not in result.stdout
+
+
+def test_remote_preflight_allows_script_when_clean_and_sha_matches(tmp_path, fake_production_repo):
+    fake_repo_dir, actual_sha = fake_production_repo
+
+    command_text = _capture_remote_command(tmp_path, extra_step_env={"EXPECTED_PRODUCTION_SHA": actual_sha})
+    result = _run_captured_command_against_fake_repo(command_text, fake_repo_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "TOR_DARK_LAUNCH_PREFLIGHT_OK" in result.stdout
+    assert "PRODUCTION_DARK_LAUNCH_SH_INVOKED" in result.stdout
+
+
+def test_remote_preflight_ignores_untracked_state_directory(tmp_path, fake_production_repo):
+    """Production has a known, legitimate untracked state/ directory --
+    it must never cause the preflight to fail closed."""
+    fake_repo_dir, actual_sha = fake_production_repo
+    (fake_repo_dir / "state").mkdir()
+    (fake_repo_dir / "state" / "runtime.json").write_text("{}\n")
+
+    command_text = _capture_remote_command(tmp_path, extra_step_env={"EXPECTED_PRODUCTION_SHA": actual_sha})
+    result = _run_captured_command_against_fake_repo(command_text, fake_repo_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "TOR_DARK_LAUNCH_PREFLIGHT_OK" in result.stdout
+    assert "PRODUCTION_DARK_LAUNCH_SH_INVOKED" in result.stdout
+
+
+def test_remote_preflight_ignores_drift_in_a_non_critical_tracked_file(tmp_path, fake_production_repo):
+    """The drift gate is scoped to exactly the four critical files --
+    an uncommitted change to some OTHER tracked file must not block the
+    launch (proves the gate isn't accidentally a full working-tree-clean
+    requirement in disguise)."""
+    fake_repo_dir, _initial_sha = fake_production_repo
+    other_file = fake_repo_dir / "README.md"
+    other_file.write_text("not one of the four critical files\n")
+    subprocess.run(["git", "add", "README.md"], cwd=str(fake_repo_dir), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-q", "-m", "add readme"],
+        cwd=str(fake_repo_dir), check=True, capture_output=True,
+    )
+    # HEAD moved with the commit above -- re-fetch it rather than reusing
+    # the fixture's now-stale initial SHA.
+    actual_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(fake_repo_dir), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    # Now dirty it (uncommitted) -- a non-critical tracked file drifting.
+    other_file.write_text("dirtied after commit\n")
+
+    command_text = _capture_remote_command(tmp_path, extra_step_env={"EXPECTED_PRODUCTION_SHA": actual_sha})
+    result = _run_captured_command_against_fake_repo(command_text, fake_repo_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "PRODUCTION_DARK_LAUNCH_SH_INVOKED" in result.stdout
+
+
+def test_remote_preflight_gates_are_the_only_thing_before_script_invocation():
+    """No docker/curl command of any kind may appear in the remote
+    command string before the production_dark_launch.sh invocation --
+    the preflight is git-only."""
+    code = _dark_launch_code_only()
+    ssh_arg_match = re.search(r'ssh -i.*?"(set -e.*?)"\s*\\\n\s*<<<', code, re.DOTALL)
+    assert ssh_arg_match
+    remote_arg = ssh_arg_match.group(1)
+    preamble = remote_arg.split("production_dark_launch.sh")[0]
+    assert "docker" not in preamble
+    assert "curl" not in preamble
+
+
+def test_dark_launch_phase_3_2b_pinning_still_intact_after_phase_3_2c():
+    """Regression guard: none of the Phase 3.2C additions above may have
+    weakened the Phase 3.2B API-image/URL pinning."""
+    source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
+    assert f'PRODUCTION_API_IMAGE: "{PINNED_API_IMAGE}"' in source
+    assert f'TOR_DARK_LAUNCH_IP_CHECK_URL: "{PINNED_IP_CHECK_URL}"' in source
+    assert "JOBPULSE_API_IMAGE='$PRODUCTION_API_IMAGE'" in source
+    assert "TOR_IP_CHECK_URL='$TOR_DARK_LAUNCH_IP_CHECK_URL'" in source
+
+
+def test_dark_launch_still_workflow_dispatch_only_after_phase_3_2c():
+    workflow = _load_dark_launch_workflow()
+    on_block = _dark_launch_on_block(workflow)
+    assert set(on_block.keys()) == {"workflow_dispatch"}
+
+
+def test_dark_launch_no_new_secrets_introduced_by_phase_3_2c():
+    referenced_secrets = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", DARK_LAUNCH_WORKFLOW_PATH.read_text()))
+    assert referenced_secrets == {"VM_SSH_KEY", "GHCR_TOKEN"}
