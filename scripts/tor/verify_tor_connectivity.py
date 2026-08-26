@@ -45,6 +45,7 @@ from scripts.tor.circuit_manager import (
     ERROR_CATEGORY_BOOTSTRAP_INCOMPLETE,
     ERROR_CATEGORY_CONTROL_PORT_FAILURE,
     _instance_lock_key,
+    _resolve_control_address,
     record_bootstrap_failed,
     record_bootstrap_ready,
     record_bootstrap_started,
@@ -90,8 +91,18 @@ def check_bootstrap_status() -> str:
         control_password = get_tor_control_password()
 
         try:
+            # See circuit_manager._resolve_control_address's docstring:
+            # stem 1.8.2's Controller.from_port() requires a literal IPv4
+            # address (a purely syntactic check, no DNS of its own) --
+            # TOR_CONTROL_HOST=tor (the Docker Compose service name) is
+            # exactly what production's first dark launch hit. Resolution
+            # failure is caught by the `except Exception` below just like
+            # any other ControlPort connection failure -- instance_key
+            # above already used the CONFIGURED control_host/control_port,
+            # never this resolved address.
+            resolved_control_address = _resolve_control_address(control_host, control_port)
             with Controller.from_port(
-                address=control_host,
+                address=resolved_control_address,
                 port=control_port,
             ) as controller:
                 if control_password:

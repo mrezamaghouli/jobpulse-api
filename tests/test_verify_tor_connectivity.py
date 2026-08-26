@@ -18,6 +18,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import scripts.tor.circuit_manager as cm
 import scripts.tor.verify_tor_connectivity as vtc
 from scripts.tor.verify_tor_connectivity import (
     TorVerificationError,
@@ -257,3 +258,83 @@ def test_check_bootstrap_status_never_contacts_a_real_tor_process(monkeypatch):
             vtc.check_bootstrap_status()
 
     assert fake_controller_cls.from_port.called
+
+
+# =====================================================================
+# Phase 3.3A: ControlPort hostname resolution inside check_bootstrap_status()
+#
+# Root cause (verified against installed stem 1.8.2 source):
+# Controller.from_port()'s `address` must already be a literal IPv4
+# address -- it performs no DNS resolution itself and raises
+# ValueError('Invalid IP address: <value>') for a hostname like "tor"
+# (the Docker Compose service name production actually uses) before any
+# socket is opened. See scripts/tor/circuit_manager._resolve_control_address.
+# =====================================================================
+
+def test_check_bootstrap_status_docker_hostname_reaches_mocked_controller_via_resolved_ip(monkeypatch):
+    """Test D: TOR_CONTROL_HOST=tor (Docker service name) must succeed --
+    the real _resolve_control_address() runs (not itself mocked), backed
+    by a mocked socket.getaddrinfo() returning an IPv4 address, and the
+    mocked Controller.from_port() must receive that resolved IP, not the
+    literal string "tor"."""
+    monkeypatch.setenv("TOR_CONTROL_HOST", "tor")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+
+    fake_controller = mock.MagicMock()
+    fake_controller.get_info.return_value = "PROGRESS=100 TAG=done SUMMARY=Done"
+    fake_getaddrinfo = mock.MagicMock(return_value=[
+        (2, 1, 6, "", ("172.20.0.5", 9051)),
+    ])
+
+    with mock.patch.object(vtc, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(vtc, "Controller") as fake_controller_cls, \
+         mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo), \
+         mock.patch.object(vtc, "record_bootstrap_started") as fake_started, \
+         mock.patch.object(vtc, "record_bootstrap_ready") as fake_ready, \
+         mock.patch.object(vtc, "record_bootstrap_failed") as fake_failed:
+        fake_psycopg2.connect.return_value = _FakeConnection()
+        fake_controller_cls.from_port.return_value = _controller_context_manager(fake_controller)
+
+        phase = vtc.check_bootstrap_status()
+
+    assert "PROGRESS=100" in phase
+    fake_controller_cls.from_port.assert_called_once_with(address="172.20.0.5", port=9051)
+    assert fake_started.called
+    assert fake_ready.called
+    assert not fake_failed.called
+
+
+def test_check_bootstrap_status_hostname_resolution_failure_is_control_port_failure(monkeypatch):
+    """Test E: a DNS/resolution failure must be categorized identically
+    to any other ControlPort connection failure -- ERROR_CATEGORY_CONTROL_PORT_FAILURE,
+    never reported as bootstrap_incomplete, and the raw exception must
+    never be passed to record_bootstrap_failed (which only ever accepts
+    the normalized category string -- see its signature)."""
+    monkeypatch.setenv("TOR_CONTROL_HOST", "tor-unresolvable")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+
+    fake_getaddrinfo = mock.MagicMock(side_effect=cm.socket.gaierror("Name or service not known"))
+
+    with mock.patch.object(vtc, "psycopg2") as fake_psycopg2, \
+         mock.patch.object(vtc, "Controller") as fake_controller_cls, \
+         mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo), \
+         mock.patch.object(vtc, "record_bootstrap_started") as fake_started, \
+         mock.patch.object(vtc, "record_bootstrap_failed") as fake_failed:
+        fake_psycopg2.connect.return_value = _FakeConnection()
+
+        with pytest.raises(cm.TorControlAddressResolutionError):
+            vtc.check_bootstrap_status()
+
+    # The real ControlPort connection was never attempted -- resolution
+    # failed first.
+    assert not fake_controller_cls.from_port.called
+    assert fake_started.called
+
+    fake_failed.assert_called_once()
+    _, called_args, called_kwargs = fake_failed.mock_calls[0]
+    passed_category = called_args[2] if len(called_args) > 2 else called_kwargs.get("error_category")
+    assert passed_category == vtc.ERROR_CATEGORY_CONTROL_PORT_FAILURE
+    # Only the normalized category string was passed -- never the raw
+    # gaierror/exception object itself.
+    for arg in list(called_args) + list(called_kwargs.values()):
+        assert not isinstance(arg, BaseException)

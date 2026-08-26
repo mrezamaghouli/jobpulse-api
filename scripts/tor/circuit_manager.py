@@ -108,11 +108,13 @@ import argparse
 import json
 import math
 import re
+import socket
 import time
 import zlib
 from datetime import datetime, timezone
 
 import psycopg2
+import stem.util.connection
 from stem import Signal
 from stem.control import Controller
 
@@ -412,6 +414,15 @@ class CircuitRotationError(Exception):
     """Raised when the Tor control-port NEWNYM exchange itself fails."""
 
 
+class TorControlAddressResolutionError(Exception):
+    """Raised when the configured TOR_CONTROL_HOST cannot be resolved to a
+    usable IPv4 address for stem's Controller.from_port() (see
+    _resolve_control_address's docstring for why this resolution step is
+    needed at all). Callers treat this exactly like any other ControlPort
+    connection failure -- it is never a distinct, specially-handled error
+    category."""
+
+
 def _utc_now():
     return datetime.now(timezone.utc)
 
@@ -427,6 +438,80 @@ def _advisory_lock_key(lock_scope: str) -> int:
 
 def _instance_lock_key(control_host: str, control_port: int) -> str:
     return f"tor-instance:{control_host}:{control_port}"
+
+
+def _resolve_control_address(control_host: str, control_port: int) -> str:
+    """Resolves the configured TOR_CONTROL_HOST to a concrete IPv4 address
+    suitable for stem 1.8.2's Controller.from_port(), which -- verified
+    directly against the installed stem 1.8.2 source
+    (stem.control.Controller.from_port -> stem.util.connection.
+    is_valid_ipv4_address) -- performs a purely SYNTACTIC dotted-quad
+    check on its `address` argument before ever opening a socket, and
+    raises ValueError('Invalid IP address: <value>') for anything that
+    isn't already a literal IPv4 address. It does no DNS resolution of
+    its own. This is exactly what production hit on the first real Tor
+    dark launch: TOR_CONTROL_HOST=tor (the Docker Compose service name,
+    correctly resolvable via container DNS for ordinary TCP connections)
+    is not a valid IPv4 literal, so from_port(address='tor', ...) fails
+    immediately with that exact message, before any ControlPort
+    connection is attempted.
+
+    This function is the ONLY thing that performs that resolution --
+    every Controller.from_port() call site in this codebase must call it
+    first and pass the RESULT as `address`. It must NEVER be used to
+    change the CONFIGURED logical host+port used for
+    _instance_lock_key()/advisory-lock scope/persisted NEWNYM cooldown
+    identity/observability identity -- those must keep using
+    control_host/control_port exactly as configured (e.g. "tor:9051"),
+    never a resolved, container-lifecycle-dependent IP that could change
+    on every `docker compose up`/restart.
+
+    socket.getaddrinfo() handles IPv4 literals (e.g. "127.0.0.1")
+    correctly too -- for a literal it returns that same address back
+    without performing any actual DNS/network lookup, so no special-case
+    branch is needed for the already-a-literal-IP case.
+
+    Raises TorControlAddressResolutionError -- never silently falls back
+    to 127.0.0.1, never swallows the failure and pretends the ControlPort
+    connection succeeded -- if control_host is empty, or genuinely cannot
+    be resolved to any IPv4 address (unknown hostname, DNS failure, no
+    AF_INET result). Logs/raises only the hostname and port -- never a
+    secret."""
+    if not control_host:
+        raise TorControlAddressResolutionError(
+            "TOR_CONTROL_HOST is empty -- cannot resolve a ControlPort address"
+        )
+
+    try:
+        addrinfo_results = socket.getaddrinfo(
+            control_host,
+            control_port,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise TorControlAddressResolutionError(
+            f"cannot resolve TOR_CONTROL_HOST={control_host!r} (port {control_port}) "
+            f"to an IPv4 address: {exc}"
+        ) from exc
+
+    if not addrinfo_results:
+        raise TorControlAddressResolutionError(
+            f"TOR_CONTROL_HOST={control_host!r} (port {control_port}) resolved to "
+            "no IPv4 addresses"
+        )
+
+    # (family, type, proto, canonname, sockaddr) -- sockaddr for AF_INET
+    # is (address, port).
+    resolved_address = addrinfo_results[0][4][0]
+
+    if not stem.util.connection.is_valid_ipv4_address(resolved_address):
+        raise TorControlAddressResolutionError(
+            f"TOR_CONTROL_HOST={control_host!r} (port {control_port}) resolved to "
+            f"{resolved_address!r}, which is not a valid IPv4 address"
+        )
+
+    return resolved_address
 
 
 def _redact_secret(text: str, secret: str) -> str:
@@ -941,8 +1026,17 @@ def request_new_identity(connection, max_retries: int = 3, max_wait_seconds=None
 
         for attempt in range(max_retries):
             try:
+                # Resolved fresh on every attempt (never cached across
+                # retries) -- a transient DNS hiccup is just another
+                # ControlPort-connection failure covered by this same
+                # bounded retry loop, exactly like a transient connection
+                # refusal would be. instance_lock_scope above already used
+                # the CONFIGURED control_host/control_port, not this
+                # resolved address -- resolution never touches locking/
+                # cooldown/observability identity.
+                resolved_control_address = _resolve_control_address(control_host, control_port)
                 with Controller.from_port(
-                    address=control_host,
+                    address=resolved_control_address,
                     port=control_port,
                 ) as controller:
                     if control_password:
