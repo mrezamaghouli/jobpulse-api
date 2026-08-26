@@ -127,8 +127,13 @@ jobs:
       PRODUCTION_API_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
       TOR_DARK_LAUNCH_IP_CHECK_URL: "https://check.torproject.org/api/ip"
       # A production dark launch must target the exact, currently-
-      # observed production checkout and its correspondingly-built Tor
-      # image -- not merely "a" validly-shaped SHA. Not derived from
+      # observed production checkout (EXPECTED_PRODUCTION_SHA) and the
+      # separately authorized, immutable Tor image (EXPECTED_TOR_IMAGE)
+      # -- not merely "a" validly-shaped SHA for either. These two pins
+      # are independent and do NOT need to share the same commit SHA:
+      # the Tor image is only rebuilt/re-authorized on its own, separate
+      # schedule, so it can (and currently does) lag behind whichever
+      # commit production/API is pinned to below. Not derived from
       # github.sha: the GitHub runner's checkout is intentionally newer
       # than what's actually deployed (production is pinned to the
       # Phase 3.3A commit, 0b0290d5dedc9bfc9fba83a1a97f782a10890b06,
