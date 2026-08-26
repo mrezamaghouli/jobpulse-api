@@ -633,6 +633,131 @@ def test_request_new_identity_live_stem_check_exceeding_max_raises_cooldown(monk
 
 
 # =====================================================================
+# Phase 3.3A: ControlPort hostname-to-IPv4 resolution
+#
+# Root cause (verified directly against the installed stem 1.8.2
+# source): Controller.from_port()'s `address` argument is checked by
+# stem.util.connection.is_valid_ipv4_address() -- a purely syntactic
+# dotted-quad check, performing NO DNS resolution of its own -- before
+# any socket is opened. A Docker Compose service name like "tor" is
+# rejected immediately with ValueError('Invalid IP address: tor'),
+# exactly what production's first real dark launch hit. These tests
+# cover _resolve_control_address() directly, and its two Controller.
+# from_port() call sites (this module's request_new_identity(), and
+# scripts/tor/verify_tor_connectivity.py's check_bootstrap_status()).
+# =====================================================================
+
+def test_resolve_control_address_accepts_ipv4_literal():
+    """Test A: an IPv4 literal must pass through unchanged -- no actual
+    DNS/network lookup is needed for a literal (verified here by NOT
+    mocking socket.getaddrinfo at all; a real getaddrinfo call on a
+    literal IP is instant and network-free)."""
+    assert cm._resolve_control_address("127.0.0.1", 9051) == "127.0.0.1"
+
+
+def test_resolve_control_address_resolves_docker_style_hostname(monkeypatch):
+    """Test B: a Docker Compose service name (e.g. "tor") must resolve
+    through socket.getaddrinfo() to a concrete IPv4 address."""
+    fake_getaddrinfo = mock.MagicMock(return_value=[
+        (2, 1, 6, "", ("172.20.0.5", 9051)),  # (family, type, proto, canonname, sockaddr)
+    ])
+    with mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        resolved = cm._resolve_control_address("tor", 9051)
+
+    assert resolved == "172.20.0.5"
+    fake_getaddrinfo.assert_called_once_with(
+        "tor", 9051, family=cm.socket.AF_INET, type=cm.socket.SOCK_STREAM,
+    )
+
+
+def test_resolve_control_address_failure_raises_clearly(monkeypatch):
+    """Requirements 6/7/8 from the task: unresolvable hosts must fail
+    clearly, never silently fall back to 127.0.0.1, never pretend the
+    ControlPort connection succeeded."""
+    fake_getaddrinfo = mock.MagicMock(side_effect=cm.socket.gaierror("Name or service not known"))
+    with mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        with pytest.raises(cm.TorControlAddressResolutionError, match="tor-does-not-exist"):
+            cm._resolve_control_address("tor-does-not-exist", 9051)
+
+
+def test_resolve_control_address_empty_host_raises_clearly():
+    with pytest.raises(cm.TorControlAddressResolutionError):
+        cm._resolve_control_address("", 9051)
+
+
+def test_resolve_control_address_no_results_raises_clearly(monkeypatch):
+    fake_getaddrinfo = mock.MagicMock(return_value=[])
+    with mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        with pytest.raises(cm.TorControlAddressResolutionError):
+            cm._resolve_control_address("tor", 9051)
+
+
+def test_resolve_control_address_never_falls_back_to_localhost(monkeypatch):
+    fake_getaddrinfo = mock.MagicMock(side_effect=cm.socket.gaierror("boom"))
+    with mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        with pytest.raises(cm.TorControlAddressResolutionError) as excinfo:
+            cm._resolve_control_address("tor", 9051)
+    assert "127.0.0.1" not in str(excinfo.value)
+
+
+def test_request_new_identity_uses_resolved_ip_but_preserves_logical_instance_identity(monkeypatch):
+    """Test C + Test F: with TOR_CONTROL_HOST=tor resolving to
+    172.20.0.5, the actual Stem connection must use the resolved IP,
+    while the advisory-lock instance identity remains the CONFIGURED
+    logical host:port (tor:9051) -- never the resolved, container-
+    lifecycle-dependent IP. Also proves existing NEWNYM/authenticate
+    behavior is otherwise unchanged."""
+    monkeypatch.setenv("TOR_CONTROL_HOST", "tor")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+    monkeypatch.setenv("TOR_CONTROL_PASSWORD", "test-password")
+
+    fake_conn = FakeConnection()
+    controller = mock.MagicMock()
+    fake_getaddrinfo = mock.MagicMock(return_value=[
+        (2, 1, 6, "", ("172.20.0.5", 9051)),
+    ])
+
+    with mock.patch.object(cm, "Controller") as fake_controller_cls, \
+         mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        fake_controller_cls.from_port.return_value = _controller_cm(controller)
+
+        cm.request_new_identity(fake_conn)
+
+    # The actual Stem socket connection used the RESOLVED IP.
+    fake_controller_cls.from_port.assert_called_once_with(address="172.20.0.5", port=9051)
+    controller.authenticate.assert_called_once_with(password="test-password")
+    controller.signal.assert_called_once_with(cm.Signal.NEWNYM)
+
+    # The advisory-lock / logical instance identity used the CONFIGURED
+    # host, never the resolved IP.
+    logical_instance_scope = cm._instance_lock_key("tor", 9051)
+    resolved_ip_instance_scope = cm._instance_lock_key("172.20.0.5", 9051)
+    assert logical_instance_scope != resolved_ip_instance_scope
+    assert unlock_call_count(fake_conn, logical_instance_scope) == 1
+    assert unlock_call_count(fake_conn, resolved_ip_instance_scope) == 0
+
+
+def test_request_new_identity_hostname_resolution_failure_is_retried_then_raises(monkeypatch):
+    """Resolution failure must be treated exactly like any other
+    ControlPort connection failure -- covered by the SAME bounded retry
+    loop, never a special-cased immediate raise, never a new unbounded
+    retry mechanism."""
+    monkeypatch.setenv("TOR_CONTROL_HOST", "tor-unresolvable")
+    monkeypatch.setenv("TOR_CONTROL_PORT", "9051")
+
+    fake_conn = FakeConnection()
+    fake_getaddrinfo = mock.MagicMock(side_effect=cm.socket.gaierror("boom"))
+
+    with mock.patch.object(cm, "Controller") as fake_controller_cls, \
+         mock.patch.object(cm.socket, "getaddrinfo", fake_getaddrinfo):
+        with pytest.raises(cm.CircuitRotationError, match="NEWNYM failed after"):
+            cm.request_new_identity(fake_conn, max_retries=3)
+
+    assert fake_getaddrinfo.call_count == 3
+    assert not fake_controller_cls.from_port.called
+
+
+# =====================================================================
 # get_circuit_state
 # =====================================================================
 
