@@ -1,13 +1,25 @@
 name: Production Tor Dark Launch
 
 # ============================================================================
-# PHASE 3 DESIGN ONLY -- NOT TO BE DISPATCHED AS PART OF THIS TASK.
+# PHASE 3 DESIGN -- NOT TO BE DISPATCHED AS PART OF THIS TASK.
 #
 # This workflow is written so the manual dark-launch procedure exists as
-# reviewable, version-controlled code, not tribal knowledge. It has never
-# been run. Dispatching it is a separate, explicit, future decision by an
-# operator -- creating this file does not start, schedule, or authorize
-# any run of it.
+# reviewable, version-controlled code, not tribal knowledge. Its first
+# production run (2026-08-25) reached a healthy Tor service -- container
+# started, health check passed, image tag and image ID both verified --
+# then failed safely during the diagnostic ControlPort/bootstrap
+# verification step, because Stem 1.8.2 rejected the Docker hostname
+# "tor" before it could even open a ControlPort connection. Tor itself
+# never failed to become healthy; the rollback path removed the tor
+# container/service and left production untouched. That incompatibility
+# was fixed in scripts/tor/circuit_manager.py /
+# scripts/tor/verify_tor_connectivity.py (Phase 3.3A) and deployed to
+# production; production/API is now at the commit pinned below as
+# EXPECTED_PRODUCTION_SHA. The Tor image itself was not rebuilt by that
+# fix, so the Tor image pin below remains the exact image already built
+# from the prior production commit. Dispatching this workflow again is a
+# separate, explicit, future decision by an operator -- updating these
+# pins does not start, schedule, or authorize any run of it.
 # ============================================================================
 #
 # workflow_dispatch ONLY -- this must never trigger automatically. It is
@@ -49,7 +61,7 @@ name: Production Tor Dark Launch
 # TOR_IMAGE_B64 is NOT a secret (a strictly-validated image reference,
 # already gated by the step above) and stays in the ssh argv assignment.
 #
-# --- Phase 3.2B pinning ---------------------------------------------------
+# --- Dark-launch API-image / URL pinning (Phase 3.2B, repinned 3.3C) ------
 # docker-compose.prod.tor.yml's `tor-diagnostic` service resolves its image
 # as `${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}`, and
 # its `TOR_IP_CHECK_URL` as `${TOR_IP_CHECK_URL:-https://check.torproject.org/api/ip}`.
@@ -57,17 +69,17 @@ name: Production Tor Dark Launch
 # environment does NOT already define the variable -- so this workflow
 # must always supply both explicitly, or the diagnostic could silently
 # run the floating `:main` API image, or a `TOR_IP_CHECK_URL` overridden
-# by production's own .env, neither of which is acceptable for the first
+# by production's own .env, neither of which is acceptable for a
 # production dark launch. PRODUCTION_API_IMAGE is a fixed, non-secret,
 # strictly-validated constant -- NOT derived from `github.sha`/main (the
 # GitHub runner's checkout may be newer than what's actually deployed;
-# production is intentionally still pinned to Phase 3's
-# 5dffbd669eec52f5283503bb6409a430509175a0) and NOT a workflow_dispatch
-# input (an operator-editable field here could target the wrong image by
-# typo, exactly like EXPECTED_PRODUCTION_SHA in tor-secret-provision.yml).
-# TOR_DARK_LAUNCH_IP_CHECK_URL is likewise fixed, not an input: the first
-# production dark launch must always probe the same well-known neutral
-# endpoint, never an operator-supplied URL.
+# production is intentionally pinned to the currently-deployed Phase
+# 3.3A commit, 0b0290d5dedc9bfc9fba83a1a97f782a10890b06) and NOT a
+# workflow_dispatch input (an operator-editable field here could target
+# the wrong image by typo, exactly like EXPECTED_PRODUCTION_SHA in
+# tor-secret-provision.yml). TOR_DARK_LAUNCH_IP_CHECK_URL is likewise
+# fixed, not an input: a production dark launch must always probe the
+# same well-known neutral endpoint, never an operator-supplied URL.
 on:
   workflow_dispatch:
     inputs:
@@ -75,9 +87,8 @@ on:
         description: >-
           Exact immutable Tor image to launch, e.g.
           ghcr.io/mrezamaghouli/jobpulse-tor:<40-char-commit-sha>. Must be
-          pinned to a commit SHA tag -- "main"/"latest" are rejected. For
-          the first production dark launch this must equal
-          EXPECTED_TOR_IMAGE below exactly.
+          pinned to a commit SHA tag -- "main"/"latest" are rejected. This
+          must equal EXPECTED_TOR_IMAGE below exactly.
         required: true
         type: string
       confirm:
@@ -104,20 +115,38 @@ jobs:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
       TOR_IMAGE_INPUT: ${{ inputs.tor_image }}
       CONFIRM_INPUT: ${{ inputs.confirm }}
-      # Not secrets -- see the "Phase 3.2B pinning" header comment above.
-      # Fixed constants, deliberately never workflow_dispatch inputs.
-      PRODUCTION_API_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:5dffbd669eec52f5283503bb6409a430509175a0"
+      # Not secrets -- see the "Dark-launch API-image / URL pinning"
+      # header comment above. Fixed constants, deliberately never
+      # workflow_dispatch inputs.
+      # Phase 3.3C repin: production/API moved from
+      # 5dffbd669eec52f5283503bb6409a430509175a0 to
+      # 0b0290d5dedc9bfc9fba83a1a97f782a10890b06 after the Phase 3.3A
+      # ControlPort hostname-resolution fix was deployed. The Tor image
+      # was NOT rebuilt by that deploy, so it keeps its own, independent
+      # pin below -- see EXPECTED_TOR_IMAGE.
+      PRODUCTION_API_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
       TOR_DARK_LAUNCH_IP_CHECK_URL: "https://check.torproject.org/api/ip"
-      # Phase 3.2C: the FIRST production dark launch must target the
-      # exact, currently-observed production checkout and its
-      # correspondingly-built Tor image -- not merely "a" validly-shaped
-      # SHA. Not derived from github.sha: the GitHub runner's checkout is
-      # intentionally newer than what's actually deployed (production
-      # remains pinned to Phase 3's 5dffbd669eec52f5283503bb6409a430509175a0
-      # until a separate, explicit deploy decision moves it). Both are
-      # fixed constants, never workflow_dispatch inputs, for the same
-      # typo-safety reason as PRODUCTION_API_IMAGE above.
-      EXPECTED_PRODUCTION_SHA: "5dffbd669eec52f5283503bb6409a430509175a0"
+      # A production dark launch must target the exact, currently-
+      # observed production checkout (EXPECTED_PRODUCTION_SHA) and the
+      # separately authorized, immutable Tor image (EXPECTED_TOR_IMAGE)
+      # -- not merely "a" validly-shaped SHA for either. These two pins
+      # are independent and do NOT need to share the same commit SHA:
+      # the Tor image is only rebuilt/re-authorized on its own, separate
+      # schedule, so it can (and currently does) lag behind whichever
+      # commit production/API is pinned to below. Not derived from
+      # github.sha: the GitHub runner's checkout is intentionally newer
+      # than what's actually deployed (production is pinned to the
+      # Phase 3.3A commit, 0b0290d5dedc9bfc9fba83a1a97f782a10890b06,
+      # until a separate, explicit deploy decision moves it further).
+      # Both are fixed constants, never workflow_dispatch inputs, for
+      # the same typo-safety reason as PRODUCTION_API_IMAGE above.
+      EXPECTED_PRODUCTION_SHA: "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+      # Independent of EXPECTED_PRODUCTION_SHA above: Phase 3.3A changed
+      # only Python scripts and rebuilt the API image, never the Tor
+      # image. The Tor image already built and validated from
+      # 5dffbd669eec52f5283503bb6409a430509175a0 remains the sole
+      # authorized Tor artifact until a separate Tor image rebuild/pin
+      # decision is made.
       EXPECTED_TOR_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
     steps:
@@ -160,7 +189,7 @@ jobs:
           # A different, otherwise-valid 40-hex-char SHA must be rejected
           # here.
           if [ "$TOR_IMAGE_INPUT" != "$EXPECTED_TOR_IMAGE" ]; then
-            echo "ERROR: tor_image must be exactly $EXPECTED_TOR_IMAGE for the first production dark launch (got: $TOR_IMAGE_INPUT)" >&2
+            echo "ERROR: tor_image must be exactly $EXPECTED_TOR_IMAGE for this dark launch (got: $TOR_IMAGE_INPUT)" >&2
             exit 1
           fi
 
@@ -173,8 +202,8 @@ jobs:
             echo "ERROR: PRODUCTION_API_IMAGE must be ghcr.io/mrezamaghouli/jobpulse-api:<40-char-commit-sha> (got: $PRODUCTION_API_IMAGE)" >&2
             exit 1
           fi
-          if [ "$PRODUCTION_API_IMAGE" != "ghcr.io/mrezamaghouli/jobpulse-api:5dffbd669eec52f5283503bb6409a430509175a0" ]; then
-            echo "ERROR: PRODUCTION_API_IMAGE must be pinned to the currently deployed production SHA 5dffbd669eec52f5283503bb6409a430509175a0 (got: $PRODUCTION_API_IMAGE)" >&2
+          if [ "$PRODUCTION_API_IMAGE" != "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06" ]; then
+            echo "ERROR: PRODUCTION_API_IMAGE must be pinned to the currently deployed production SHA 0b0290d5dedc9bfc9fba83a1a97f782a10890b06 (got: $PRODUCTION_API_IMAGE)" >&2
             exit 1
           fi
           echo "Validated PRODUCTION_API_IMAGE: $PRODUCTION_API_IMAGE"

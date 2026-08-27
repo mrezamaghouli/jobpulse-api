@@ -793,7 +793,9 @@ def test_only_the_real_tor_job_carries_the_opt_in_gate():
 #    behavior independently and is untouched by this change.
 # ---------------------------------------------------------------------
 DARK_LAUNCH_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tor-dark-launch.yml"
-PINNED_PRODUCTION_SHA = "5dffbd669eec52f5283503bb6409a430509175a0"
+# Phase 3.3C repin: production/API moved to this commit after the Phase
+# 3.3A ControlPort hostname-resolution fix was deployed.
+PINNED_PRODUCTION_SHA = "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
 PINNED_API_IMAGE = f"ghcr.io/mrezamaghouli/jobpulse-api:{PINNED_PRODUCTION_SHA}"
 PINNED_IP_CHECK_URL = "https://check.torproject.org/api/ip"
 
@@ -1269,7 +1271,13 @@ def test_dark_launch_notice_is_a_static_heredoc_not_secret_interpolated():
 #    downstream production_dark_launch.sh is stood in for by a tiny
 #    recorder script that never touches Docker.
 # ---------------------------------------------------------------------
-PINNED_TOR_IMAGE = f"ghcr.io/mrezamaghouli/jobpulse-tor:{PINNED_PRODUCTION_SHA}"
+# Independent of PINNED_PRODUCTION_SHA above: Phase 3.3A rebuilt only the
+# API image, never the Tor image, so the Tor image keeps its own,
+# separately-tracked SHA that must NOT move in lockstep with a future
+# production/API repin (see test_dark_launch_tor_image_pin_is_independent_
+# of_production_sha_pin below).
+PINNED_TOR_IMAGE_SHA = "5dffbd669eec52f5283503bb6409a430509175a0"
+PINNED_TOR_IMAGE = f"ghcr.io/mrezamaghouli/jobpulse-tor:{PINNED_TOR_IMAGE_SHA}"
 
 _DARK_LAUNCH_CRITICAL_FILES = (
     "scripts/tor/production_dark_launch.sh",
@@ -1309,6 +1317,17 @@ def test_dark_launch_expected_production_sha_is_exact():
 def test_dark_launch_expected_tor_image_is_exact():
     source = DARK_LAUNCH_WORKFLOW_PATH.read_text()
     assert f'EXPECTED_TOR_IMAGE: "{PINNED_TOR_IMAGE}"' in source
+
+
+def test_dark_launch_tor_image_pin_is_independent_of_production_sha_pin():
+    """Regression guard for Phase 3.3C: production/API and the Tor image
+    are rebuilt/deployed on independent schedules (the Phase 3.3A deploy
+    moved production/API without rebuilding the Tor image at all) -- the
+    Tor image pin must never be silently re-derived from the production
+    SHA pin again."""
+    assert PINNED_TOR_IMAGE_SHA != PINNED_PRODUCTION_SHA
+    assert PINNED_TOR_IMAGE == f"ghcr.io/mrezamaghouli/jobpulse-tor:{PINNED_TOR_IMAGE_SHA}"
+    assert PINNED_PRODUCTION_SHA not in PINNED_TOR_IMAGE
 
 
 def test_dark_launch_expected_production_sha_not_derived_from_github_sha():
