@@ -625,6 +625,7 @@ _ALLOWED_TOR_ENABLED_SETTERS = {
     "scripts/tor/production_dark_launch.sh",  # dark-launch invariant checks only, invoked only by the workflow_dispatch-only tor-dark-launch.yml, never dispatched by this task
     ".github/workflows/tor-secret-provision.yml",  # Phase 3.1: SSH-invokes the helper below, never sets/dispatches Tor itself
     ".github/scripts/tor/provision_production_secret.sh",  # Phase 3.1: read-only pre/post invariant check (must equal 'false'), invoked only by the workflow_dispatch-only tor-secret-provision.yml, never dispatched by this task
+    ".github/workflows/production-runtime-diagnostic.yml",  # Phase 3.4A: single read-only `docker exec ... printenv TOR_ENABLED` evidence check, invoked only by the workflow_dispatch-only production-runtime-diagnostic.yml, never dispatched by this task
 }
 
 
