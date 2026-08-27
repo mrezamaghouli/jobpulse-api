@@ -1,11 +1,15 @@
 """Static audit of .github/workflows/production-runtime-diagnostic.yml
-(Phase 3.1A -- read-only production frontend/container diagnosis).
+(Phase 3.4A -- read-only production runtime / Tor observability).
 
 This workflow only ever gathers evidence over SSH: `git status`/`rev-parse`,
-`docker compose ... config|ps`, `docker ps`, a small number of metadata-only
-`docker inspect` calls, and two plain `curl` health probes. It must never
-start/stop/restart/create/remove any container, never touch Tor, never read
-a secret, and never mutate git or the filesystem on the production VM.
+`docker compose ... config|ps`, `docker ps`, metadata-only `docker inspect`
+calls (now including jobpulse-tor-prod), `docker port` to confirm no Tor
+host ports are published, exactly one narrowly scoped `docker exec`
+(printenv TOR_ENABLED on the API container only), and two plain localhost
+`curl` health probes. It must never start/stop/restart/create/remove any
+container, never manage/connect to/send traffic through Tor (metadata-only
+inspection of jobpulse-tor-prod is the one intentional exception), never
+read a secret, and never mutate git or the filesystem on the production VM.
 
 No SSH, no real Docker, no network -- these are all static source/YAML
 checks against the version-controlled workflow file, following the same
@@ -23,7 +27,9 @@ TOR_IMAGE_BUILD_PATH = REPO_ROOT / ".github" / "workflows" / "tor-image-build.ym
 DEPLOY_PATH = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-EXPECTED_PRODUCTION_SHA = "5dffbd669eec52f5283503bb6409a430509175a0"
+EXPECTED_PRODUCTION_SHA = "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+EXPECTED_API_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+EXPECTED_TOR_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
 PHASE_3_1A_CHANGED_FILES = [
     ".github/workflows/production-runtime-diagnostic.yml",
@@ -202,15 +208,18 @@ def test_workflow_inspect_format_restricted_to_allowed_metadata_fields():
     assert match, "expected a single-quoted --format template for inspect_metadata"
     template = match.group(1)
 
-    allowed_gostruct_fields = ("{{.Name}}", "{{.Id}}", "{{.Image}}", "{{.State.Status}}",
-                                "{{.State.StartedAt}}", "{{.RestartCount}}",
+    allowed_gostruct_fields = ("{{.Name}}", "{{.Id}}", "{{.Image}}", "{{.Config.Image}}",
+                                "{{.State.Status}}", "{{.State.StartedAt}}", "{{.RestartCount}}",
                                 '{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}')
     for field in allowed_gostruct_fields:
         assert field in template, field
 
     # No env/mount/secret-shaped field made it into the template.
-    for forbidden_field in ("Env", "Mounts", "Binds", "Secrets"):
+    # (Config.Image is allowed -- it's the safe, human-readable image
+    # reference, not the container's environment.)
+    for forbidden_field in ("Mounts", "Binds", "Secrets"):
         assert forbidden_field not in template, forbidden_field
+    assert ".Config.Env" not in template
 
 
 def test_workflow_health_template_uses_safe_absent_key_lookup_not_unsafe_if():
@@ -238,10 +247,24 @@ def test_workflow_frontend_metadata_line_can_report_health_na():
     assert 'health={{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}' in source
 
 
-def test_workflow_inspects_exactly_the_three_expected_containers():
+EXPECTED_INSPECTED_CONTAINERS = (
+    "jobpulse-api-prod",
+    "jobpulse-postgres-prod",
+    "jobpulse-frontend-prod",
+    "jobpulse-tor-prod",
+)
+
+
+def test_workflow_inspects_exactly_the_four_expected_containers():
+    """Phase 3.4A: jobpulse-tor-prod joins the three Phase 3.1A containers.
+    Metadata-only Tor observation is now intentional -- see
+    test_workflow_never_reads_secrets_or_touches_tor for what remains
+    forbidden (ControlPort/SOCKS/NEWNYM/the control password/etc)."""
     source = WORKFLOW_PATH.read_text()
-    for name in ("jobpulse-api-prod", "jobpulse-postgres-prod", "jobpulse-frontend-prod"):
+    for name in EXPECTED_INSPECTED_CONTAINERS:
         assert f"inspect_metadata {name}" in source
+    calls = re.findall(r"inspect_metadata ([\w-]+)", source)
+    assert set(calls) == set(EXPECTED_INSPECTED_CONTAINERS)
 
 
 def test_workflow_existence_probe_uses_restricted_format_not_bare_inspect():
@@ -305,6 +328,8 @@ EXPECTED_REMOTE_COMMANDS = (
     "curl -fsS http://127.0.0.1:8000/health",
     "curl -sS -o /dev/null",
     "http://127.0.0.1/",
+    "docker exec jobpulse-api-prod printenv TOR_ENABLED",
+    "docker port jobpulse-tor-prod",
 )
 
 
@@ -385,6 +410,21 @@ def test_no_git_fetch_reset_checkout_or_pull_anywhere():
     code = _code_only(WORKFLOW_PATH.read_text())
     for forbidden in ("git fetch", "git reset", "git checkout", "git pull"):
         assert forbidden not in code, forbidden
+
+
+def test_remote_block_has_exactly_one_exit_the_cd_guard():
+    """Phase 3.4A adds API/Tor image comparisons, Tor runtime-state
+    reporting, the TOR_ENABLED exec check, and the published-port check --
+    none of them may abort the rest of the evidence gathering. The only
+    early-exit anywhere in the remote block remains the `cd /opt/jobpulse`
+    guard, unrelated to any comparison/probe result."""
+    source = WORKFLOW_PATH.read_text()
+    remote_match = re.search(r"<<'REMOTE'[^\n]*\n(.*?)\n\s*REMOTE\n", source, re.DOTALL)
+    assert remote_match
+    remote_code = _code_only(remote_match.group(1))
+    exit_lines = [l for l in remote_code.splitlines() if re.search(r"\bexit\b", l)]
+    assert len(exit_lines) == 1, exit_lines
+    assert "/opt/jobpulse" in exit_lines[0]
 
 
 # =====================================================================
@@ -497,6 +537,157 @@ def test_ci_yml_real_tor_gate_unchanged():
     the real-Tor network job."""
     source = CI_PATH.read_text()
     assert "github.event_name == 'workflow_dispatch' && inputs.run_real_tor == true" in source
+
+
+# =====================================================================
+# Phase 3.4A: expected API/Tor image pins (evidence-only comparison
+# constants, independently asserted -- they intentionally differ)
+# =====================================================================
+def test_expected_api_image_literal_is_exact():
+    source = WORKFLOW_PATH.read_text()
+    assert f'EXPECTED_API_IMAGE="{EXPECTED_API_IMAGE}"' in source
+
+
+def test_expected_tor_image_literal_is_exact():
+    source = WORKFLOW_PATH.read_text()
+    assert f'EXPECTED_TOR_IMAGE="{EXPECTED_TOR_IMAGE}"' in source
+
+
+def test_api_and_tor_image_pins_are_independently_asserted_and_differ():
+    """Mirrors tor-dark-launch.yml's discipline: the API image pin and the
+    Tor image pin are two separate constants that intentionally carry
+    different commit SHAs (the Tor image lags production/API on its own
+    rebuild schedule) -- never derived from one another or from
+    github.sha."""
+    assert EXPECTED_API_IMAGE != EXPECTED_TOR_IMAGE
+    source = WORKFLOW_PATH.read_text()
+    code = _code_only(source)
+    assert "github.sha" not in code
+    assert 'EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:' in source
+    assert 'EXPECTED_TOR_IMAGE="ghcr.io/mrezamaghouli/jobpulse-tor:' in source
+
+
+def test_api_image_comparison_is_evidence_only():
+    source = WORKFLOW_PATH.read_text()
+    assert 'echo "api_image_expected=$EXPECTED_API_IMAGE"' in source
+    assert 'echo "api_image_actual=$API_IMAGE_ACTUAL"' in source
+    assert 'echo "api_image_match=yes"' in source
+    assert 'echo "api_image_match=no"' in source
+
+
+def test_tor_image_comparison_is_evidence_only():
+    source = WORKFLOW_PATH.read_text()
+    assert 'echo "tor_image_expected=$EXPECTED_TOR_IMAGE"' in source
+    assert 'echo "tor_image_actual=$TOR_IMAGE_ACTUAL"' in source
+    assert 'echo "tor_image_match=yes"' in source
+    assert 'echo "tor_image_match=no"' in source
+
+
+def test_image_mismatches_do_not_pull_restart_recreate_or_deploy():
+    """A mismatch against EXPECTED_API_IMAGE/EXPECTED_TOR_IMAGE must never
+    trigger `docker pull`/`docker restart`/`docker compose up` -- reported
+    only. Already covered generally by
+    test_workflow_contains_no_mutation_commands, but pinned here
+    specifically to the image-comparison sections so a future edit to
+    those sections alone still gets caught."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for section_header in ("== API image identity", "== Tor image identity"):
+        idx = code.find(section_header)
+        assert idx != -1, section_header
+        # Look at the ~600 chars following the section header -- enough to
+        # cover the whole comparison block without bleeding into the next.
+        window = code[idx: idx + 600]
+        for forbidden in FORBIDDEN_MUTATION_COMMANDS:
+            assert forbidden not in window, (section_header, forbidden)
+
+
+# =====================================================================
+# Phase 3.4A: Tor runtime state (metadata only)
+# =====================================================================
+def test_tor_runtime_state_fields_reported():
+    source = WORKFLOW_PATH.read_text()
+    for field in (
+        "tor_container_present=yes",
+        "tor_container_present=no",
+        "tor_status=",
+        "tor_health=",
+        "tor_restart_count=",
+        "tor_started_at=",
+    ):
+        assert field in source, field
+
+
+def test_tor_runtime_state_uses_no_docker_logs():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "docker logs" not in code
+
+
+# =====================================================================
+# Phase 3.4A: exactly one docker exec, narrowly scoped to TOR_ENABLED
+# =====================================================================
+def test_docker_exec_appears_exactly_once():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert code.count("docker exec") == 1
+
+
+def test_docker_exec_is_the_exact_authorized_tor_enabled_command():
+    source = WORKFLOW_PATH.read_text()
+    assert "docker exec jobpulse-api-prod printenv TOR_ENABLED" in source
+
+
+def test_docker_exec_never_targets_the_tor_container():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for line in code.splitlines():
+        if "docker exec" not in line:
+            continue
+        assert "jobpulse-tor-prod" not in line, line
+
+
+def test_no_broad_environment_dump():
+    """No bare `env` or `printenv` (with no variable name) call -- the one
+    authorized docker exec must always name TOR_ENABLED explicitly."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert re.search(r"docker exec\s+\S+\s+env\b", code) is None
+    assert re.search(r"printenv\s*(\n|$|['\"])", code) is None
+
+
+def test_api_tor_enabled_comparison_is_evidence_only():
+    source = WORKFLOW_PATH.read_text()
+    assert 'echo "api_tor_enabled_expected=false"' in source
+    assert 'echo "api_tor_enabled_actual=$API_TOR_ENABLED_ACTUAL"' in source
+    assert 'echo "api_tor_enabled_match=yes"' in source
+    assert 'echo "api_tor_enabled_match=no"' in source
+
+
+# =====================================================================
+# Phase 3.4A: Tor host port exposure (read-only)
+# =====================================================================
+def test_docker_port_command_present_and_read_only():
+    source = WORKFLOW_PATH.read_text()
+    assert "docker port jobpulse-tor-prod" in source
+    assert 'echo "tor_published_ports=NONE"' in source
+
+
+# =====================================================================
+# Phase 3.4A: no external network target of any kind
+# =====================================================================
+def test_no_external_http_url_introduced():
+    """Phase 3.4A runtime observability is network-neutral: only the
+    existing localhost API/frontend probes may appear. No
+    check.torproject.org, no LinkedIn, no collector/target endpoint."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("check.torproject.org", "linkedin.com", "://api.linkedin"):
+        assert forbidden.lower() not in code.lower(), forbidden
+
+    urls = re.findall(r"https?://[^\s'\"]+", code)
+    for url in urls:
+        assert url.startswith("http://127.0.0.1"), url
+
+
+def test_existing_localhost_probes_still_present():
+    source = WORKFLOW_PATH.read_text()
+    assert "http://127.0.0.1:8000/health" in source
+    assert "http://127.0.0.1/" in source
 
 
 # =====================================================================

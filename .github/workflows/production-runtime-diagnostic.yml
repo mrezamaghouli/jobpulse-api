@@ -1,24 +1,33 @@
 name: Production Runtime Diagnostic
 
 # ============================================================================
-# PHASE 3.1A -- READ-ONLY PRODUCTION FRONTEND / CONTAINER DIAGNOSIS.
+# PHASE 3.4A -- READ-ONLY PRODUCTION RUNTIME / TOR OBSERVABILITY.
 #
 # This workflow gathers evidence about the state of production containers
-# (in particular jobpulse-frontend-prod) so a human can classify what is
-# actually running there. It NEVER starts/stops/restarts/creates/removes
-# any container, NEVER runs `docker compose up/down`, NEVER touches Tor,
-# NEVER reads any secret file, and NEVER mutates the git working tree or
-# filesystem on the production VM. workflow_dispatch ONLY -- no push,
+# (API, Postgres, frontend, and -- as of Phase 3.4A -- the Tor sidecar,
+# jobpulse-tor-prod) so a human can classify what is actually running
+# there. It NEVER starts/stops/restarts/creates/removes any container,
+# NEVER runs `docker compose up/down`, NEVER mutates the git working tree
+# or filesystem on the production VM, and never manages, connects to, or
+# sends traffic through Tor; metadata-only inspection is permitted. It
+# does not connect to the Tor ControlPort, does not use SOCKS, does not
+# run NEWNYM or any circuit operation, and does not read the Tor control
+# password (neither /opt/jobpulse/.tor_control_password nor
+# /run/secrets/tor_control_password). workflow_dispatch ONLY -- no push,
 # pull_request, workflow_run, or schedule trigger exists here, so this can
 # never run as a side effect of ordinary CI or of docker-build.yml /
-# tor-image-build.yml / deploy.yml.
+# tor-image-build.yml / deploy.yml / tor-dark-launch.yml.
 #
 # Only secrets.VM_SSH_KEY is used here, purely to establish SSH transport.
-# Every remote command is read-only: `git status`/`git rev-parse`,
-# `docker compose ... config|ps`, `docker ps`, `docker inspect` restricted
-# to a small metadata format string (name/id/image id/status/StartedAt/
-# RestartCount/health -- never .Config.Env or any secret/mount content),
-# and two plain `curl` health probes.
+# No GHCR token, no Tor password secret. Every remote command is
+# read-only: `git status`/`git rev-parse`, `docker compose ... config|ps`,
+# `docker ps`, `docker inspect` restricted to a small metadata format
+# string (name/id/image id/status/StartedAt/RestartCount/health -- never
+# .Config.Env or any secret/mount content), `docker port` to confirm no
+# Tor host ports are published, exactly one narrowly scoped `docker exec`
+# (printenv TOR_ENABLED on jobpulse-api-prod only, never a broader
+# environment dump), and two plain localhost `curl` health probes -- no
+# external network target of any kind, including check.torproject.org.
 # ============================================================================
 on:
   workflow_dispatch:
@@ -77,11 +86,22 @@ jobs:
           cd /opt/jobpulse || { echo "DIAG_ERROR: cannot cd to /opt/jobpulse"; exit 1; }
 
           COMPOSE_FILE="docker-compose.prod.yml"
-          # Not a secret -- the currently expected deployed Phase 3 SHA,
+          # Not a secret -- the currently expected deployed Phase 3.3A SHA,
           # for evidence-only comparison against the VM's actual checkout.
           # Never used to fetch/reset/checkout/pull; a mismatch is reported,
           # not corrected.
-          EXPECTED_PRODUCTION_SHA="5dffbd669eec52f5283503bb6409a430509175a0"
+          EXPECTED_PRODUCTION_SHA="0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+
+          # Non-secret, fixed, evidence-only comparison constants -- never
+          # derived from github.sha, never workflow_dispatch inputs (same
+          # typo-safety discipline as tor-dark-launch.yml). The API and Tor
+          # images intentionally use DIFFERENT SHAs: the Tor image is only
+          # rebuilt on its own separate schedule and currently lags behind
+          # whichever commit production/API is pinned to. A mismatch against
+          # either is reported only -- it never triggers a pull, restart,
+          # recreate, or deploy.
+          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          EXPECTED_TOR_IMAGE="ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
           echo "===DIAGNOSTIC_START==="
 
@@ -136,9 +156,12 @@ jobs:
             --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'
 
           echo "== metadata-only container inspection =="
-          # Deliberately restricted format string: name/id/image id/status/
-          # StartedAt/RestartCount/health only. Never .Config.Env, never any
-          # environment variable, never mount/secret contents.
+          # Deliberately restricted format string: name/id/image id/config
+          # image reference/status/StartedAt/RestartCount/health only.
+          # Config.Image is the human-readable "repo:tag" reference (safe,
+          # non-secret image identity metadata) -- distinct from .Image,
+          # which is the underlying image ID hash. Never .Config.Env, never
+          # any environment variable, never mount/secret contents.
           # `{{with (index .State "Health")}}` looks up "Health" as a map
           # key and only enters the block if present -- unlike
           # `{{if .State.Health}}`, which errors ("map has no entry for
@@ -150,7 +173,7 @@ jobs:
             local name="$1"
             if docker inspect "$name" --format '{{.Id}}' >/dev/null 2>&1; then
               docker inspect "$name" --format \
-                'name={{.Name}} id={{.Id}} image_id={{.Image}} status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} health={{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}'
+                'name={{.Name}} id={{.Id}} image_id={{.Image}} image={{.Config.Image}} status={{.State.Status}} started_at={{.State.StartedAt}} restart_count={{.RestartCount}} health={{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}'
             else
               echo "name=$name status=NOT_FOUND"
             fi
@@ -158,6 +181,70 @@ jobs:
           inspect_metadata jobpulse-api-prod
           inspect_metadata jobpulse-postgres-prod
           inspect_metadata jobpulse-frontend-prod
+          inspect_metadata jobpulse-tor-prod
+
+          echo "== API image identity (evidence only) =="
+          # Metadata-only: --format restricted to .Config.Image, the safe
+          # human-readable image reference. Never pulls/restarts/recreates
+          # on a mismatch -- reported only.
+          API_IMAGE_ACTUAL="$(docker inspect jobpulse-api-prod --format '{{.Config.Image}}' 2>/dev/null || true)"
+          [ -n "$API_IMAGE_ACTUAL" ] || API_IMAGE_ACTUAL="NOT_FOUND"
+          echo "api_image_expected=$EXPECTED_API_IMAGE"
+          echo "api_image_actual=$API_IMAGE_ACTUAL"
+          if [ "$API_IMAGE_ACTUAL" = "$EXPECTED_API_IMAGE" ]; then
+            echo "api_image_match=yes"
+          else
+            echo "api_image_match=no"
+          fi
+
+          echo "== Tor image identity (evidence only) =="
+          TOR_IMAGE_ACTUAL="$(docker inspect jobpulse-tor-prod --format '{{.Config.Image}}' 2>/dev/null || true)"
+          [ -n "$TOR_IMAGE_ACTUAL" ] || TOR_IMAGE_ACTUAL="NOT_FOUND"
+          echo "tor_image_expected=$EXPECTED_TOR_IMAGE"
+          echo "tor_image_actual=$TOR_IMAGE_ACTUAL"
+          if [ "$TOR_IMAGE_ACTUAL" = "$EXPECTED_TOR_IMAGE" ]; then
+            echo "tor_image_match=yes"
+          else
+            echo "tor_image_match=no"
+          fi
+
+          echo "== Tor runtime state (metadata only, no logs) =="
+          if docker inspect jobpulse-tor-prod --format '{{.Id}}' >/dev/null 2>&1; then
+            echo "tor_container_present=yes"
+            echo "tor_status=$(docker inspect jobpulse-tor-prod --format '{{.State.Status}}' 2>/dev/null || echo unknown)"
+            echo "tor_health=$(docker inspect jobpulse-tor-prod --format '{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}' 2>/dev/null || echo unknown)"
+            echo "tor_restart_count=$(docker inspect jobpulse-tor-prod --format '{{.RestartCount}}' 2>/dev/null || echo unknown)"
+            echo "tor_started_at=$(docker inspect jobpulse-tor-prod --format '{{.State.StartedAt}}' 2>/dev/null || echo unknown)"
+          else
+            echo "tor_container_present=no"
+            echo "tor_status=NOT_FOUND"
+            echo "tor_health=n/a"
+            echo "tor_restart_count=n/a"
+            echo "tor_started_at=n/a"
+          fi
+
+          echo "== Tor host port exposure (evidence only) =="
+          # Read-only: confirms whether jobpulse-tor-prod publishes any
+          # host port bindings. Never changes networking or exposes ports.
+          TOR_PUBLISHED_PORTS="$(docker port jobpulse-tor-prod 2>/dev/null || true)"
+          if [ -z "$TOR_PUBLISHED_PORTS" ]; then
+            echo "tor_published_ports=NONE"
+          else
+            echo "tor_published_ports=$TOR_PUBLISHED_PORTS"
+          fi
+
+          echo "== live API TOR_ENABLED (single narrowly-scoped remote command) =="
+          # The ONLY docker exec in this workflow. Never a broader `env`/
+          # `printenv` dump -- exactly this one variable, on the API
+          # container only, never on jobpulse-tor-prod.
+          API_TOR_ENABLED_ACTUAL="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNKNOWN)"
+          echo "api_tor_enabled_expected=false"
+          echo "api_tor_enabled_actual=$API_TOR_ENABLED_ACTUAL"
+          if [ "$API_TOR_ENABLED_ACTUAL" = "false" ]; then
+            echo "api_tor_enabled_match=yes"
+          else
+            echo "api_tor_enabled_match=no"
+          fi
 
           echo "== read-only health checks =="
           API_RC=0
