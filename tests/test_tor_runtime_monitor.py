@@ -319,7 +319,11 @@ def _extract_remote_heredoc(source: str) -> str:
 
 
 def _extract_step_block(source: str, step_name: str, next_marker: str) -> str:
-    pattern = rf"- name: {re.escape(step_name)}.*?\n(\s+run: \|\n)(.*?)\n\n\s*{re.escape(next_marker)}"
+    # `.*?` (DOTALL, non-greedy) rather than requiring an immediate blank
+    # line before next_marker -- a step's run block may be followed by an
+    # explanatory comment block (itself valid bash, since every line
+    # starts with `#`) before the next step's `- name:` line.
+    pattern = rf"- name: {re.escape(step_name)}.*?\n(\s+run: \|\n)(.*?)\n\s*{re.escape(next_marker)}"
     m = re.search(pattern, source, re.DOTALL)
     assert m, f"expected to find step {step_name!r}"
     block = m.group(2)
@@ -363,8 +367,10 @@ def test_evidence_step_passes_bash_syntax_check(tmp_path):
 
 def test_classify_step_passes_bash_syntax_check(tmp_path):
     source = WORKFLOW_PATH.read_text()
-    script = _extract_last_step_block(
-        source, "Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)"
+    script = _extract_step_block(
+        source,
+        "Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)",
+        "- name: Report execution status",
     )
     # Substitute the GitHub Actions expression for a literal path so bash
     # -n can parse the file exactly as it will be interpolated at runtime.
@@ -372,6 +378,15 @@ def test_classify_step_passes_bash_syntax_check(tmp_path):
         '${{ steps.evidence.outputs.output_file }}', '/tmp/placeholder'
     )
     script_path = tmp_path / "classify.sh"
+    script_path.write_text(script)
+    result = subprocess.run(["bash", "-n", str(script_path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_final_step_passes_bash_syntax_check(tmp_path):
+    source = WORKFLOW_PATH.read_text()
+    script = _extract_final_step_script(source)
+    script_path = tmp_path / "final_step.sh"
     script_path.write_text(script)
     result = subprocess.run(["bash", "-n", str(script_path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -723,3 +738,446 @@ def test_classify_function_body_contains_no_io_or_network_calls():
     code = _code_only(func_src)
     for forbidden in ("ssh ", "docker ", "curl ", "git ", " > ", " >> "):
         assert forbidden not in code, forbidden
+
+
+# =====================================================================
+# Phase 3.4H -- unattended-run hardening: bounded execution time,
+# operator-visible WARNING/CRITICAL annotations, job summary. Trigger
+# remains workflow_dispatch-only; no schedule is added in this phase.
+# =====================================================================
+def test_workflow_still_workflow_dispatch_only_after_hardening():
+    data = _load_workflow(WORKFLOW_PATH)
+    assert _on_block(data) == {"workflow_dispatch": None}
+
+
+def test_still_no_schedule_or_cron():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("schedule:", "cron:"):
+        assert forbidden not in code, forbidden
+
+
+def test_monitor_job_has_five_minute_timeout():
+    data = _load_workflow(WORKFLOW_PATH)
+    assert data["jobs"]["monitor"]["timeout-minutes"] == 5
+
+
+def test_ssh_keyscan_has_finite_timeout():
+    source = WORKFLOW_PATH.read_text()
+    assert "ssh-keyscan -T 10" in source
+
+
+def test_ssh_connection_has_batch_mode():
+    source = WORKFLOW_PATH.read_text()
+    assert "-o BatchMode=yes" in source
+
+
+def test_ssh_connection_has_connect_timeout():
+    source = WORKFLOW_PATH.read_text()
+    assert "-o ConnectTimeout=10" in source
+
+
+def test_ssh_connection_has_single_connection_attempt():
+    source = WORKFLOW_PATH.read_text()
+    assert "-o ConnectionAttempts=1" in source
+
+
+def test_no_strict_host_key_checking_disabled():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "StrictHostKeyChecking=no" not in code
+    assert "StrictHostKeyChecking no" not in code
+
+
+def test_no_retry_loop_introduced():
+    """No looping construct wraps the ssh/ssh-keyscan calls -- a single
+    bounded attempt only, never a retry-until-success loop."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("while ", "until ", "for i in", "retry"):
+        assert forbidden not in code.lower(), forbidden
+
+
+def test_no_sleep_introduced():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "sleep " not in code
+    assert "sleep\n" not in code
+
+
+def test_no_notification_integration_introduced_by_hardening():
+    """Phase 3.4H adds only GitHub Actions workflow-command annotations
+    (::warning::/::error::) and $GITHUB_STEP_SUMMARY -- no Slack/email/
+    Telegram/Discord/webhook/issue-creation/PagerDuty/SMS integration and
+    no new secret."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("SLACK", "WEBHOOK", "TELEGRAM", "DISCORD", "PAGERDUTY",
+                       "issues.create", "gh issue create", "smtp", "sendmail",
+                       "createComment", "twilio"):
+        assert forbidden.lower() not in code.lower(), forbidden
+    secrets = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", WORKFLOW_PATH.read_text()))
+    assert secrets == {"VM_SSH_KEY"}
+
+
+def test_github_step_summary_is_used():
+    source = WORKFLOW_PATH.read_text()
+    assert "$GITHUB_STEP_SUMMARY" in source
+
+
+def test_warning_and_error_annotation_syntax_present():
+    source = WORKFLOW_PATH.read_text()
+    assert "::warning::" in source
+    assert "::error::" in source
+
+
+def test_summary_written_before_final_exit_propagation():
+    """Structural ordering guard: the $GITHUB_STEP_SUMMARY write must
+    appear before the final `exit "$MONITOR_EXIT"` in the classify step's
+    source, so a CRITICAL run (exit 2) still produces its summary and
+    annotation first -- `set -e` must never short-circuit past it."""
+    source = WORKFLOW_PATH.read_text()
+    summary_idx = source.index('>> "$GITHUB_STEP_SUMMARY"')
+    exit_idx = source.rindex('exit "$MONITOR_EXIT"')
+    assert summary_idx < exit_idx
+
+
+def test_classify_evidence_output_still_piped_not_swallowed():
+    """The annotation/summary logic must observe classify_evidence's real
+    exit code via PIPESTATUS after piping through `tee`, not silently
+    replace it with tee's own (always-zero) exit code."""
+    source = WORKFLOW_PATH.read_text()
+    assert "classify_evidence | tee" in source
+    assert 'MONITOR_EXIT="${PIPESTATUS[0]}"' in source
+
+
+# =====================================================================
+# Phase 3.4H -- behavioral: execute the ENTIRE classify step (not just
+# classify_evidence()) with fabricated evidence, a fake OUTPUT_FILE, and
+# a fake $GITHUB_STEP_SUMMARY. No Docker, no SSH, no Tor, no network --
+# GITHUB_STEP_SUMMARY is just a local temp file the same way the real
+# runner provides one.
+# =====================================================================
+EVIDENCE_LINES_OK = """production_sha_expected=0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+production_sha_actual=0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+production_sha_match=yes
+api_image_expected=ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+api_image_actual=ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+api_image_match=yes
+tor_container_present=yes
+tor_image_expected=ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0
+tor_image_actual=ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0
+tor_image_match=yes
+tor_status=running
+tor_health=healthy
+tor_restart_count=0
+tor_started_at=2026-08-27T08:58:13.353242516Z
+tor_published_ports=NONE
+api_tor_enabled_expected=false
+api_tor_enabled_actual=false
+api_tor_enabled_match=yes
+api_health_rc=0
+api_health_body={"status":"ok","database":"connected"}
+frontend_http_status=200
+frontend_curl_rc=0
+"""
+
+
+def _extract_classify_step_script(source: str) -> str:
+    idx = source.index("- name: Classify evidence")
+    tail = source[idx:]
+    m = re.search(r"run: \|\n(.*)", tail, re.DOTALL)
+    assert m
+    block = m.group(1)
+    lines = block.splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip(" "))
+    script = "\n".join(l[indent:] if l.startswith(" " * indent) else l for l in lines)
+    # The real GitHub expression is interpolated by the Actions runner
+    # before bash ever sees this file; substitute it for a shell
+    # variable reference so the extracted script reads its evidence file
+    # from an env var we control, exactly mirroring how
+    # test_local_step_passes_bash_syntax_check-style extraction already
+    # handles this workflow's other `${{ ... }}` usage.
+    script = script.replace(
+        '${{ steps.evidence.outputs.output_file }}', '"$OUTPUT_FILE_OVERRIDE"'
+    )
+    return script
+
+
+def _run_classify_step(tmp_path, evidence_text=EVIDENCE_LINES_OK):
+    """Execute the full classify step (evidence-parsing + classify_evidence
+    + annotation + summary + final exit) against fabricated evidence, with
+    GITHUB_STEP_SUMMARY pointed at a local temp file. Returns
+    (stdout, exit_code, summary_text)."""
+    script = _extract_classify_step_script(WORKFLOW_PATH.read_text())
+    script_path = tmp_path / "classify_step.sh"
+    script_path.write_text(script)
+
+    evidence_path = tmp_path / "evidence.txt"
+    evidence_path.write_text(evidence_text)
+
+    summary_path = tmp_path / "summary.md"
+    summary_path.write_text("")
+
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "OUTPUT_FILE_OVERRIDE": str(evidence_path),
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+    }
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True, text=True, env=env,
+    )
+    return result.stdout, result.returncode, summary_path.read_text()
+
+
+# 12. WARNING still exits 0 / 11. WARNING emits ::warning::
+def test_full_step_warning_emits_annotation_and_exits_zero(tmp_path):
+    evidence = EVIDENCE_LINES_OK.replace("tor_restart_count=0", "tor_restart_count=1")
+    stdout, rc, summary = _run_classify_step(tmp_path, evidence)
+    assert "::warning::" in stdout
+    assert "::error::" not in stdout
+    assert "monitor_status=WARNING" in stdout
+    assert rc == 0
+
+
+# 13. CRITICAL emits ::error:: / 14. CRITICAL still exits 2
+def test_full_step_critical_emits_annotation_and_exits_two(tmp_path):
+    evidence = EVIDENCE_LINES_OK.replace("tor_status=running", "tor_status=exited")
+    stdout, rc, summary = _run_classify_step(tmp_path, evidence)
+    assert "::error::" in stdout
+    assert "monitor_status=CRITICAL" in stdout
+    assert rc == 2
+
+
+# 15. OK emits no warning/error annotation
+def test_full_step_ok_emits_no_annotation(tmp_path):
+    stdout, rc, summary = _run_classify_step(tmp_path, EVIDENCE_LINES_OK)
+    assert "::warning::" not in stdout
+    assert "::error::" not in stdout
+    assert "monitor_status=OK" in stdout
+    assert rc == 0
+
+
+# 17-21: summary content fields
+def test_full_step_summary_contains_required_fields(tmp_path):
+    stdout, rc, summary = _run_classify_step(tmp_path, EVIDENCE_LINES_OK)
+    for expected in (
+        "Verdict: OK",
+        "warning_count | 0",
+        "critical_count | 0",
+        "tor_status | running",
+        "tor_health | healthy",
+        "api_health_ok | yes",
+        "database_connected | yes",
+        "api_tor_enabled_match | yes",
+    ):
+        assert expected in summary, expected
+
+
+def test_full_step_critical_summary_still_generated(tmp_path):
+    """Even a CRITICAL run (non-zero exit) must have produced its summary
+    -- proves the ordering guard behaviorally, not just structurally."""
+    evidence = EVIDENCE_LINES_OK.replace("tor_status=running", "tor_status=exited")
+    stdout, rc, summary = _run_classify_step(tmp_path, evidence)
+    assert rc == 2
+    assert "Verdict: CRITICAL" in summary
+    assert "critical_count | 1" in summary
+
+
+# 22. summary contains no secret values
+def test_full_step_summary_contains_no_secret_material(tmp_path):
+    stdout, rc, summary = _run_classify_step(tmp_path, EVIDENCE_LINES_OK)
+    for forbidden in ("VM_SSH_KEY", "BEGIN OPENSSH", "BEGIN RSA", "PRIVATE KEY",
+                       "tor_control_password", "GHCR_TOKEN"):
+        assert forbidden not in summary, forbidden
+
+
+# 25. classification behavior tests from Phase 3.4D still all pass
+# unchanged -- covered by the unmodified test_scenario_* tests above,
+# which still execute the real classify_evidence() function extracted
+# from this same (now-hardened) workflow file.
+
+
+# =====================================================================
+# Phase 3.4H (final hardening pass) -- every run must leave a GitHub
+# Actions summary, including one that fails before classification is
+# ever reached (missing secret, ssh-keyscan failure, SSH connection
+# failure, unreachable /opt/jobpulse, MONITOR_EVIDENCE_INCOMPLETE).
+# =====================================================================
+def test_stable_step_ids_present():
+    data = _load_workflow(WORKFLOW_PATH)
+    steps = data["jobs"]["monitor"]["steps"]
+    ids_by_name = {s["name"]: s.get("id") for s in steps}
+    assert ids_by_name["Validate secrets"] == "validate"
+    assert ids_by_name["Gather production runtime evidence (read-only)"] == "evidence"
+    assert ids_by_name["Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)"] == "classify"
+
+
+def test_final_reporting_step_exists_and_always_runs():
+    data = _load_workflow(WORKFLOW_PATH)
+    steps = data["jobs"]["monitor"]["steps"]
+    final = steps[-1]
+    assert "Report execution status" in final["name"]
+    assert final.get("if") == "always()"
+
+
+def test_final_step_references_only_safe_step_outcomes():
+    source = WORKFLOW_PATH.read_text()
+    for expr in (
+        "${{ steps.validate.outcome }}",
+        "${{ steps.evidence.outcome }}",
+        "${{ steps.classify.outcome }}",
+    ):
+        assert expr in source, expr
+
+
+def test_final_step_uses_github_step_summary():
+    final_step = _extract_last_step_block(
+        WORKFLOW_PATH.read_text(), "Report execution status (always runs -- no SSH, no Docker, no Tor, no network)"
+    )
+    assert "$GITHUB_STEP_SUMMARY" in final_step
+
+
+def test_no_continue_on_error_anywhere():
+    """validate/evidence/classify must never be able to mask their own
+    failure -- a real failure in any of them must still fail the overall
+    job. The final always() step's own success must never paper over
+    that. Checked via _code_only since the explanatory comments above
+    legitimately discuss why continue-on-error is absent."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "continue-on-error" not in code
+
+
+def test_final_step_contains_no_ssh_docker_curl_or_secret_reads():
+    final_step = _code_only(_extract_last_step_block(
+        WORKFLOW_PATH.read_text(), "Report execution status (always runs -- no SSH, no Docker, no Tor, no network)"
+    ))
+    for forbidden in ("ssh ", "ssh-keyscan", "docker ", "curl ", "secrets.", "VM_SSH_KEY"):
+        assert forbidden not in final_step, forbidden
+
+
+# =====================================================================
+# Exact-count SSH regression guards (protects against an old unbounded
+# ssh/ssh-keyscan call being retained alongside the hardened one).
+# =====================================================================
+def test_exactly_one_ssh_keyscan_invocation():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert code.count("ssh-keyscan") == 1
+
+
+def test_exactly_one_remote_ssh_invocation():
+    """Counts lines that invoke the `ssh` binary itself (not
+    ssh-keyscan, not the key-material path jobpulse_monitor_key, not the
+    private-key file name)."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    ssh_invocations = [
+        line for line in code.splitlines()
+        if re.match(r"\s*ssh\s", line) and "ssh-keyscan" not in line
+    ]
+    assert len(ssh_invocations) == 1, ssh_invocations
+    assert "-o BatchMode=yes" in ssh_invocations[0]
+    assert "-o ConnectTimeout=10" in ssh_invocations[0]
+    assert "-o ConnectionAttempts=1" in ssh_invocations[0]
+
+
+def test_single_ssh_keyscan_has_finite_timeout():
+    source = WORKFLOW_PATH.read_text()
+    keyscan_lines = [l for l in _code_only(source).splitlines() if "ssh-keyscan" in l]
+    assert len(keyscan_lines) == 1
+    assert "-T 10" in keyscan_lines[0]
+
+
+# =====================================================================
+# Behavioral: execute the final always() step directly with fabricated
+# step outcomes. No SSH, no Docker, no Tor, no network -- it never makes
+# any of those calls, verified statically above and structurally here.
+# =====================================================================
+def _extract_final_step_script(source: str) -> str:
+    idx = source.index("- name: Report execution status")
+    tail = source[idx:]
+    m = re.search(r"run: \|\n(.*)", tail, re.DOTALL)
+    assert m
+    block = m.group(1)
+    lines = block.splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip(" "))
+    script = "\n".join(l[indent:] if l.startswith(" " * indent) else l for l in lines)
+    script = script.replace('${{ steps.validate.outcome }}', '"$VALIDATE_OUTCOME_OVERRIDE"')
+    script = script.replace('${{ steps.evidence.outcome }}', '"$EVIDENCE_OUTCOME_OVERRIDE"')
+    script = script.replace('${{ steps.classify.outcome }}', '"$CLASSIFY_OUTCOME_OVERRIDE"')
+    return script
+
+
+def _run_final_step(tmp_path, validate="success", evidence="success", classify="success"):
+    script = _extract_final_step_script(WORKFLOW_PATH.read_text())
+    script_path = tmp_path / "final_step.sh"
+    script_path.write_text(script)
+
+    summary_path = tmp_path / "summary.md"
+
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "VALIDATE_OUTCOME_OVERRIDE": validate,
+        "EVIDENCE_OUTCOME_OVERRIDE": evidence,
+        "CLASSIFY_OUTCOME_OVERRIDE": classify,
+        "GITHUB_STEP_SUMMARY": str(summary_path),
+    }
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        capture_output=True, text=True, env=env,
+    )
+    summary = summary_path.read_text() if summary_path.exists() else ""
+    return result.stdout, result.returncode, summary
+
+
+def test_final_step_pre_classification_failure_emits_error_and_fallback_summary(tmp_path):
+    """Missing-secret scenario: validate failed, evidence and classify
+    both skipped."""
+    stdout, rc, summary = _run_final_step(tmp_path, validate="failure", evidence="skipped", classify="skipped")
+    assert "::error::" in stdout
+    assert "could not complete runtime evidence gathering" in stdout
+    assert rc == 0  # this step's own exit never masks the already-failed prior steps
+    assert "Execution status: INCOMPLETE / FAILED" in summary
+    assert "| Validate secrets | failure |" in summary
+    assert "| Gather production runtime evidence | skipped |" in summary
+    assert "| Classify evidence | skipped |" in summary
+
+
+def test_final_step_evidence_transport_failure_emits_error_and_fallback_summary(tmp_path):
+    """SSH/evidence-gathering failure scenario: validate succeeded,
+    evidence failed, classify skipped."""
+    stdout, rc, summary = _run_final_step(tmp_path, validate="success", evidence="failure", classify="skipped")
+    assert "::error::" in stdout
+    assert "Execution status: INCOMPLETE / FAILED" in summary
+    assert "| Gather production runtime evidence | failure |" in summary
+
+
+def test_final_step_pre_classification_failure_not_labeled_critical(tmp_path):
+    stdout, rc, summary = _run_final_step(tmp_path, validate="failure", evidence="skipped", classify="skipped")
+    assert "monitor_status=CRITICAL" not in stdout
+    assert "monitor_status=CRITICAL" not in summary
+    assert "Verdict: CRITICAL" not in summary  # fallback path never claims the deterministic CRITICAL verdict
+
+
+def test_final_step_noop_when_classification_was_reached_success(tmp_path):
+    stdout, rc, summary = _run_final_step(tmp_path, validate="success", evidence="success", classify="success")
+    assert "::error::" not in stdout
+    assert summary == ""
+    assert rc == 0
+
+
+def test_final_step_noop_when_classification_was_reached_critical(tmp_path):
+    """When classify itself failed (outcome=failure, i.e. the CRITICAL
+    exit-2 path), the final step must NOT write a second summary or
+    duplicate/reinterpret the annotation -- the Classify evidence step
+    already did both."""
+    stdout, rc, summary = _run_final_step(tmp_path, validate="success", evidence="success", classify="failure")
+    assert "::error::" not in stdout
+    assert summary == ""
+    assert rc == 0
+
+
+# Full end-to-end proof that the Classify evidence step's own CRITICAL
+# handling is untouched by this phase: emits its own ::error::, writes
+# its own detailed summary, and exits 2 -- exactly as before.
+def test_classify_step_critical_path_still_self_contained(tmp_path):
+    evidence = EVIDENCE_LINES_OK.replace("tor_status=running", "tor_status=exited")
+    stdout, rc, summary = _run_classify_step(tmp_path, evidence)
+    assert "::error::" in stdout
+    assert rc == 2
+    assert "Verdict: CRITICAL" in summary

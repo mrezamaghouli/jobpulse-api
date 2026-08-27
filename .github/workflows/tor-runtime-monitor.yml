@@ -41,6 +41,19 @@ name: Tor Runtime Monitor
 # would surface as a failed GitHub Actions run; nothing here restarts
 # Tor, changes TOR_ENABLED, rotates circuits, or otherwise acts on what
 # it finds.
+#
+# Phase 3.4H unattended-run hardening (still workflow_dispatch only -- no
+# schedule/cron added here; that is a separate, future, explicit
+# decision): a job-level timeout-minutes bounds a stuck runner/SSH path
+# instead of hanging indefinitely; ssh-keyscan and the ssh connection
+# itself carry finite timeouts (no retries, no sleeps, no weakened auth --
+# BatchMode=yes still requires the real key, ConnectionAttempts=1 means a
+# single try); and the classification step now also emits a GitHub
+# Actions ::warning::/::error:: annotation and a $GITHUB_STEP_SUMMARY
+# (runner-side only, never written to production, never containing secret
+# material) so a WARNING/CRITICAL verdict is visible in the Actions UI
+# without changing the underlying exit-code semantics (OK/WARNING still
+# exit 0, CRITICAL still exits 2).
 # ============================================================================
 on:
   workflow_dispatch:
@@ -55,6 +68,10 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    # Bounds a stuck runner/SSH path -- the verified Phase 3.4G run
+    # completed in a few seconds; 5 minutes is a generous ceiling, not a
+    # tuned budget.
+    timeout-minutes: 5
 
     env:
       VM_HOST: "35.192.251.190"
@@ -64,6 +81,7 @@ jobs:
 
     steps:
       - name: Validate secrets
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
@@ -83,13 +101,23 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_monitor_key
           chmod 600 ~/.ssh/jobpulse_monitor_key
-          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+          # -T 10: finite ssh-keyscan timeout (seconds) -- bounds host-key
+          # discovery instead of hanging. Host-key verification itself is
+          # unchanged: known_hosts is still populated and used normally by
+          # the ssh invocation below, never bypassed.
+          ssh-keyscan -T 10 -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
 
           OUTPUT_FILE="$(mktemp)"
           echo "output_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
 
           set +e
-          ssh -i ~/.ssh/jobpulse_monitor_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+          # BatchMode=yes: never prompts/falls back to password auth --
+          # the real private key is still required. ConnectTimeout=10:
+          # finite TCP+auth handshake bound. ConnectionAttempts=1: a
+          # single try, no retry loop. None of this weakens host-key
+          # checking (no StrictHostKeyChecking=no) or authentication.
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 \
+            -i ~/.ssh/jobpulse_monitor_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
             bash -s <<'REMOTE' 2>&1 | tee "$OUTPUT_FILE"
           # No `set -e`: this is a pure evidence-gathering pass. A single
           # missing container or a failed probe must not abort the rest of
@@ -223,6 +251,7 @@ jobs:
           echo "MONITOR_EVIDENCE_COMPLETE"
 
       - name: Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)
+        id: classify
         shell: bash
         run: |
           set -euo pipefail
@@ -337,9 +366,114 @@ jobs:
             API_HEALTH_RC API_HEALTH_BODY API_IMAGE_MATCH API_TOR_ENABLED_ACTUAL \
             PRODUCTION_SHA_MATCH
 
+          CLASSIFY_OUTPUT="$(mktemp)"
+
           set +e
-          classify_evidence
-          MONITOR_EXIT=$?
+          classify_evidence | tee "$CLASSIFY_OUTPUT"
+          MONITOR_EXIT="${PIPESTATUS[0]}"
           set -e
 
+          # ------------------------------------------------------------------
+          # Phase 3.4H: operator-visible annotation + job summary. Both are
+          # built from classify_evidence's own already-printed fields (never
+          # re-derived), run BEFORE the final `exit "$MONITOR_EXIT"` below --
+          # even for a CRITICAL run -- and never touch production or any
+          # secret. This does not change the OK/WARNING->0, CRITICAL->2 exit
+          # semantics; it only makes the verdict visible in the Actions UI.
+          # ------------------------------------------------------------------
+          get_classify_field() {
+            grep -m1 "^$1=" "$CLASSIFY_OUTPUT" | cut -d'=' -f2- || true
+          }
+
+          MONITOR_STATUS="$(get_classify_field monitor_status)"
+          WARNING_COUNT="$(get_classify_field warning_count)"
+          CRITICAL_COUNT="$(get_classify_field critical_count)"
+
+          case "$MONITOR_STATUS" in
+            WARNING)
+              echo "::warning::Tor Runtime Monitor classified production as WARNING (warning_count=$WARNING_COUNT critical_count=$CRITICAL_COUNT)"
+              ;;
+            CRITICAL)
+              echo "::error::Tor Runtime Monitor classified production as CRITICAL (warning_count=$WARNING_COUNT critical_count=$CRITICAL_COUNT)"
+              ;;
+            *)
+              echo "Tor Runtime Monitor: $MONITOR_STATUS (warning_count=$WARNING_COUNT critical_count=$CRITICAL_COUNT)"
+              ;;
+          esac
+
+          {
+            echo "## Tor Runtime Monitor"
+            echo
+            echo "**Verdict: $MONITOR_STATUS**"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| production_sha_match | $(get_classify_field production_sha_match) |"
+            echo "| api_image_match | $(get_classify_field api_image_match) |"
+            echo "| api_health_ok | $(get_classify_field api_health_ok) |"
+            echo "| database_connected | $(get_classify_field database_connected) |"
+            echo "| api_tor_enabled_match | $(get_classify_field api_tor_enabled_match) |"
+            echo "| tor_container_present | $(get_classify_field tor_container_present) |"
+            echo "| tor_image_match | $(get_classify_field tor_image_match) |"
+            echo "| tor_status | $(get_classify_field tor_status) |"
+            echo "| tor_health | $(get_classify_field tor_health) |"
+            echo "| tor_restart_count | $(get_classify_field tor_restart_count) |"
+            echo "| tor_restart_count_changed | $(get_classify_field tor_restart_count_changed) |"
+            echo "| tor_published_ports | $(get_classify_field tor_published_ports) |"
+            echo "| warning_count | $WARNING_COUNT |"
+            echo "| critical_count | $CRITICAL_COUNT |"
+            echo
+            echo "_Frontend (informational only, not part of the severity model): HTTP status=$(get_field frontend_http_status), curl_rc=$(get_field frontend_curl_rc)_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           exit "$MONITOR_EXIT"
+
+      # ------------------------------------------------------------------
+      # Phase 3.4H (final hardening pass): guarantees every run -- including
+      # one that fails before classification is ever reached (missing
+      # secret, ssh-keyscan failure, SSH connection failure, unreachable
+      # /opt/jobpulse, MONITOR_EVIDENCE_INCOMPLETE) -- still leaves a
+      # GitHub Actions summary explaining what happened. `if: always()`
+      # makes this run even when a prior step failed (validate/evidence/
+      # classify carry no continue-on-error, so a real failure still fails
+      # the overall job -- this step cannot and does not mask that).
+      #
+      # It inspects ONLY the three step outcomes above -- never SSH, never
+      # docker, never curl, never a secret, never the SSH private key or
+      # Tor password. If classification was actually reached (outcome !=
+      # skipped), the Classify evidence step has ALREADY written its own
+      # detailed summary and, for a CRITICAL verdict, its own ::error::
+      # annotation -- this step must never replace, mask, or reinterpret
+      # that, so it does nothing further in that case. It only fills the
+      # gap for the run that never got that far.
+      # ------------------------------------------------------------------
+      - name: Report execution status (always runs -- no SSH, no Docker, no Tor, no network)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VALIDATE_OUTCOME="${{ steps.validate.outcome }}"
+          EVIDENCE_OUTCOME="${{ steps.evidence.outcome }}"
+          CLASSIFY_OUTCOME="${{ steps.classify.outcome }}"
+
+          if [ "$CLASSIFY_OUTCOME" != "skipped" ]; then
+            echo "Tor Runtime Monitor: classification was reached (classify outcome=$CLASSIFY_OUTCOME); its own detailed summary and, for a CRITICAL verdict, its own error annotation already stand -- nothing further to report here."
+            exit 0
+          fi
+
+          echo "::error::Tor Runtime Monitor could not complete runtime evidence gathering (validate=$VALIDATE_OUTCOME evidence=$EVIDENCE_OUTCOME classify=$CLASSIFY_OUTCOME) -- no OK/WARNING/CRITICAL classification was produced for this run"
+
+          {
+            echo "## Tor Runtime Monitor"
+            echo
+            echo "**Execution status: INCOMPLETE / FAILED**"
+            echo
+            echo "| Step | Outcome |"
+            echo "|---|---|"
+            echo "| Validate secrets | $VALIDATE_OUTCOME |"
+            echo "| Gather production runtime evidence | $EVIDENCE_OUTCOME |"
+            echo "| Classify evidence | $CLASSIFY_OUTCOME |"
+            echo
+            echo "Tor Runtime Monitor could not complete runtime evidence gathering, so no production classification (OK/WARNING/CRITICAL) was produced for this run. This is not itself a CRITICAL production verdict -- see the step outcomes above for where execution stopped."
+          } >> "$GITHUB_STEP_SUMMARY"
