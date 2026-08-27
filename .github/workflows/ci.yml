@@ -97,7 +97,12 @@ jobs:
         # production-runtime-diagnostic.yml workflow (workflow_dispatch
         # trigger shape, secrets usage, forbidden-command absence,
         # metadata-only docker inspect templates, bash -n syntax on the
-        # extracted remote script) -- no real Docker, no real network,
+        # extracted remote script), plus tests/test_tor_runtime_monitor.py
+        # (Phase 3.4D), a static/security audit of the read-only
+        # tor-runtime-monitor.yml workflow plus a behavioral audit that
+        # extracts its classify_evidence() bash function and actually
+        # executes it with fabricated evidence for all 20 severity
+        # scenarios -- no real Docker, no real network,
         # no SSH. Every other file here mocks
         # psycopg2 and stem.control.Controller -- none opens a real
         # database connection or contacts a real Tor process, and none
@@ -123,6 +128,7 @@ jobs:
             tests/test_tor_dark_launch_script.py \
             tests/test_tor_secret_provision.py \
             tests/test_production_runtime_diagnostic.py \
+            tests/test_tor_runtime_monitor.py \
             -v
 
       - name: Create dummy prod env files for compose validation

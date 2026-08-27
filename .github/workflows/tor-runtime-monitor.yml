@@ -1,0 +1,345 @@
+name: Tor Runtime Monitor
+
+# ============================================================================
+# PHASE 3.4D -- READ-ONLY TOR RUNTIME MONITORING (DESIGN + WORKFLOW_DISPATCH
+# EXECUTION SURFACE ONLY -- NO SCHEDULE YET).
+#
+# This workflow reuses the exact same evidence-gathering discipline proven
+# by production-runtime-diagnostic.yml (Phase 3.4A/3.4C) and adds a second,
+# purely local (runner-side) classification pass that turns that evidence
+# into a deterministic OK/WARNING/CRITICAL verdict. It NEVER
+# starts/stops/restarts/creates/removes any container, NEVER runs
+# `docker compose up/down`, NEVER pulls/pushes/deploys anything, NEVER
+# mutates git or the filesystem on the production VM, and never manages,
+# connects to, or sends traffic through Tor; metadata-only inspection is
+# permitted. It does not connect to the Tor ControlPort, does not use
+# SOCKS, does not run NEWNYM or any circuit operation, and does not read
+# the Tor control password (neither /opt/jobpulse/.tor_control_password
+# nor /run/secrets/tor_control_password).
+#
+# Phase 3.4D scope: workflow_dispatch ONLY -- no push, pull_request,
+# workflow_run, or schedule trigger exists here. A future phase may add a
+# `schedule:` trigger once this design has been independently reviewed;
+# that is a separate, explicit decision and is NOT made by this file.
+# Adding this workflow cannot, by itself, cause any build/deploy pipeline
+# to run: it carries no push/path trigger of any kind.
+#
+# Only secrets.VM_SSH_KEY is used here, purely to establish SSH transport.
+# No GHCR token, no Tor password secret, no notification secret (no Slack/
+# email/webhook integration exists in this file). Every remote command is
+# read-only, identical in kind to production-runtime-diagnostic.yml:
+# `git rev-parse`, `docker inspect` restricted to a small metadata format
+# string (name/id/image id/status/StartedAt/RestartCount/health -- never
+# .Config.Env or any secret/mount content), `docker port` to confirm no
+# Tor host ports are published, exactly one narrowly scoped `docker exec`
+# (printenv TOR_ENABLED on jobpulse-api-prod only, never a broader
+# environment dump), and two plain localhost `curl` health probes -- no
+# external network target of any kind, including check.torproject.org.
+#
+# Detection/reporting only -- this workflow never remediates. A CRITICAL
+# verdict makes the job fail (non-zero exit) so a future scheduled run
+# would surface as a failed GitHub Actions run; nothing here restarts
+# Tor, changes TOR_ENABLED, rotates circuits, or otherwise acts on what
+# it finds.
+# ============================================================================
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-tor-runtime-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    env:
+      VM_HOST: "35.192.251.190"
+      VM_USER: "mrezamaghouli"
+      VM_PORT: "22"
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+
+    steps:
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "VM_SSH_KEY secret is missing"
+            exit 1
+          fi
+
+      - name: Gather production runtime evidence (read-only)
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_monitor_key
+          chmod 600 ~/.ssh/jobpulse_monitor_key
+          ssh-keyscan -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          OUTPUT_FILE="$(mktemp)"
+          echo "output_file=$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+
+          set +e
+          ssh -i ~/.ssh/jobpulse_monitor_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            bash -s <<'REMOTE' 2>&1 | tee "$OUTPUT_FILE"
+          # No `set -e`: this is a pure evidence-gathering pass. A single
+          # missing container or a failed probe must not abort the rest of
+          # the evidence gathering -- every section below reports its own
+          # result instead of letting the script die partway through. The
+          # future classification pass (a separate, local step -- see
+          # below) is what turns this evidence into a verdict; nothing on
+          # this remote host decides OK/WARNING/CRITICAL.
+          set -uo pipefail
+
+          cd /opt/jobpulse || { echo "MONITOR_ERROR: cannot cd to /opt/jobpulse"; exit 1; }
+
+          # Not secrets -- fixed, non-secret, evidence-only comparison
+          # constants, identical in kind and value to
+          # production-runtime-diagnostic.yml. Never derived from
+          # github.sha, never workflow_dispatch inputs (typo-safety, same
+          # discipline as tor-dark-launch.yml). Never used to
+          # fetch/reset/checkout/pull; a mismatch is reported, not
+          # corrected.
+          EXPECTED_PRODUCTION_SHA="0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          EXPECTED_TOR_IMAGE="ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
+
+          echo "===MONITOR_EVIDENCE_START==="
+
+          ACTUAL_PRODUCTION_SHA="$(git rev-parse HEAD)"
+          echo "production_sha_expected=$EXPECTED_PRODUCTION_SHA"
+          echo "production_sha_actual=$ACTUAL_PRODUCTION_SHA"
+          if [ "$ACTUAL_PRODUCTION_SHA" = "$EXPECTED_PRODUCTION_SHA" ]; then
+            echo "production_sha_match=yes"
+          else
+            echo "production_sha_match=no"
+          fi
+
+          # Deliberately restricted format string: name/id/image id/config
+          # image reference/status/StartedAt/RestartCount/health only.
+          # Never .Config.Env, never any environment variable, never
+          # mount/secret contents. `{{with (index .State "Health")}}`
+          # looks up "Health" as a map key and only enters the block if
+          # present -- a container with no HEALTHCHECK (e.g.
+          # jobpulse-frontend-prod, nginx:alpine) omits the key entirely
+          # rather than zero-valuing it.
+          inspect_field() {
+            local name="$1" template="$2"
+            docker inspect "$name" --format "$template" 2>/dev/null || true
+          }
+
+          if docker inspect jobpulse-api-prod --format '{{.Id}}' >/dev/null 2>&1; then
+            API_IMAGE_ACTUAL="$(inspect_field jobpulse-api-prod '{{.Config.Image}}')"
+            [ -n "$API_IMAGE_ACTUAL" ] || API_IMAGE_ACTUAL="NOT_FOUND"
+          else
+            API_IMAGE_ACTUAL="NOT_FOUND"
+          fi
+          echo "api_image_expected=$EXPECTED_API_IMAGE"
+          echo "api_image_actual=$API_IMAGE_ACTUAL"
+          if [ "$API_IMAGE_ACTUAL" = "$EXPECTED_API_IMAGE" ]; then
+            echo "api_image_match=yes"
+          else
+            echo "api_image_match=no"
+          fi
+
+          if docker inspect jobpulse-tor-prod --format '{{.Id}}' >/dev/null 2>&1; then
+            echo "tor_container_present=yes"
+            TOR_IMAGE_ACTUAL="$(inspect_field jobpulse-tor-prod '{{.Config.Image}}')"
+            [ -n "$TOR_IMAGE_ACTUAL" ] || TOR_IMAGE_ACTUAL="NOT_FOUND"
+            echo "tor_image_expected=$EXPECTED_TOR_IMAGE"
+            echo "tor_image_actual=$TOR_IMAGE_ACTUAL"
+            if [ "$TOR_IMAGE_ACTUAL" = "$EXPECTED_TOR_IMAGE" ]; then
+              echo "tor_image_match=yes"
+            else
+              echo "tor_image_match=no"
+            fi
+            echo "tor_status=$(inspect_field jobpulse-tor-prod '{{.State.Status}}')"
+            echo "tor_health=$(inspect_field jobpulse-tor-prod '{{with (index .State "Health")}}{{.Status}}{{else}}n/a{{end}}')"
+            echo "tor_restart_count=$(inspect_field jobpulse-tor-prod '{{.RestartCount}}')"
+            echo "tor_started_at=$(inspect_field jobpulse-tor-prod '{{.State.StartedAt}}')"
+          else
+            echo "tor_container_present=no"
+            echo "tor_image_expected=$EXPECTED_TOR_IMAGE"
+            echo "tor_image_actual=NOT_FOUND"
+            echo "tor_image_match=no"
+            echo "tor_status=NOT_FOUND"
+            echo "tor_health=n/a"
+            echo "tor_restart_count=n/a"
+            echo "tor_started_at=n/a"
+          fi
+
+          # Read-only: confirms whether jobpulse-tor-prod publishes any
+          # host port bindings. Never changes networking or exposes ports.
+          TOR_PUBLISHED_PORTS="$(docker port jobpulse-tor-prod 2>/dev/null || true)"
+          if [ -z "$TOR_PUBLISHED_PORTS" ]; then
+            echo "tor_published_ports=NONE"
+          else
+            echo "tor_published_ports=$TOR_PUBLISHED_PORTS"
+          fi
+
+          # The ONLY docker exec in this workflow. Never a broader `env`/
+          # `printenv` dump -- exactly this one variable, on the API
+          # container only, never on jobpulse-tor-prod.
+          API_TOR_ENABLED_ACTUAL="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNKNOWN)"
+          echo "api_tor_enabled_expected=false"
+          echo "api_tor_enabled_actual=$API_TOR_ENABLED_ACTUAL"
+          if [ "$API_TOR_ENABLED_ACTUAL" = "false" ]; then
+            echo "api_tor_enabled_match=yes"
+          else
+            echo "api_tor_enabled_match=no"
+          fi
+
+          API_RC=0
+          API_HEALTH_BODY="$(curl -fsS http://127.0.0.1:8000/health)" || API_RC=$?
+          [ -n "$API_HEALTH_BODY" ] || API_HEALTH_BODY="NONE"
+          echo "api_health_rc=$API_RC"
+          echo "api_health_body=$API_HEALTH_BODY"
+
+          FRONTEND_RC=0
+          curl -sS -o /dev/null -w 'frontend_http_status=%{http_code}\n' \
+            http://127.0.0.1/ || FRONTEND_RC=$?
+          echo "frontend_curl_rc=$FRONTEND_RC"
+
+          echo "===MONITOR_EVIDENCE_END==="
+          echo "MONITOR_EVIDENCE_COMPLETE"
+          REMOTE
+          SSH_EXIT="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$SSH_EXIT" -ne 0 ] || ! grep -q '^MONITOR_EVIDENCE_COMPLETE$' "$OUTPUT_FILE"; then
+            echo "MONITOR_EVIDENCE_INCOMPLETE"
+            exit 1
+          fi
+
+          echo "MONITOR_EVIDENCE_COMPLETE"
+
+      - name: Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ------------------------------------------------------------------
+          # Pure classification function. Operates ONLY on already-set shell
+          # variables (the evidence parsed below from the previous step's
+          # output) -- no SSH, no `docker`, no Tor daemon, no network call of
+          # any kind happens in this step. This is what Phase 3.4D's tests
+          # exercise directly: the function is extracted verbatim and
+          # invoked with fabricated evidence to prove the OK/WARNING/
+          # CRITICAL decision table, with no production access whatsoever.
+          #
+          # Severity model (fixed, deterministic, never remediates):
+          #   CRITICAL -- Tor missing / not running / unhealthy, an
+          #     unexpected Tor host port, TOR_ENABLED != false, API health
+          #     failure, or database disconnected.
+          #   WARNING -- Tor restart count increased from the fixed
+          #     reference, Tor image drift, API image drift, or production
+          #     SHA drift.
+          #   OK -- every evidence field matches its expected/reference
+          #     value.
+          # A CRITICAL verdict anywhere always wins over any number of
+          # WARNINGs.
+          # ------------------------------------------------------------------
+          classify_evidence() {
+            local warning_count=0
+            local critical_count=0
+
+            [ "$TOR_CONTAINER_PRESENT" = "yes" ] || critical_count=$((critical_count + 1))
+            [ "$TOR_STATUS" = "running" ] || critical_count=$((critical_count + 1))
+            [ "$TOR_HEALTH" = "healthy" ] || critical_count=$((critical_count + 1))
+            [ "$TOR_PUBLISHED_PORTS" = "NONE" ] || critical_count=$((critical_count + 1))
+            [ "$API_TOR_ENABLED_ACTUAL" = "false" ] || critical_count=$((critical_count + 1))
+            [ "$API_HEALTH_RC" = "0" ] || critical_count=$((critical_count + 1))
+
+            local database_connected=no
+            case "$API_HEALTH_BODY" in
+              *'"database":"connected"'*) database_connected=yes ;;
+            esac
+            [ "$database_connected" = "yes" ] || critical_count=$((critical_count + 1))
+
+            local tor_restart_count_changed=no
+            if [ "$TOR_RESTART_COUNT" != "$REFERENCE_TOR_RESTART_COUNT" ]; then
+              tor_restart_count_changed=yes
+              warning_count=$((warning_count + 1))
+            fi
+
+            [ "$TOR_IMAGE_MATCH" = "yes" ] || warning_count=$((warning_count + 1))
+            [ "$API_IMAGE_MATCH" = "yes" ] || warning_count=$((warning_count + 1))
+            [ "$PRODUCTION_SHA_MATCH" = "yes" ] || warning_count=$((warning_count + 1))
+
+            local api_tor_enabled_match=no
+            [ "$API_TOR_ENABLED_ACTUAL" = "false" ] && api_tor_enabled_match=yes
+
+            local monitor_status=OK
+            if [ "$critical_count" -gt 0 ]; then
+              monitor_status=CRITICAL
+            elif [ "$warning_count" -gt 0 ]; then
+              monitor_status=WARNING
+            fi
+
+            echo "tor_container_present=$TOR_CONTAINER_PRESENT"
+            echo "tor_status=$TOR_STATUS"
+            echo "tor_health=$TOR_HEALTH"
+            echo "tor_restart_count=$TOR_RESTART_COUNT"
+            echo "tor_restart_count_changed=$tor_restart_count_changed"
+            echo "tor_image_match=$TOR_IMAGE_MATCH"
+            echo "tor_published_ports=$TOR_PUBLISHED_PORTS"
+            echo "api_health_ok=$([ "$API_HEALTH_RC" = "0" ] && echo yes || echo no)"
+            echo "database_connected=$database_connected"
+            echo "api_image_match=$API_IMAGE_MATCH"
+            echo "api_tor_enabled_match=$api_tor_enabled_match"
+            echo "production_sha_match=$PRODUCTION_SHA_MATCH"
+            echo "warning_count=$warning_count"
+            echo "critical_count=$critical_count"
+            echo "monitor_status=$monitor_status"
+
+            if [ "$monitor_status" = "CRITICAL" ]; then
+              return 2
+            fi
+            return 0
+          } # end classify_evidence
+
+          OUTPUT_FILE="${{ steps.evidence.outputs.output_file }}"
+
+          get_field() {
+            grep -m1 "^$1=" "$OUTPUT_FILE" | cut -d'=' -f2- || true
+          }
+
+          # Fixed baseline for comparison only -- never a hard pass/fail
+          # requirement by itself; a higher value is WARNING evidence, not
+          # a reason to restart anything. Matches the independently
+          # verified Phase 3.4C reference (jobpulse-tor-prod, restart_count
+          # 0 at last direct observation).
+          REFERENCE_TOR_RESTART_COUNT="0"
+
+          TOR_CONTAINER_PRESENT="$(get_field tor_container_present)"
+          TOR_STATUS="$(get_field tor_status)"
+          TOR_HEALTH="$(get_field tor_health)"
+          TOR_RESTART_COUNT="$(get_field tor_restart_count)"
+          TOR_IMAGE_MATCH="$(get_field tor_image_match)"
+          TOR_PUBLISHED_PORTS="$(get_field tor_published_ports)"
+          API_HEALTH_RC="$(get_field api_health_rc)"
+          API_HEALTH_BODY="$(get_field api_health_body)"
+          API_IMAGE_MATCH="$(get_field api_image_match)"
+          API_TOR_ENABLED_ACTUAL="$(get_field api_tor_enabled_actual)"
+          PRODUCTION_SHA_MATCH="$(get_field production_sha_match)"
+
+          export TOR_CONTAINER_PRESENT TOR_STATUS TOR_HEALTH TOR_RESTART_COUNT \
+            REFERENCE_TOR_RESTART_COUNT TOR_IMAGE_MATCH TOR_PUBLISHED_PORTS \
+            API_HEALTH_RC API_HEALTH_BODY API_IMAGE_MATCH API_TOR_ENABLED_ACTUAL \
+            PRODUCTION_SHA_MATCH
+
+          set +e
+          classify_evidence
+          MONITOR_EXIT=$?
+          set -e
+
+          exit "$MONITOR_EXIT"
