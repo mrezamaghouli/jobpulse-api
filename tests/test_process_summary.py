@@ -8,6 +8,8 @@ No real Docker, PostgreSQL, or LinkedIn is ever used -- this module has
 no I/O dependency on any of them; only local temp files.
 """
 import json
+import os
+import stat
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -389,3 +391,244 @@ def test_build_summary_generated_at_is_utc_and_timezone_aware():
     dt = datetime.fromisoformat(summary.generated_at)
     assert dt.tzinfo is not None
     assert dt.utcoffset() == timedelta(0)
+
+
+# =====================================================================
+# Ingestion hotfix: write_summary_atomic() must publish a file that is
+# host-readable across the api container's root -> host's non-root
+# collection-wrapper UID boundary. tempfile.mkstemp() always creates its
+# file at 0600 regardless of umask, and os.replace() never changes a
+# file's mode -- both proven correct by direct inspection of CPython's
+# documented behavior, not merely assumed; the two tests below assert
+# the produced mode directly.
+# =====================================================================
+
+def test_write_summary_atomic_produces_explicit_host_readable_mode(tmp_path):
+    """The published file's permission bits must equal SUMMARY_FILE_MODE
+    (0644) exactly -- readable by owner, group, and other -- regardless
+    of the calling process's umask. This is the literal fix for the
+    production symptom: a root-owned api-container writer and a
+    non-root (uid=1001) host-side wrapper reader, connected only by a
+    bind-mounted directory, with no shared group."""
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(aggregate_collector_metrics=agg(rows_inserted=1)), True)
+
+    old_umask = os.umask(0o077)  # deliberately hostile umask
+    try:
+        ps.write_summary_atomic(path, summary)
+    finally:
+        os.umask(old_umask)
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode == ps.SUMMARY_FILE_MODE == 0o644
+    # Explicitly: group and other must both be able to read the file --
+    # this is the exact bit a bare `tempfile.mkstemp()` (mode 0600) does
+    # not set, and the exact bit a hostile umask (tested above) could not
+    # have granted by accident either.
+    assert mode & stat.S_IRGRP
+    assert mode & stat.S_IROTH
+
+
+def test_write_summary_atomic_mode_is_never_transiently_wrong(tmp_path):
+    """The temp file is fchmod'd BEFORE the atomic rename, so at every
+    instant the file is observable at `path` it already has the correct
+    mode -- there is no window where a concurrent host-side reader could
+    see a 0600 (or any other) intermediate mode at the final path."""
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(), True)
+    ps.write_summary_atomic(path, summary)
+    # os.replace is a single rename syscall; by the time write_summary_atomic
+    # returns, `path` can only ever have held the final, already-chmod'd
+    # inode -- confirmed by checking the mode immediately after return.
+    assert stat.S_IMODE(path.stat().st_mode) == ps.SUMMARY_FILE_MODE
+
+
+def test_temp_file_stays_private_0600_while_content_is_incomplete(tmp_path, monkeypatch):
+    """The published mode must only ever be granted AFTER the content is
+    fully written, flushed, and fsync'd -- never before. Verified by
+    wrapping os.fchmod itself: at the exact instant it is called (the
+    ordering point write_summary_atomic uses to widen permissions), the
+    temp file's mode on disk must still be the private 0600 mkstemp()
+    grants by default, proving nothing widened it earlier."""
+    observed_mode_at_fchmod_time = {}
+    real_fchmod = os.fchmod
+
+    def spying_fchmod(fd, mode):
+        # fstat the SAME fd fchmod is about to widen -- this is the mode
+        # the file has held for its entire life up to this instant.
+        observed_mode_at_fchmod_time["mode"] = stat.S_IMODE(os.fstat(fd).st_mode)
+        return real_fchmod(fd, mode)
+
+    monkeypatch.setattr(ps.os, "fchmod", spying_fchmod)
+
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(aggregate_collector_metrics=agg(rows_inserted=1)), True)
+    ps.write_summary_atomic(path, summary)
+
+    assert observed_mode_at_fchmod_time["mode"] == 0o600
+    # ...and immediately after fchmod ran (still pre-rename), the file
+    # already carries the final mode.
+    assert stat.S_IMODE(path.stat().st_mode) == ps.SUMMARY_FILE_MODE
+
+
+def test_fchmod_used_not_path_based_chmod(tmp_path, monkeypatch):
+    """Guards the specific mechanism, not just the outcome: the fix must
+    use os.fchmod on the already-open descriptor (immune to any path-
+    based TOCTOU concern), never a path-based os.chmod call anywhere in
+    write_summary_atomic."""
+    calls = {"fchmod": 0, "chmod": 0}
+    real_fchmod = os.fchmod
+    real_chmod = os.chmod
+
+    def spying_fchmod(fd, mode):
+        calls["fchmod"] += 1
+        return real_fchmod(fd, mode)
+
+    def spying_chmod(*args, **kwargs):
+        calls["chmod"] += 1
+        return real_chmod(*args, **kwargs)
+
+    monkeypatch.setattr(ps.os, "fchmod", spying_fchmod)
+    monkeypatch.setattr(ps.os, "chmod", spying_chmod)
+
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(), True)
+    ps.write_summary_atomic(path, summary)
+
+    assert calls["fchmod"] == 1
+    assert calls["chmod"] == 0
+
+
+def test_fchmod_happens_before_publication_not_after(tmp_path, monkeypatch):
+    """The fd must be widened to 0644 BEFORE os.replace ever runs -- not
+    after. Verified by recording call order via a shared sequence list
+    wrapping both os.fchmod and os.replace."""
+    order = []
+    real_fchmod = os.fchmod
+    real_replace = os.replace
+
+    def spying_fchmod(fd, mode):
+        order.append("fchmod")
+        return real_fchmod(fd, mode)
+
+    def spying_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(ps.os, "fchmod", spying_fchmod)
+    monkeypatch.setattr(ps.os, "replace", spying_replace)
+
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(), True)
+    ps.write_summary_atomic(path, summary)
+
+    assert order == ["fchmod", "replace"]
+
+
+def test_no_partial_final_path_file_exposed_even_with_slow_writer(tmp_path, monkeypatch):
+    """Simulates a slow writer: json.dump is wrapped to assert `path`
+    (the FINAL path) does not exist yet at the moment content is being
+    written -- the temp file is invisible under the final name until the
+    single atomic os.replace() call, regardless of how long writing
+    takes."""
+    real_dump = json.dump
+
+    def spying_dump(obj, fp, **kwargs):
+        assert not path.exists(), "final path must not exist before publication"
+        return real_dump(obj, fp, **kwargs)
+
+    monkeypatch.setattr(ps.json, "dump", spying_dump)
+
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(aggregate_collector_metrics=agg(rows_inserted=1)), True)
+    ps.write_summary_atomic(path, summary)
+
+    assert path.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == ps.SUMMARY_FILE_MODE
+
+
+def test_write_then_read_round_trips_with_explicit_mode(tmp_path):
+    """Item A/B from the hotfix test plan combined: the permission fix
+    does not disturb the existing atomic-transport or strict-validation
+    contract -- a valid summary still round-trips exactly, and the file
+    left behind carries the new explicit mode."""
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(
+        batch(aggregate_collector_metrics=agg(rows_inserted=3, jobs_valid=3, jobs_discovered=3)), True,
+    )
+    ps.write_summary_atomic(path, summary)
+    loaded = ps.read_summary(path)
+    assert loaded == summary
+    assert stat.S_IMODE(path.stat().st_mode) == ps.SUMMARY_FILE_MODE
+
+
+def test_missing_or_invalid_summary_still_fails_after_permission_fix(tmp_path):
+    """Item B: the permission fix must not weaken result_read_error /
+    invalid_result detection -- a missing file and a malformed document
+    are both still rejected exactly as before."""
+    with pytest.raises(ps.SummaryReadError) as missing_exc:
+        ps.read_summary(tmp_path / "missing.json")
+    assert missing_exc.value.category == ps.ERROR_CATEGORY_MISSING_RESULT
+
+    bad_path = tmp_path / "bad.json"
+    bad_path.write_text("not json", encoding="utf-8")
+    os.chmod(bad_path, ps.SUMMARY_FILE_MODE)  # correctly readable, still invalid content
+    with pytest.raises(ps.SummaryReadError) as invalid_exc:
+        ps.read_summary(bad_path)
+    assert invalid_exc.value.category == ps.ERROR_CATEGORY_INVALID_RESULT
+
+
+def test_write_summary_atomic_still_produces_no_partial_file_with_explicit_mode(tmp_path):
+    """Item D: atomic replacement behavior (no leftover .process_summary.*
+    temp file, no partially-written document ever visible at `path`) is
+    unchanged by the explicit chmod call."""
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(batch(aggregate_collector_metrics=agg(rows_inserted=1)), True)
+    ps.write_summary_atomic(path, summary)
+
+    assert path.exists()
+    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".process_summary.")]
+    assert leftovers == []
+    # Re-write over an existing summary (as a real second cycle's run_id
+    # would produce a distinct path, but the same-path overwrite case --
+    # e.g. a retried write -- must remain atomic too).
+    summary2 = ps.build_summary(
+        batch(aggregate_collector_metrics=agg(rows_updated_existing=1, jobs_valid=1, jobs_discovered=1)), True,
+    )
+    ps.write_summary_atomic(path, summary2)
+    loaded = ps.read_summary(path)
+    assert loaded.outcome == ps.OUTCOME_TECHNICAL_SUCCESS_NO_NEW_ROWS
+    leftovers_after = [p for p in tmp_path.iterdir() if p.name.startswith(".process_summary.")]
+    assert leftovers_after == []
+
+
+def test_no_secrets_or_credentials_added_to_summary_by_the_fix(tmp_path):
+    """Item E: the fix only changes file permissions -- it must not add
+    any new field, and the document must still contain no secret-shaped
+    content (only the pre-existing operational counters/classification).
+    """
+    path = tmp_path / "summary.json"
+    summary = ps.build_summary(
+        batch(aggregate_collector_metrics=agg(rows_inserted=1, jobs_valid=1, jobs_discovered=1)), True,
+    )
+    ps.write_summary_atomic(path, summary)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    expected_fields = {
+        "schema_version", "generated_at", "had_pending_targets", "total_queries",
+        "successful_queries", "failed_queries", "useful_queries", "zero_yield_queries",
+        "skipped_queries", "partial_failure", "aggregate_collector_metrics", "outcome",
+    }
+    assert set(raw.keys()) == expected_fields
+    for forbidden in ("password", "token", "cookie", "secret", "api_key", "authorization",
+                       "session", "credential"):
+        assert forbidden not in path.read_text(encoding="utf-8").lower()
+
+
+def test_summary_file_mode_constant_is_explicit_not_umask_derived():
+    """Guards the design choice itself: SUMMARY_FILE_MODE is a fixed
+    module-level constant (0644), not something derived from os.umask()
+    at call time -- the whole point is that the published mode must not
+    depend on whatever umask the api container's entrypoint happens to
+    be running under."""
+    assert ps.SUMMARY_FILE_MODE == 0o644

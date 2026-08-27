@@ -80,6 +80,9 @@ jobs:
           python -m py_compile scripts/seed_autonomous_search_queue.py
           python -m py_compile scripts/build_linkedin_collection_targets.py
           python -m py_compile scripts/migrate_database.py
+          python -m py_compile scripts/process_summary.py
+          python -m py_compile scripts/seed_priority_coverage_queue.py
+          python -m py_compile scripts/reconcile_priority_coverage.py
 
       - name: Run focused Tor unit suite (no real Tor daemon, no network)
         # Scoped, network-free suite covering the Phase 2 Tor
@@ -319,6 +322,149 @@ jobs:
               sys.exit(1)
 
           print('PostgreSQL 16 integration test executed for real with zero skips: OK')
+          "
+
+
+  postgres-collection-integration:
+    name: PostgreSQL 16 collection refresh integration
+    runs-on: ubuntu-latest
+    # Runs ONLY tests/test_priority_coverage_refresh_integration.py --
+    # real PostgreSQL 16 evidence for the LinkedIn ingestion continuous-
+    # collection hotfix: scripts/seed_priority_coverage_queue.py's
+    # recurring 'done'-coverage eligibility (never re-selecting
+    # queued/running, never requeuing fresh 'done' rows, correctly
+    # reseeding stale ones, and the shared eligibility predicate that
+    # closes the priority-starvation hazard between get_current_priority()
+    # and select_tasks()), and scripts/reconcile_priority_coverage.py's
+    # 'queued' -> 'done' reconciliation, including the exact stuck-row
+    # shape observed in production. A separate job/database from
+    # postgres-upsert-integration above -- deliberately not merged into
+    # it or renamed, so that existing job's identity/history is
+    # undisturbed. Never connects to production, never Docker directly
+    # (this is a GitHub Actions `services:` container), never sends a
+    # LinkedIn request, never runs a real collection cycle.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jobpulse_test
+          POSTGRES_PASSWORD: jobpulse_test
+          POSTGRES_DB: jobpulse_collection_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobpulse_test -d jobpulse_collection_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      JOBPULSE_TEST_POSTGRES_DSN: "postgresql://jobpulse_test:jobpulse_test@localhost:5432/jobpulse_collection_test"
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: jobpulse_collection_test
+      POSTGRES_USER: jobpulse_test
+      POSTGRES_PASSWORD: jobpulse_test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpq-dev postgresql-client
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Preflight -- DSN set, psycopg2 importable, database reachable
+        # Identical bounded-retry discipline to postgres-upsert-integration's
+        # own preflight above (same rationale: a real psycopg2 connection
+        # attempt using the SAME driver and DSN the integration test
+        # itself uses, not merely a bare TCP/pg_isready check). Hard
+        # maximum duration (30 attempts x1s = 30s); exits non-zero, never
+        # falls through successfully, if the database never becomes
+        # reachable in that window.
+        run: |
+          python -c "
+          import os
+          import sys
+          import time
+
+          dsn = os.environ.get('JOBPULSE_TEST_POSTGRES_DSN', '')
+          if not dsn:
+              print('JOBPULSE_TEST_POSTGRES_DSN is not set or empty', file=sys.stderr)
+              sys.exit(1)
+          print('JOBPULSE_TEST_POSTGRES_DSN is set: OK')
+
+          try:
+              import psycopg2
+          except ImportError as exc:
+              print(f'psycopg2 import failed: {exc}', file=sys.stderr)
+              sys.exit(1)
+          print('psycopg2 import: OK')
+
+          max_attempts = 30
+          delay_seconds = 1.0
+
+          for attempt in range(1, max_attempts + 1):
+              try:
+                  conn = psycopg2.connect(dsn, connect_timeout=5)
+                  conn.close()
+                  print(f'PostgreSQL reachable after {attempt} attempt(s): OK')
+                  sys.exit(0)
+              except Exception as exc:
+                  print(f'attempt {attempt}/{max_attempts} failed: {exc}')
+                  if attempt < max_attempts:
+                      time.sleep(delay_seconds)
+
+          print(f'PostgreSQL never became reachable within {max_attempts} attempts ({max_attempts * delay_seconds:.0f}s bound)', file=sys.stderr)
+          sys.exit(1)
+          "
+
+      - name: Run the PostgreSQL 16 collection refresh integration test only (fails if skipped)
+        # Same discipline as postgres-upsert-integration's own run step:
+        # `--junit-xml` + the parser below is what proves the test file
+        # was actually EXECUTED for real (skipped=0), not merely that
+        # pytest exited 0 -- pytest's own exit code is 0 whether tests ran
+        # or were all skipped, so the exit code alone cannot detect "the
+        # DSN preflight passed but the test still didn't run."
+        run: |
+          PYTHONPATH=. python -m pytest tests/test_priority_coverage_refresh_integration.py -v -rs --junit-xml=pg-collection-integration-report.xml
+
+          python -c "
+          import sys
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse('pg-collection-integration-report.xml')
+          root = tree.getroot()
+          suite = root if root.tag == 'testsuite' else root.find('testsuite')
+
+          tests = int(suite.get('tests', 0))
+          skipped = int(suite.get('skipped', 0))
+          failures = int(suite.get('failures', 0))
+          errors = int(suite.get('errors', 0))
+
+          print(f'tests={tests} skipped={skipped} failures={failures} errors={errors}')
+
+          if tests == 0:
+              print('No tests were collected in tests/test_priority_coverage_refresh_integration.py -- treating as failure', file=sys.stderr)
+              sys.exit(1)
+          if skipped > 0:
+              print(f'{skipped} test(s) were unexpectedly SKIPPED in CI -- the PostgreSQL 16 collection refresh integration test must actually run here, never be skipped', file=sys.stderr)
+              sys.exit(1)
+          if failures > 0 or errors > 0:
+              sys.exit(1)
+
+          print('PostgreSQL 16 collection refresh integration test executed for real with zero skips: OK')
           "
 
 

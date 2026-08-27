@@ -184,11 +184,48 @@ def build_summary(batch_report: Optional[dict], had_pending_targets: bool) -> Pr
     )
 
 
+SUMMARY_FILE_MODE = 0o644
+
+
 def write_summary_atomic(path: os.PathLike, summary: ProcessSummary) -> None:
     """Same atomicity contract as scripts.collector_result.write_result_atomic
     -- tempfile in the same directory, fsync, os.replace. Raises on
     failure; the caller must treat that as a hard failure, not a silent
-    no-op."""
+    no-op.
+
+    Explicit mode, not umask: this is the ONE write_*_atomic in the
+    codebase whose reader crosses a UID boundary -- this function runs
+    INSIDE the api container (uid=0/root; see Dockerfile, which has no
+    USER directive) and scripts/run_collection_cycle_safe.sh reads the
+    published file back on the HOST as a non-root user, via
+    docker-compose.prod.yml's `./logs:/app/logs` bind mount.
+    `tempfile.mkstemp()` always creates its file at mode 0600 regardless
+    of umask (Python's own documented, deliberate hardening for a
+    generic temp file that might hold secrets) -- without an explicit
+    mode change, the published summary stayed root-only-readable and
+    every host-side read failed with ERROR_CATEGORY_RESULT_READ_ERROR
+    ("... its summary is unusable (category=result_read_error)" in the
+    wrapper's log), exactly the production symptom this fixes. The
+    summary contains only operational counts/classification -- no
+    credentials, no PII, no job content -- so a world-readable 0644 is
+    appropriate.
+
+    Ordering (deliberate): the temp file stays at its private 0600 mode
+    for the ENTIRE time it might hold incomplete content -- write, flush,
+    fsync all happen first. Only once the content is fully durable does
+    `os.fchmod(f.fileno(), SUMMARY_FILE_MODE)` widen the already-open
+    file descriptor's permissions -- fchmod is used instead of a path-
+    based os.chmod() specifically because the open fd identifies the
+    exact inode being published, immune to any path-based TOCTOU
+    concern. Only THEN does `os.replace()` publish it. This guarantees
+    two invariants simultaneously: (1) nothing with 0644-level access
+    can ever observe a half-written temp file (it's 0600 for its entire
+    incomplete lifetime), and (2) nothing can ever observe the file at
+    the FINAL path with any mode other than 0644 -- os.replace is a
+    single rename syscall, so by the time any reader can see `path` at
+    all, the inode behind it has already had its final mode set. There
+    is no post-rename chmod window.
+    """
     path = Path(path)
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -199,6 +236,7 @@ def write_summary_atomic(path: os.PathLike, summary: ProcessSummary) -> None:
             json.dump(summary.to_dict(), f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
+            os.fchmod(f.fileno(), SUMMARY_FILE_MODE)
         os.replace(tmp_path, path)
     except BaseException:
         try:
