@@ -17,12 +17,12 @@ name: Tor Runtime Monitor
 # the Tor control password (neither /opt/jobpulse/.tor_control_password
 # nor /run/secrets/tor_control_password).
 #
-# Phase 3.4D scope: workflow_dispatch ONLY -- no push, pull_request,
-# workflow_run, or schedule trigger exists here. A future phase may add a
-# `schedule:` trigger once this design has been independently reviewed;
-# that is a separate, explicit decision and is NOT made by this file.
-# Adding this workflow cannot, by itself, cause any build/deploy pipeline
-# to run: it carries no push/path trigger of any kind.
+# Through Phase 3.4H this workflow was workflow_dispatch-only. Phase
+# 3.4I adds the schedule trigger described further below. At every
+# phase, including now: still no push, no pull_request, no workflow_run
+# trigger. Adding or scheduling this workflow cannot, by itself, cause
+# any build/deploy pipeline to run: it carries no push/path trigger of
+# any kind.
 #
 # Only secrets.VM_SSH_KEY is used here, purely to establish SSH transport.
 # No GHCR token, no Tor password secret, no notification secret (no Slack/
@@ -54,9 +54,26 @@ name: Tor Runtime Monitor
 # material) so a WARNING/CRITICAL verdict is visible in the Actions UI
 # without changing the underlying exit-code semantics (OK/WARNING still
 # exit 0, CRITICAL still exits 2).
+#
+# Phase 3.4I: activates unattended hourly execution via `schedule:`,
+# alongside (not instead of) `workflow_dispatch` for manual runs. Minute
+# 17 rather than minute 0 -- GitHub Actions' documented advice to avoid
+# scheduling at the top of the hour, when scheduled-workflow load across
+# all of GitHub peaks and cron-triggered runs are more likely to be
+# delayed. No runtime logic changed by this phase: evidence gathering,
+# classify_evidence(), WARNING/CRITICAL/OK behavior, SSH hardening,
+# timeout-minutes, and the final if: always() fallback step are all
+# exactly as Phase 3.4H left them. The existing fixed-group,
+# cancel-in-progress: false concurrency setting below already serializes
+# every run (manual or scheduled) through the same queue -- a scheduled
+# trigger while a previous run is still in flight waits rather than
+# running concurrently or being cancelled mid-SSH-session, so it was left
+# unchanged rather than weakened.
 # ============================================================================
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
@@ -137,8 +154,8 @@ jobs:
           # discipline as tor-dark-launch.yml). Never used to
           # fetch/reset/checkout/pull; a mismatch is reported, not
           # corrected.
-          EXPECTED_PRODUCTION_SHA="0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
-          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          EXPECTED_PRODUCTION_SHA="148bd362b37c82c92737382d181fbdeac4d2187b"
+          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:148bd362b37c82c92737382d181fbdeac4d2187b"
           EXPECTED_TOR_IMAGE="ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
           echo "===MONITOR_EVIDENCE_START==="
