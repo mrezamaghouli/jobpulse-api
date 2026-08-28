@@ -36,8 +36,8 @@ DOCKER_BUILD_PATH = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
 TOR_IMAGE_BUILD_PATH = REPO_ROOT / ".github" / "workflows" / "tor-image-build.yml"
 DEPLOY_PATH = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
-EXPECTED_PRODUCTION_SHA = "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
-EXPECTED_API_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+EXPECTED_PRODUCTION_SHA = "148bd362b37c82c92737382d181fbdeac4d2187b"
+EXPECTED_API_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-api:148bd362b37c82c92737382d181fbdeac4d2187b"
 EXPECTED_TOR_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -76,29 +76,24 @@ def test_workflow_file_exists_and_parses_as_yaml():
     assert data["name"] == "Tor Runtime Monitor"
 
 
-def test_workflow_is_workflow_dispatch_only():
+def test_workflow_dispatch_remains_enabled():
+    """Phase 3.4I adds `schedule:` alongside -- not instead of --
+    `workflow_dispatch`, so manual runs remain possible."""
     data = _load_workflow(WORKFLOW_PATH)
     on_block = _on_block(data)
-    assert on_block == {"workflow_dispatch": None}
+    assert "workflow_dispatch" in on_block
+    # No inputs were ever defined and none are added by this phase.
+    assert on_block["workflow_dispatch"] is None
 
 
-def test_workflow_source_has_no_other_trigger_keys():
-    """Checks executable YAML only -- the header comment intentionally
-    discusses `schedule:` in prose (explaining that Phase 3.4D does not
-    add one yet), which must not trip this guard."""
+def test_workflow_source_has_no_disallowed_trigger_keys():
+    """Checks executable YAML only. `schedule:` is now legitimate (Phase
+    3.4I); push/pull_request/workflow_run remain forbidden -- adding this
+    workflow must never be reachable from an ordinary push/PR/other
+    workflow completion."""
     code = _code_only(WORKFLOW_PATH.read_text())
-    for forbidden in ("push:", "pull_request:", "workflow_run:", "schedule:"):
+    for forbidden in ("push:", "pull_request:", "workflow_run:"):
         assert forbidden not in code, forbidden
-
-
-def test_no_schedule_activated_in_phase_3_4d():
-    """Explicit, separate guard beyond the generic trigger check: `cron:`
-    (schedule's only key) must not appear in executable YAML/code yet.
-    Checked via _code_only for the same reason as
-    test_workflow_source_has_no_other_trigger_keys -- prose discussing a
-    future `schedule:`/cron trigger is allowed in comments."""
-    code = _code_only(WORKFLOW_PATH.read_text())
-    assert "cron:" not in code
 
 
 def test_workflow_permissions_are_read_only():
@@ -287,9 +282,11 @@ def test_expected_tor_image_literal_is_exact():
 def test_reference_tor_restart_count_is_fixed_baseline_not_hard_requirement():
     source = WORKFLOW_PATH.read_text()
     assert 'REFERENCE_TOR_RESTART_COUNT="0"' in source
-    # Must never be a workflow_dispatch input (typo-safety discipline).
+    # Must never be a workflow_dispatch input (typo-safety discipline) --
+    # workflow_dispatch carries no `inputs:` block, regardless of whether
+    # `schedule:` is also present alongside it.
     data = _load_workflow(WORKFLOW_PATH)
-    assert _on_block(data) == {"workflow_dispatch": None}
+    assert _on_block(data)["workflow_dispatch"] is None
 
 
 def test_none_of_the_expected_constants_derived_from_github_sha():
@@ -742,18 +739,15 @@ def test_classify_function_body_contains_no_io_or_network_calls():
 
 # =====================================================================
 # Phase 3.4H -- unattended-run hardening: bounded execution time,
-# operator-visible WARNING/CRITICAL annotations, job summary. Trigger
-# remains workflow_dispatch-only; no schedule is added in this phase.
+# operator-visible WARNING/CRITICAL annotations, job summary. (Phase 3.4H
+# itself added no schedule; Phase 3.4I below activates one alongside
+# workflow_dispatch -- see that section for the current trigger shape.)
 # =====================================================================
-def test_workflow_still_workflow_dispatch_only_after_hardening():
+def test_workflow_dispatch_still_present_after_hardening():
     data = _load_workflow(WORKFLOW_PATH)
-    assert _on_block(data) == {"workflow_dispatch": None}
-
-
-def test_still_no_schedule_or_cron():
-    code = _code_only(WORKFLOW_PATH.read_text())
-    for forbidden in ("schedule:", "cron:"):
-        assert forbidden not in code, forbidden
+    on_block = _on_block(data)
+    assert "workflow_dispatch" in on_block
+    assert on_block["workflow_dispatch"] is None
 
 
 def test_monitor_job_has_five_minute_timeout():
@@ -853,11 +847,11 @@ def test_classify_evidence_output_still_piped_not_swallowed():
 # GITHUB_STEP_SUMMARY is just a local temp file the same way the real
 # runner provides one.
 # =====================================================================
-EVIDENCE_LINES_OK = """production_sha_expected=0b0290d5dedc9bfc9fba83a1a97f782a10890b06
-production_sha_actual=0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+EVIDENCE_LINES_OK = """production_sha_expected=148bd362b37c82c92737382d181fbdeac4d2187b
+production_sha_actual=148bd362b37c82c92737382d181fbdeac4d2187b
 production_sha_match=yes
-api_image_expected=ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06
-api_image_actual=ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06
+api_image_expected=ghcr.io/mrezamaghouli/jobpulse-api:148bd362b37c82c92737382d181fbdeac4d2187b
+api_image_actual=ghcr.io/mrezamaghouli/jobpulse-api:148bd362b37c82c92737382d181fbdeac4d2187b
 api_image_match=yes
 tor_container_present=yes
 tor_image_expected=ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0
@@ -1181,3 +1175,189 @@ def test_classify_step_critical_path_still_self_contained(tmp_path):
     assert "::error::" in stdout
     assert rc == 2
     assert "Verdict: CRITICAL" in summary
+
+
+# =====================================================================
+# Phase 3.4I -- schedule activation readiness: adds `schedule:` alongside
+# `workflow_dispatch` for unattended hourly execution. No runtime logic
+# (evidence gathering, classify_evidence(), SSH hardening, timeout,
+# final if: always() fallback, secrets, permissions, concurrency, image/
+# SHA pins) changes in this phase -- only the trigger block and its
+# surrounding comments.
+# =====================================================================
+def test_schedule_trigger_exists():
+    data = _load_workflow(WORKFLOW_PATH)
+    on_block = _on_block(data)
+    assert "schedule" in on_block
+
+
+def test_exactly_one_cron_entry():
+    data = _load_workflow(WORKFLOW_PATH)
+    on_block = _on_block(data)
+    assert isinstance(on_block["schedule"], list)
+    assert len(on_block["schedule"]) == 1
+
+
+def test_cron_is_exactly_17_past_every_hour():
+    data = _load_workflow(WORKFLOW_PATH)
+    on_block = _on_block(data)
+    assert on_block["schedule"][0] == {"cron": "17 * * * *"}
+
+
+def test_no_minute_zero_schedule():
+    """Guards against ever reverting to the documented GitHub Actions
+    high-load top-of-the-hour slot."""
+    source = WORKFLOW_PATH.read_text()
+    assert '"0 * * * *"' not in source
+    assert "'0 * * * *'" not in source
+
+
+def test_no_duplicate_schedule_trigger():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert code.count("- cron:") == 1
+
+
+def test_workflow_dispatch_and_schedule_both_present_no_other_triggers():
+    data = _load_workflow(WORKFLOW_PATH)
+    on_block = _on_block(data)
+    assert set(on_block.keys()) == {"workflow_dispatch", "schedule"}
+
+
+def test_timeout_minutes_unchanged_by_schedule_activation():
+    data = _load_workflow(WORKFLOW_PATH)
+    assert data["jobs"]["monitor"]["timeout-minutes"] == 5
+
+
+def test_stable_step_ids_unchanged_by_schedule_activation():
+    data = _load_workflow(WORKFLOW_PATH)
+    steps = data["jobs"]["monitor"]["steps"]
+    ids_by_name = {s["name"]: s.get("id") for s in steps}
+    assert ids_by_name["Validate secrets"] == "validate"
+    assert ids_by_name["Gather production runtime evidence (read-only)"] == "evidence"
+    assert ids_by_name["Classify evidence (deterministic, local -- no SSH, no Docker, no Tor)"] == "classify"
+
+
+def test_final_always_step_unchanged_by_schedule_activation():
+    data = _load_workflow(WORKFLOW_PATH)
+    steps = data["jobs"]["monitor"]["steps"]
+    final = steps[-1]
+    assert "Report execution status" in final["name"]
+    assert final.get("if") == "always()"
+
+
+def test_concurrency_unchanged_and_still_serializes_runs():
+    """The existing fixed-group, cancel-in-progress: false setting is
+    already correct for hourly scheduling: it was deliberately left
+    unchanged rather than weakened.
+
+    Actual GitHub Actions semantics (not an unlimited FIFO queue): with a
+    fixed, non-templated group name, at most one run in this group is
+    ever executing, and at most one additional run is held pending.
+    cancel-in-progress: false means a newly arriving run never cancels
+    the currently *running* one -- it never kills a run mid-SSH-session.
+    But if a run is already pending when yet another trigger arrives, the
+    newer pending run replaces the older pending one rather than joining
+    a queue behind it.
+
+    That "replace the stale pending run" behavior is what we actually
+    want here: this monitor reports on production's state *right now*,
+    not a durable log, so if multiple triggers stack up (e.g. several
+    manual dispatches during an incident), running the newest one instead
+    of a now-stale queued one is more useful, not less. No queue: max is
+    added -- a deeper backlog of pending runs would only mean acting on
+    older, less relevant evidence."""
+    data = _load_workflow(WORKFLOW_PATH)
+    assert data["concurrency"] == {
+        "group": "jobpulse-tor-runtime-monitor",
+        "cancel-in-progress": False,
+    }
+    # A dynamic/templated group (e.g. including github.run_id) would
+    # defeat serialization -- guard against that regression explicitly.
+    assert "${{" not in data["concurrency"]["group"]
+
+
+def test_no_additional_secrets_from_schedule_activation():
+    secrets = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", WORKFLOW_PATH.read_text()))
+    assert secrets == {"VM_SSH_KEY"}
+
+
+def test_no_new_permissions_from_schedule_activation():
+    data = _load_workflow(WORKFLOW_PATH)
+    assert data["permissions"] == {"contents": "read"}
+
+
+def test_expected_constants_unchanged_by_schedule_activation():
+    source = WORKFLOW_PATH.read_text()
+    assert f'EXPECTED_PRODUCTION_SHA="{EXPECTED_PRODUCTION_SHA}"' in source
+    assert f'EXPECTED_API_IMAGE="{EXPECTED_API_IMAGE}"' in source
+    assert f'EXPECTED_TOR_IMAGE="{EXPECTED_TOR_IMAGE}"' in source
+
+
+def test_warning_critical_ok_exit_codes_unchanged_by_schedule_activation(tmp_path):
+    """Re-proves the exit-code contract end-to-end (real bash execution,
+    not just static text) after the trigger-block edit, guarding against
+    any accidental collateral change to the classify step."""
+    ok_stdout, ok_rc, _ = _run_classify_step(tmp_path, EVIDENCE_LINES_OK)
+    assert "monitor_status=OK" in ok_stdout
+    assert ok_rc == 0
+
+    warning_evidence = EVIDENCE_LINES_OK.replace("tor_restart_count=0", "tor_restart_count=1")
+    warning_stdout, warning_rc, _ = _run_classify_step(tmp_path, warning_evidence)
+    assert "monitor_status=WARNING" in warning_stdout
+    assert warning_rc == 0
+
+    critical_evidence = EVIDENCE_LINES_OK.replace("tor_status=running", "tor_status=exited")
+    critical_stdout, critical_rc, _ = _run_classify_step(tmp_path, critical_evidence)
+    assert "monitor_status=CRITICAL" in critical_stdout
+    assert critical_rc == 2
+
+
+def test_still_no_continue_on_error_after_schedule_activation():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "continue-on-error" not in code
+
+
+def test_still_no_tor_operation_after_schedule_activation():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("ControlPort", "SOCKS", "9050", "9051", "AUTHENTICATE",
+                       "SETEVENTS", "NEWNYM", "request_new_identity", "docker logs"):
+        assert forbidden not in code, forbidden
+
+
+def test_still_no_linkedin_or_external_url_after_schedule_activation():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    assert "linkedin" not in code.lower()
+    urls = re.findall(r"https?://[^\s'\"]+", code)
+    for url in urls:
+        assert url.startswith("http://127.0.0.1"), url
+
+
+def test_still_no_mutation_or_remediation_commands_after_schedule_activation():
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in FORBIDDEN_MUTATION_COMMANDS:
+        assert forbidden not in code, forbidden
+
+
+def test_scheduled_runs_share_the_same_single_job_as_manual_runs():
+    """Guards against a second, schedule-specific job or code path: there
+    must be exactly one job (`monitor`), and nothing in the workflow
+    branches on `github.event_name`/`github.event.schedule` to give a
+    scheduled run different evidence-gathering or classification logic
+    than a workflow_dispatch run."""
+    data = _load_workflow(WORKFLOW_PATH)
+    assert list(data["jobs"].keys()) == ["monitor"]
+    source = WORKFLOW_PATH.read_text()
+    assert "github.event_name" not in source
+    assert "github.event.schedule" not in source
+
+
+def test_build_and_tor_image_paths_still_do_not_match_after_schedule_activation():
+    """Re-audits both build workflows against the current, unchanged
+    Phase 3.4D file scope -- adding `schedule:` to tor-runtime-monitor.yml
+    itself doesn't add a new file to that scope, so this is a stability
+    guard, not a new path-filter claim."""
+    for build_path in (DOCKER_BUILD_PATH, TOR_IMAGE_BUILD_PATH):
+        patterns = _push_paths(build_path)
+        for changed_file in PHASE_3_4D_CHANGED_FILES:
+            for pattern in patterns:
+                assert not _path_matches_filter(changed_file, pattern), (changed_file, pattern)
