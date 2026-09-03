@@ -11,6 +11,8 @@ from psycopg2.extras import RealDictCursor
 
 from app.config import get_postgres_config
 from scripts.linkedin_auth_preflight import preflight_linkedin_auth
+from scripts.search_transport.metrics import record_metric
+from scripts.search_transport.retry_policy import decide_retry
 from scripts import linkedin_plan_collect as lpc
 from scripts.process_summary import (
     RESULT_PATH_ENV_VAR as PROCESS_SUMMARY_RESULT_PATH_ENV_VAR,
@@ -85,17 +87,66 @@ def mark_targets(ids, status, error=None):
                 )
 
             elif status == "failed":
+                # Per-task retry budget (Phase 3.4K, Section 8): fail_count
+                # BEFORE this failure is what decide_retry() needs, so it is
+                # read first, per row, rather than folded into one blind
+                # bulk UPDATE -- a row that has already exhausted its
+                # budget moves to the TERMINAL 'failed' status instead of
+                # being requeued to 'pending' again, closing the
+                # previously-unbounded retry loop. decide_retry() is the
+                # single source of truth for this threshold; this function
+                # never reimplements the comparison itself.
                 cur.execute(
-                    """
-                    UPDATE job_search_demand_queue
-                    SET status = 'pending',
-                        locked_at = NULL,
-                        fail_count = fail_count + 1,
-                        last_error = %s
-                    WHERE id = ANY(%s);
-                    """,
-                    (str(error or "unknown error")[:1000], ids),
+                    "SELECT id, fail_count FROM job_search_demand_queue WHERE id = ANY(%s);",
+                    (ids,),
                 )
+                fail_counts_by_id = {row[0]: row[1] or 0 for row in cur.fetchall()}
+
+                requeue_ids = []
+                exhausted_ids = []
+
+                for task_id in ids:
+                    decision = decide_retry(fail_counts_by_id.get(task_id, 0))
+
+                    if decision.exhausted:
+                        exhausted_ids.append(task_id)
+                    else:
+                        requeue_ids.append(task_id)
+
+                    record_metric(
+                        "search_demand_queue_retry",
+                        queue_status=decision.next_status,
+                        fail_count=decision.attempts_used,
+                        max_attempts=decision.max_attempts,
+                    )
+
+                error_text = str(error or "unknown error")[:1000]
+
+                if requeue_ids:
+                    cur.execute(
+                        """
+                        UPDATE job_search_demand_queue
+                        SET status = 'pending',
+                            locked_at = NULL,
+                            fail_count = fail_count + 1,
+                            last_error = %s
+                        WHERE id = ANY(%s);
+                        """,
+                        (error_text, requeue_ids),
+                    )
+
+                if exhausted_ids:
+                    cur.execute(
+                        """
+                        UPDATE job_search_demand_queue
+                        SET status = 'failed',
+                            locked_at = NULL,
+                            fail_count = fail_count + 1,
+                            last_error = %s
+                        WHERE id = ANY(%s);
+                        """,
+                        (error_text, exhausted_ids),
+                    )
 
         conn.commit()
 

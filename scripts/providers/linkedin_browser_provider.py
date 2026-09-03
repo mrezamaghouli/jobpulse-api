@@ -7,10 +7,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import psycopg2
-from playwright.sync_api import (
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
+from playwright.sync_api import sync_playwright
 
 from app.config import (
 
@@ -21,7 +18,9 @@ from app.config import (
     get_linkedin_location,
     get_postgres_config,
 )
-from scripts.tor.tor_client import get_proxy_config
+from scripts.search_transport.classifier import CATEGORY_NETWORK_FAILURE, CATEGORY_SUCCESS
+from scripts.search_transport.executor import RequestExecutor
+from scripts.search_transport.transport import get_search_transport
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -104,6 +103,16 @@ class LinkedInBrowserProvider:
                 "Run scripts/linkedin_save_session_from_browser.py first."
             )
 
+        # Resolved once per collector subprocess, before anything network-
+        # related happens. A proxy-unavailable transport raises here and
+        # propagates uncaught -- there is no except-and-fall-back-to-direct
+        # anywhere in this provider (see scripts/search_transport/transport.py).
+        self.transport = get_search_transport()
+        self.executor = RequestExecutor(self.transport)
+
+        if self.transport.mode != "direct":
+            print(f"Search transport mode: {self.transport.mode}")
+
         OUTPUT_DIR.mkdir(exist_ok=True)
 
         search_url = self.build_jobs_search_url(
@@ -139,9 +148,7 @@ class LinkedInBrowserProvider:
             print(f"Current URL: {current_url}")
 
             if "/login" in current_url or "checkpoint" in current_url:
-                print("\nLinkedIn asked for login/checkpoint.")
-                print("Complete it manually in the opened browser window.")
-                input("Press ENTER after the jobs page is visible... ")
+                self._handle_login_or_checkpoint(current_url)
 
             raw_jobs = self.extract_jobs_from_page(page, self.limit)
 
@@ -172,6 +179,46 @@ class LinkedInBrowserProvider:
 
             return normalized_jobs
 
+    def _handle_login_or_checkpoint(self, current_url: str) -> None:
+        """LinkedIn served a login page or checkpoint/captcha instead of
+        the jobs search results. Unattended (the default, and the ONLY
+        mode used by the automated queue path -- see
+        scripts/process_search_demand_queue.py -> linkedin_plan_collect ->
+        collector_postgres): raises immediately as a structured failure.
+        collector_postgres.collect_jobs_to_postgres() catches this
+        exception around provider.fetch_jobs() and turns it into
+        OUTCOME_FAILED_FETCH / ERROR_CATEGORY_FETCH, which
+        linkedin_plan_collect.classify_query_result() and
+        scripts/process_search_demand_queue.py's bounded retry budget
+        (see scripts/search_transport/retry_policy.py) already handle end
+        to end -- this never blocks the collection cycle waiting for
+        terminal input that will never arrive in a queue-driven run.
+
+        Setting LINKEDIN_INTERACTIVE_AUTH_RECOVERY=true preserves the
+        original interactive prompt for an explicitly-invoked, local,
+        human-attended session-recovery workflow (e.g. an operator running
+        this provider directly to refresh
+        .auth/linkedin_storage_state.json) -- never set for the automated
+        queue path.
+        """
+        interactive = os.getenv("LINKEDIN_INTERACTIVE_AUTH_RECOVERY", "false").lower() in (
+            "1", "true", "yes", "on",
+        )
+
+        print("\nLinkedIn asked for login/checkpoint.")
+
+        if interactive:
+            print("Complete it manually in the opened browser window.")
+            input("Press ENTER after the jobs page is visible... ")
+            return
+
+        raise RuntimeError(
+            "LinkedIn login/checkpoint encountered in unattended mode "
+            f"(url={current_url!r}). Refresh {AUTH_FILE} using an explicit, "
+            "interactive session-recovery run (LINKEDIN_INTERACTIVE_AUTH_RECOVERY=true) "
+            "before retrying the automated queue."
+        )
+
     def launch_browser(self, playwright):
         supported_channels = {
             "chrome": "chrome",
@@ -183,10 +230,10 @@ class LinkedInBrowserProvider:
 
         print(f"Launching browser channel: {channel}")
 
-        proxy_config = get_proxy_config()
+        proxy_config = self.transport.playwright_proxy_config
 
         if proxy_config:
-            print(f"Routing through Tor proxy: {proxy_config['server']}")
+            print(f"Routing through proxy transport: {proxy_config['server']}")
 
         return playwright.chromium.launch(
             channel=channel,
@@ -231,21 +278,24 @@ class LinkedInBrowserProvider:
         return f"https://www.linkedin.com/jobs/search/?{urlencode(query_params)}"
 
     def open_search_page(self, page, search_url: str):
-        page.set_default_timeout(30000)
-        page.set_default_navigation_timeout(120000)
+        # connect_timeout_ms / read_timeout_ms come from the resolved
+        # SearchTransport -- direct mode's defaults reproduce the 30000/
+        # 120000 values this method hardcoded before Phase 3.4K exactly;
+        # proxy mode uses wider, separately-tuned values (Tor's higher
+        # latency/variance must not be misclassified as a LinkedIn block).
+        page.set_default_timeout(self.transport.read_timeout_ms)
+        page.set_default_navigation_timeout(self.transport.connect_timeout_ms)
 
-        try:
-            page.goto(
-                search_url,
-                wait_until="commit",
-                timeout=120000,
-            )
+        result = self.executor.navigate(
+            page, search_url, auth_check_fn=self._is_login_wall,
+        )
 
+        if not self._is_hard_navigation_failure(result):
             page.wait_for_timeout(5000)
             return
 
-        except PlaywrightTimeoutError as error:
-            print(f"LinkedIn navigation timeout: {error}")
+        if result.category == CATEGORY_NETWORK_FAILURE and result.reason_code == "timeout":
+            print(f"LinkedIn navigation timeout (category={result.category})")
             print("Trying to continue with the current page state...")
 
             current_url = page.url or ""
@@ -256,13 +306,45 @@ class LinkedInBrowserProvider:
 
             print("Retrying LinkedIn search page once...")
 
-            page.goto(
-                search_url,
-                wait_until="commit",
-                timeout=120000,
+            result = self.executor.navigate(
+                page, search_url, auth_check_fn=self._is_login_wall,
             )
 
-            page.wait_for_timeout(5000)
+            if not self._is_hard_navigation_failure(result):
+                page.wait_for_timeout(5000)
+                return
+
+        raise RuntimeError(
+            f"LinkedIn search page navigation failed: category={result.category} "
+            f"reason={result.reason_code}"
+        )
+
+    def _is_login_wall(self, page) -> bool:
+        return detect_linkedin_auth_state(page) != "probably_authenticated"
+
+    def _is_hard_navigation_failure(self, result) -> bool:
+        """A DOM-only auth-challenge heuristic (detect_linkedin_auth_state)
+        checked immediately after wait_until="commit" -- before this heavy
+        client-rendered SPA has hydrated -- is not reliable enough to abort
+        the run on: a false positive here would be a new failure mode this
+        phase must not introduce into the default (direct) production
+        path. Only a LITERAL 403/429 status, or a genuine (non-timeout)
+        network failure, is treated as a hard failure; a DOM-heuristic-only
+        AUTH_CHALLENGE on a 2xx/3xx response is still classified and metered
+        (for observability) but does not abort -- the checkpoint-handling
+        logic later in fetch_jobs() (_handle_login_or_checkpoint()) remains
+        the actual handler for that case. Note that handler's own behavior
+        is unattended by default as of this phase (raises rather than
+        blocking on input()) -- see _handle_login_or_checkpoint()'s
+        docstring; only its role as "the thing that handles a login wall
+        here" is unchanged, not its unattended-vs-interactive behavior."""
+        if result.category == CATEGORY_SUCCESS:
+            return False
+
+        if result.category == CATEGORY_NETWORK_FAILURE:
+            return True
+
+        return result.status_code in (403, 429)
 
     def should_skip_existing_enriched_jobs(self) -> bool:
         value = os.getenv("LINKEDIN_SKIP_EXISTING_ENRICHED", "true")

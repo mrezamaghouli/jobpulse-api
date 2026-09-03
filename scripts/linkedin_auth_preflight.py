@@ -1,7 +1,27 @@
+"""LinkedIn auth preflight (Phase 3.4K, Section 6).
+
+Transport parity with real collection: this module resolves its proxy
+argument, connect timeout, and read timeout from EXACTLY the same
+scripts.search_transport.transport.get_search_transport() the actual
+collector (scripts/providers/linkedin_browser_provider.py) uses -- never
+the legacy scripts/tor/tor_client.py path, which reads the pre-existing
+Tor-infra-is-live flag directly (see app/config.py::get_tor_enabled(),
+never referenced by this module or by get_search_transport()) and could
+therefore silently select a different network transport than the
+collection run this preflight is meant to validate.
+This module contains no ControlPort logic and never requests a circuit
+change -- no collection-runtime code does (see
+scripts/search_transport/executor.py's module docstring); it is a
+read-only auth check, nothing more. A proxy transport that is configured
+but unreachable fails this preflight closed
+(ProxyTransportUnavailableError propagates into the same
+LINKEDIN_AUTH_PREFLIGHT_FAILED SystemExit as any other failure below) --
+there is no fallback to direct traffic anywhere in this module.
+"""
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from scripts.providers.linkedin_browser_provider import assert_linkedin_authenticated
-from scripts.tor.tor_client import get_proxy_config
+from scripts.search_transport.transport import get_search_transport
 
 
 def preflight_linkedin_auth():
@@ -23,18 +43,25 @@ def preflight_linkedin_auth():
     print("Running LinkedIn auth preflight check...")
 
     try:
+        transport = get_search_transport()
+
+        if transport.mode != "direct":
+            print(f"Auth preflight transport mode: {transport.mode}")
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
                 channel=os.getenv("LINKEDIN_BROWSER_CHANNEL", "chrome"),
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
-                proxy=get_proxy_config(),
+                proxy=transport.playwright_proxy_config,
             )
 
             context = browser.new_context(storage_state=state_path)
             page = context.new_page()
+            page.set_default_timeout(transport.read_timeout_ms)
+            page.set_default_navigation_timeout(transport.connect_timeout_ms)
 
-            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
+            page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
             assert_linkedin_authenticated(page, stage="process_search_demand_queue_preflight")

@@ -627,6 +627,7 @@ _ALLOWED_TOR_ENABLED_SETTERS = {
     ".github/scripts/tor/provision_production_secret.sh",  # Phase 3.1: read-only pre/post invariant check (must equal 'false'), invoked only by the workflow_dispatch-only tor-secret-provision.yml, never dispatched by this task
     ".github/workflows/production-runtime-diagnostic.yml",  # Phase 3.4A: single read-only `docker exec ... printenv TOR_ENABLED` evidence check, invoked only by the workflow_dispatch-only production-runtime-diagnostic.yml, never dispatched by this task
     ".github/workflows/tor-runtime-monitor.yml",  # Phase 3.4D: single read-only `docker exec ... printenv TOR_ENABLED` evidence check feeding the classify_evidence severity model, invoked only by the workflow_dispatch-only tor-runtime-monitor.yml, never dispatched by this task
+    "scripts/search_transport/transport.py",  # Phase 3.4K: docstring/error-message text only, explaining why SEARCH_TRANSPORT=proxy is deliberately NOT gated by TOR_ENABLED (get_tor_enabled() is never called here) -- this file is itself the proof that the invariant this test enforces was upheld, not violated
 }
 
 

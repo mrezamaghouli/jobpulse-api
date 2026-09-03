@@ -8,7 +8,11 @@ import time
 import hashlib
 import psycopg2
 
-from app.config import get_postgres_config
+from app.config import (
+    get_linkedin_plan_collect_query_kill_after_seconds,
+    get_linkedin_plan_collect_query_timeout_seconds,
+    get_postgres_config,
+)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -500,8 +504,24 @@ def run_single_query(query: dict, index: int, total: int) -> dict:
         env[RESULT_PATH_ENV_VAR] = str(result_path)
 
         try:
+            # Bounded by scripts.run_with_deadline (Phase 3.4K
+            # Stabilization, Section 7): a wedged collector_postgres
+            # subprocess is SIGTERM'd/SIGKILL'd on its own, per-query
+            # deadline instead of being able to silently consume the
+            # entire outer step budget (see
+            # scripts/run_collection_cycle_safe.sh's STEP_TIMEOUT_SECONDS)
+            # and abort every other query in this batch along with it. A
+            # deadline expiry surfaces as a non-zero returncode, which
+            # classify_query_result() below already treats as an ordinary
+            # query failure -- no new failure contract needed.
             process = subprocess.run(
-                [sys.executable, "-m", "scripts.collector_postgres"],
+                [
+                    sys.executable, "-m", "scripts.run_with_deadline",
+                    "--seconds", str(get_linkedin_plan_collect_query_timeout_seconds()),
+                    "--kill-after", str(get_linkedin_plan_collect_query_kill_after_seconds()),
+                    "--",
+                    sys.executable, "-m", "scripts.collector_postgres",
+                ],
                 cwd=str(BASE_DIR),
                 env=env,
                 text=True,
