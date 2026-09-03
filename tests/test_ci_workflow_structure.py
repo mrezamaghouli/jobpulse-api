@@ -209,59 +209,108 @@ def test_deploy_job_condition_mentions_dispatch_and_successful_main_push_build(d
     )
 
 
-def _condition_as_python(condition: str) -> str:
+# --- Deploy workflow: automatic deploy gated behind a repository variable
+#
+# A successful main-push image build previously deployed production
+# automatically and unconditionally. That coupling made it impossible to
+# merge a PR to main without also deploying it. The deploy job's `if:`
+# now additionally requires `vars.PRODUCTION_AUTO_DEPLOY_ENABLED == 'true'`
+# on the workflow_run (automatic) branch of the condition only --
+# workflow_dispatch (manual deploy) is untouched and remains available
+# regardless of this variable's value.
+
+
+def test_deploy_job_condition_requires_auto_deploy_variable_on_automatic_path(deploy_workflow):
+    condition = deploy_workflow["jobs"]["deploy"].get("if", "")
+    assert "vars.PRODUCTION_AUTO_DEPLOY_ENABLED" in condition
+    assert "vars.PRODUCTION_AUTO_DEPLOY_ENABLED == 'true'" in condition, (
+        "the automatic-deploy gate must be an exact 'true' string comparison -- "
+        "an unset repository variable evaluates to an empty string in GitHub "
+        "Actions expressions, which must never accidentally equal 'true'"
+    )
+
+
+def _condition_as_python(condition: str, auto_deploy_var=None) -> str:
     """Translate the small subset of GitHub Actions expression syntax
     used by the deploy job's `if:` into an evaluable Python expression,
     so the actual condition string (not a hand-copied stand-in) is what
-    gets exercised below."""
+    gets exercised below. `vars.X` evaluates to an empty string in real
+    GitHub Actions when the variable is unset -- auto_deploy_var=None is
+    translated the same way here, via `vars_ctx.get(..., '')`."""
     py = condition
     py = py.replace("github.event.workflow_run.conclusion", "event['workflow_run']['conclusion']")
     py = py.replace("github.event.workflow_run.head_branch", "event['workflow_run']['head_branch']")
     py = py.replace("github.event.workflow_run.event", "event['workflow_run']['event']")
     py = py.replace("github.event_name", "github['event_name']")
+    py = py.replace(
+        "vars.PRODUCTION_AUTO_DEPLOY_ENABLED",
+        "vars_ctx.get('PRODUCTION_AUTO_DEPLOY_ENABLED', '')",
+    )
     py = py.replace("||", " or ")
     py = py.replace("&&", " and ")
     return py
 
 
 @pytest.mark.parametrize(
-    "event_name,conclusion,head_branch,wr_event,should_deploy,case_id",
+    "event_name,conclusion,head_branch,wr_event,auto_deploy_var,should_deploy,case_id",
     [
-        ("workflow_dispatch", None, None, None, True, "deploy-workflow_dispatch"),
-        ("workflow_run", "success", "main", "push", True, "success-push-main"),
-        ("workflow_run", "failure", "main", "push", False, "failure-push-main"),
-        ("workflow_run", "cancelled", "main", "push", False, "cancelled-push-main"),
-        ("workflow_run", "skipped", "main", "push", False, "skipped-push-main"),
-        ("workflow_run", "success", "feature-branch", "push", False, "success-push-feature"),
-        ("workflow_run", "success", "main", "workflow_dispatch", False, "success-dispatch-main"),
-        ("workflow_run", "success", "feature-branch", "workflow_dispatch", False, "success-dispatch-feature"),
-        ("push", None, None, None, False, "unrelated-push-event"),
+        # workflow_dispatch must deploy regardless of the auto-deploy variable.
+        ("workflow_dispatch", None, None, None, None, True, "dispatch-var-unset"),
+        ("workflow_dispatch", None, None, None, "false", True, "dispatch-var-false"),
+        ("workflow_dispatch", None, None, None, "true", True, "dispatch-var-true"),
+        # workflow_run (automatic) requires the variable to be exactly 'true',
+        # in addition to every pre-existing condition.
+        ("workflow_run", "success", "main", "push", "true", True, "success-push-main-var-true"),
+        ("workflow_run", "success", "main", "push", None, False, "success-push-main-var-unset"),
+        ("workflow_run", "success", "main", "push", "false", False, "success-push-main-var-false"),
+        ("workflow_run", "success", "main", "push", "TRUE", False, "success-push-main-var-wrong-case"),
+        ("workflow_run", "success", "main", "push", "1", False, "success-push-main-var-truthy-not-true"),
+        # the variable alone is not sufficient -- every other existing gate
+        # must still independently hold.
+        ("workflow_run", "failure", "main", "push", "true", False, "failure-push-main-var-true"),
+        ("workflow_run", "cancelled", "main", "push", "true", False, "cancelled-push-main-var-true"),
+        ("workflow_run", "skipped", "main", "push", "true", False, "skipped-push-main-var-true"),
+        ("workflow_run", "success", "feature-branch", "push", "true", False, "success-push-feature-var-true"),
+        ("workflow_run", "success", "main", "workflow_dispatch", "true", False, "success-dispatch-main-var-true"),
+        (
+            "workflow_run", "success", "feature-branch", "workflow_dispatch", "true", False,
+            "success-dispatch-feature-var-true",
+        ),
+        ("push", None, None, None, "true", False, "unrelated-push-event-var-true"),
     ],
     ids=[
-        "deploy-workflow_dispatch",
-        "success-push-main",
-        "failure-push-main",
-        "cancelled-push-main",
-        "skipped-push-main",
-        "success-push-feature",
-        "success-dispatch-main",
-        "success-dispatch-feature",
-        "unrelated-push-event",
+        "dispatch-var-unset",
+        "dispatch-var-false",
+        "dispatch-var-true",
+        "success-push-main-var-true",
+        "success-push-main-var-unset",
+        "success-push-main-var-false",
+        "success-push-main-var-wrong-case",
+        "success-push-main-var-truthy-not-true",
+        "failure-push-main-var-true",
+        "cancelled-push-main-var-true",
+        "skipped-push-main-var-true",
+        "success-push-feature-var-true",
+        "success-dispatch-main-var-true",
+        "success-dispatch-feature-var-true",
+        "unrelated-push-event-var-true",
     ],
 )
-def test_deploy_condition_only_fires_on_dispatch_or_successful_main_push_build(
-    deploy_workflow, event_name, conclusion, head_branch, wr_event, should_deploy, case_id
+def test_deploy_condition_only_fires_on_dispatch_or_gated_successful_main_push_build(
+    deploy_workflow, event_name, conclusion, head_branch, wr_event, auto_deploy_var, should_deploy, case_id
 ):
     condition = deploy_workflow["jobs"]["deploy"]["if"]
     py_expr = _condition_as_python(condition)
 
     github = {"event_name": event_name}
     event = {"workflow_run": {"conclusion": conclusion, "head_branch": head_branch, "event": wr_event}}
+    vars_ctx = {} if auto_deploy_var is None else {"PRODUCTION_AUTO_DEPLOY_ENABLED": auto_deploy_var}
 
-    result = eval(py_expr, {"__builtins__": {}}, {"github": github, "event": event})
+    result = eval(py_expr, {"__builtins__": {}}, {"github": github, "event": event, "vars_ctx": vars_ctx})
     assert result is should_deploy, (
         f"[{case_id}] event_name={event_name!r} conclusion={conclusion!r} "
-        f"head_branch={head_branch!r} workflow_run.event={wr_event!r}: "
+        f"head_branch={head_branch!r} workflow_run.event={wr_event!r} "
+        f"auto_deploy_var={auto_deploy_var!r}: "
         f"expected should_deploy={should_deploy}, condition evaluated to {result!r}"
     )
 

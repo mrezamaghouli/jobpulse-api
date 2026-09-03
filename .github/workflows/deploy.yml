@@ -16,11 +16,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Automatic-deploy gate: a successful "Build JobPulse API Image" run
+  # (workflow_run) deploys production ONLY when the repository variable
+  # PRODUCTION_AUTO_DEPLOY_ENABLED is exactly the string "true". Unset,
+  # empty, or any other value (including "false") disables the automatic
+  # path -- vars.* evaluates to an empty string when the variable does
+  # not exist, so an unset variable can never accidentally satisfy this
+  # comparison. workflow_dispatch is a separate, always-available manual
+  # path and is NOT affected by this variable: it is checked first via
+  # `||`, short-circuiting before the automatic-deploy branch (and its
+  # PRODUCTION_AUTO_DEPLOY_ENABLED check) is ever evaluated. This lets a
+  # PR merge to main -- and its image build -- happen without
+  # automatically deploying production, while leaving an explicit,
+  # human-triggered "Run workflow" deploy always available regardless of
+  # this variable's value. Set PRODUCTION_AUTO_DEPLOY_ENABLED=true in the
+  # repository's Settings -> Secrets and variables -> Actions -> Variables
+  # to re-enable the automatic path once merges are ready to deploy again.
   deploy:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'workflow_run' &&
+        vars.PRODUCTION_AUTO_DEPLOY_ENABLED == 'true' &&
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_branch == 'main' &&
         github.event.workflow_run.event == 'push'
