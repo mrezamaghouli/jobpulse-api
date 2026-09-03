@@ -1433,7 +1433,26 @@ Push to main (paths: Dockerfile, requirements*.txt, app/**, scripts/**, config/*
 deployment fires only from a `workflow_run` completion of "Build JobPulse
 API Image" that was itself triggered by a `push` to `main` and completed
 with `conclusion == 'success'`; a failed, cancelled, or skipped build never
-triggers a deploy. This was fixed because the old direct `push` trigger on
+triggers a deploy.
+
+Automatic deploys additionally require the repository variable
+`PRODUCTION_AUTO_DEPLOY_ENABLED` to be exactly `true` (Settings -> Secrets
+and variables -> Actions -> Variables). Unset, or set to anything other
+than `true` (including `false`), disables the automatic path: a successful
+main-push image build still runs, publishes `:main` and the commit-SHA
+image tags, but does NOT deploy production. This separates "merge to
+main" from "deploy to production" -- a PR can be merged and its image
+built without automatically pushing that build to the VM.
+`workflow_dispatch` (manual deploy, described below) is entirely
+unaffected by this variable and remains available at any time.
+
+    successful main-push image build
+    + PRODUCTION_AUTO_DEPLOY_ENABLED=true  -> automatic deploy runs
+    successful main-push image build
+    + (unset, or any other value)          -> NO automatic deploy
+    workflow_dispatch                      -> deploy runs regardless
+
+This was fixed because the old direct `push` trigger on
 `frontend/**`/`docs/**`/etc. could race the `workflow_run` deploy when a
 single commit touched both an API-build path and a push-trigger path,
 enqueueing two automatic production deploys for one push
