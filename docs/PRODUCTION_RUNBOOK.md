@@ -1654,3 +1654,222 @@ that does have one: the response must be a JSON object containing
 whether any row actually matches. Authentication and HTTP-status
 expectations for every check are unchanged by this.
 
+## Phase 3.4L: Isolated Neutral Search-Transport Canary
+
+Standalone, one-shot health check for the Phase 3.4K `SEARCH_TRANSPORT`
+proxy path (`scripts/search_transport/`). It is a **separate sibling**
+service to `tor-diagnostic` (`docker-compose.prod.tor.yml`), not an
+extension of it -- `tor-diagnostic` carries PostgreSQL config,
+ControlPort config, the `TOR_CONTROL_PASSWORD_FILE` secret mount, and
+Phase 2 bootstrap-persistence behavior that this canary has no reason to
+depend on. The canary (`scripts/search_transport/canary.py`, run as
+Compose service `search-transport-canary`) is SOCKS-only,
+database-free, ControlPort-free, secret-free, collector-free, and
+session-free.
+
+**What it proves, and what it does not prove:** this command proves that
+
+```
+search-transport-canary -> SearchTransport proxy configuration -> tor:9050 -> neutral Tor-check endpoint
+```
+
+works end-to-end, using the exact same `get_search_transport()`
+selector production collection code would use (the canary never forces
+`mode="proxy"` in code -- the Compose service's `SEARCH_TRANSPORT=proxy`
+environment variable does that, the same way production would). It does
+**NOT** prove the live `jobpulse-api-prod` container is using proxy
+transport -- that is a separate, unrelated fact governed entirely by
+`SEARCH_TRANSPORT` on the `api` service, which this procedure never
+touches.
+
+**Do NOT set `SEARCH_TRANSPORT=proxy` on `jobpulse-api-prod` as part of
+this procedure.** Running this canary is a read-only-to-production,
+isolated verification step; it never modifies the `api` service's
+configuration or restarts it.
+
+### Prerequisites
+
+- The `tor` service (`docker-compose.prod.tor.yml`) is already running
+  and healthy (`docker compose ... ps tor` shows `healthy`) -- verify
+  this explicitly and read-only, e.g. `docker compose -f
+  docker-compose.prod.yml -f docker-compose.prod.tor.yml ps tor`,
+  BEFORE running the canary. Do not rely on the canary invocation itself
+  to start/recreate/restart Tor (see "Do not let the canary start Tor"
+  below).
+- `JOBPULSE_TOR_IMAGE` is set to the correct, pinned production Tor
+  image (same requirement as `tor-diagnostic`).
+- `JOBPULSE_API_IMAGE` **must** be set to an immutable, reviewed
+  commit-SHA image for a real verification run -- e.g.
+  `ghcr.io/mrezamaghouli/jobpulse-api:<40-char-commit-or-merge-sha>` of
+  the commit that actually contains the reviewed Phase 3.4L canary
+  implementation. The Compose file's fallback default
+  (`ghcr.io/mrezamaghouli/jobpulse-api:main`) is a *mutable* tag that can
+  point at a different image tomorrow than it does today -- acceptable
+  for local `docker compose config` validation (as this phase's tests
+  do), but not for a real canary run whose result an operator will rely
+  on. Do not leave `JOBPULSE_API_IMAGE` unset/on `:main` for a real
+  production verification. (No specific commit SHA is documented here
+  yet, since the reviewed Phase 3.4L commit does not exist until this
+  branch is actually merged.)
+- `TOR_IP_CHECK_URL`, if overridden, must be: neutral, non-LinkedIn,
+  HTTP/HTTPS, AND return a JSON object shaped like the Tor Project's own
+  check endpoint -- `{"IsTor": <bool>, "IP": "<address>"}`. The canary's
+  response parser (`scripts/search_transport/canary.py::
+  parse_neutral_tor_response`) is written specifically against that
+  schema: it validates and rejects `linkedin.com`/any `*.linkedin.com`
+  subdomain target *before* making any request (fails closed on an
+  unsafe target), but a *schema-incompatible* neutral endpoint (valid,
+  safe, reachable, yet not shaped like `{IsTor, IP}`) will correctly fail
+  Tor-route verification (exit `5`) rather than silently reporting
+  success -- that is expected, working behavior, not a bug to route
+  around with a different endpoint shape.
+
+### Do not let the canary start Tor
+
+`search-transport-canary` declares `depends_on: {tor: {condition:
+service_healthy}}` so that `docker compose config`/tooling can express
+the real dependency, but depending on the Compose CLI/version in use,
+`docker compose run` MAY attempt to start a stopped `tor` dependency
+rather than simply waiting on an already-running one. For production
+verification we explicitly do NOT want the canary run to be the thing
+that starts/recreates/restarts Tor -- Tor's own lifecycle must stay
+governed by its own separate, deliberate `up -d tor` step. Pass
+`--no-deps` (supported by Docker Compose v2, the CLI this project's
+other `docker compose` commands already assume) so `run` never starts or
+touches the `tor` service on its own:
+
+```
+docker compose \
+  -f docker-compose.prod.yml \
+  -f docker-compose.prod.tor.yml \
+  --profile tor-ops \
+  run --rm --no-deps search-transport-canary
+```
+
+With `--no-deps`, if `tor` is absent or unreachable, `SearchTransport`
+fails closed: `get_search_transport()`'s own SOCKS-port TCP probe raises
+`ProxyTransportUnavailableError`, and the canary reports `"ok": false`
+with `failure_category: "PROXY_UNAVAILABLE"` / exit code `3` -- it never
+silently falls back to direct transport, and it never starts Tor itself
+to "fix" the situation.
+
+**Not run by this task** -- this is documentation of the future
+operator procedure only.
+
+### Process-wide deadline
+
+The Compose command wraps the canary in the repository's existing
+in-container deadline runner, `scripts/run_with_deadline.py`:
+
+```
+python -m scripts.run_with_deadline --seconds 60 --kill-after 5 -- \
+  python -m scripts.search_transport.canary
+```
+
+This exists because the canary's own Playwright connect/read timeouts
+(`SEARCH_TRANSPORT_PROXY_PROBE_TIMEOUT_MS` / `_CONNECT_TIMEOUT_MS` /
+`_READ_TIMEOUT_MS`) only bound navigation/actions *after* a Playwright
+page exists -- they do not bound `sync_playwright()` startup or
+`chromium.launch()` itself, which could otherwise hang before any of
+those timeouts are reached. `run_with_deadline` is the second,
+independent, process-wide bound: if the 60-second deadline fires, it
+SIGTERMs (then, after a 5-second grace period, SIGKILLs) the whole
+process group and exits `124`; if it is itself signaled externally, it
+exits `128 + signum`. **This is a distinct failure mode from the
+canary's own documented exit-code contract below** -- a process killed
+by the external deadline may not have reached its own `print(...)` of
+the final JSON result line at all, so a `124`/`125`/`128+N` exit with no
+parsable JSON on stdout means "the deadline runner intervened," not "the
+canary completed and reported failure." `run_with_deadline` runs the
+canary exactly once; it never retries.
+
+### Expected output
+
+On success, the canary's own final line of stdout is exactly one JSON
+object, and its own process exit code is `0`:
+
+```json
+{
+  "ok": true,
+  "mode": "proxy",
+  "proxy_listener_reachable": true,
+  "neutral_request_success": true,
+  "tor_route_verified": true,
+  "status_code": 200,
+  "latency_ms": 1234,
+  "failure_category": null,
+  "reason_code": null,
+  "observed_exit_ip": "203.0.113.5",
+  "checked_at": "2026-09-04T00:00:00+00:00"
+}
+```
+
+Note this is the *final* line, not necessarily the *only* line:
+`scripts/search_transport/executor.py`'s `RequestExecutor` emits its own
+existing, unrelated `SEARCH_TRANSPORT_METRIC ...` structured log line
+during the navigation it performs, before the canary's final JSON is
+printed -- that line is pre-existing Phase 3.4K observability behavior,
+shared with every other caller of `RequestExecutor`, and this phase
+deliberately does not change it. A consumer parsing canary output should
+treat the **last** JSON-parsable line of stdout as the canary's result,
+not assume stdout contains a single line.
+
+`tor_route_verified: true` requires BOTH the HTTP navigation succeeding
+AND the neutral endpoint's response body semantically confirming Tor
+routing (`IsTor` is exactly `true`, plus `IP` a real, parseable IPv4 or
+IPv6 address per Python's `ipaddress.ip_address()` -- not merely a
+non-empty string) -- an HTTP 200 alone is never treated as proof of Tor
+routing.
+
+### Failure semantics
+
+Any unsuccessful canary run exits non-zero and reports `"ok": false`
+with a `failure_category`/`reason_code` pair describing what failed:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Canary verified successfully |
+| `2` | Invalid canary configuration / unsafe target -- resolved transport mode is `direct`, `SEARCH_TRANSPORT` is set to an unrecognized value (`reason_code: invalid_transport_configuration`), or `TOR_IP_CHECK_URL` is malformed/points at a LinkedIn host |
+| `3` | Proxy (SOCKS) listener unavailable -- `tor:9050` refused/timed out a TCP connect |
+| `4` | Neutral navigation/request failure (timeout, non-2xx status, etc.) |
+| `5` | Tor-route response verification failed (invalid/non-object JSON, `IsTor` missing or not `true`, or missing/empty/malformed `IP`) |
+| `6` | Unexpected internal failure |
+
+Those are the canary's OWN exit codes, printed alongside its own final
+JSON. Separately, the outer `run_with_deadline` wrapper (see above) has
+its own exit codes (`124` deadline, `125` internal runner error, `128 +
+signum` external signal) that mean the canary process itself was
+terminated before it could necessarily finish/report -- do not confuse
+a `124` from the wrapper with the canary's own contract above.
+
+The canary's output JSON never includes cookies, headers, the raw
+response body, proxy credentials, environment values, or raw stack
+traces.
+
+### Remaining blockers before a real run against production
+
+This section documents the *future* invocation only -- it has not been
+run against production as part of this phase. Before an operator
+actually runs it:
+
+- `JOBPULSE_API_IMAGE` must be pinned to the immutable, reviewed
+  commit-SHA image described in Prerequisites above -- never the mutable
+  `:main` tag.
+- The real `/opt/jobpulse/.tor_control_password` file and pinned
+  `JOBPULSE_TOR_IMAGE` value must already be in place on the production
+  host (same prerequisite as `tor-diagnostic`).
+- The `tor` service must already be confirmed `healthy` via its own
+  bootstrap healthcheck, independently of the canary run (see "Do not
+  let the canary start Tor" above); use `--no-deps`.
+- No code in this phase has been exercised against a real Tor daemon or
+  real network path -- only against fakes/mocks in
+  `tests/test_search_transport_canary.py` and raw-YAML/PyYAML structural
+  checks in `tests/test_tor_production_dark_launch.py` (the Docker
+  CLI-based `docker compose config` checks in that same file remain
+  skipped in any environment without a working `docker` binary, as is
+  the case in this sandbox -- see the stabilization report's Compose
+  Validation section for exact counts). The first real invocation is
+  itself the validation of the Playwright-through-SOCKS5 path in this
+  container image, comparable to the still-open Playwright/Chromium
+  sandbox-flags item noted for `tor-diagnostic` above.
+

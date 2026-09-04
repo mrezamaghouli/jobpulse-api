@@ -181,3 +181,96 @@ services:
     # jobpulse-api image + Playwright/Chromium combination -- see the
     # Phase 3 report's open items. Tracked as a follow-up, not shipped
     # as an untested claim.
+
+  # ---------------------------------------------------------------------
+  # Phase 3.4L: isolated, SOCKS-only, neutral-target search-transport
+  # canary -- a SEPARATE sibling of tor-diagnostic above, not an
+  # extension of it. tor-diagnostic intentionally carries PostgreSQL
+  # config, ControlPort config, the TOR_CONTROL_PASSWORD_FILE secret
+  # mount, and Phase 2 bootstrap-persistence behavior; this service needs
+  # NONE of that. It proves one narrow thing: that
+  # scripts/search_transport/canary.py, using the same
+  # get_search_transport() selector production collection would use (via
+  # SEARCH_TRANSPORT=proxy set here, never forced in code), can reach the
+  # neutral Tor-check endpoint through tor:9050 and get back a response
+  # that semantically confirms Tor routing (IsTor=true + a real IP) --
+  # not merely an HTTP 200. See docs/PRODUCTION_RUNBOOK.md's Phase 3.4L
+  # section for the future operator invocation; this task does not run
+  # it. Same tor-ops profile discipline as tor-diagnostic: never starts
+  # on `up`/`up -d`, only an explicit `--profile tor-ops run --rm
+  # search-transport-canary`.
+  #
+  # No ports, no volumes, no env_file, no PostgreSQL/POSTGRES_* vars, no
+  # TOR_ENABLED, no TOR_CONTROL_* vars, no control-password secret mount,
+  # no .api_keys.env/.admin.env/.auth/logs mount, no Docker socket, no
+  # privileged mode, no host networking. Timeout values below are
+  # service-local and intentionally tighter than the proxy-mode defaults
+  # in app/config.py (which stay unchanged) -- appropriate for a single
+  # bounded one-shot canary run, not for production collection traffic.
+  #
+  # No fixed container_name (unlike tor/tor-diagnostic above): this
+  # service is only ever invoked via `docker compose run --rm`, which
+  # Compose already names uniquely per invocation (project+service+run
+  # number). Pinning a fixed name here would only reintroduce a
+  # collision risk if a previous run's container wasn't cleaned up (e.g.
+  # an operator's client was killed before `--rm` could fire) -- with no
+  # operational benefit, since nothing else ever needs to address this
+  # one-shot container by a stable name the way `jobpulse-tor-prod`'s
+  # network alias does for the long-lived `tor` service.
+  # ---------------------------------------------------------------------
+  search-transport-canary:
+    profiles:
+      - tor-ops
+    image: ${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}
+    restart: "no"
+    depends_on:
+      tor:
+        condition: service_healthy
+
+    environment:
+      SEARCH_TRANSPORT: "proxy"
+      TOR_SOCKS_HOST: tor
+      TOR_SOCKS_PORT: "9050"
+      # Neutral connectivity check only -- never a LinkedIn URL. Operators
+      # may override via .env if they prefer a different neutral endpoint,
+      # but any override MUST stay HTTP/HTTPS, non-LinkedIn, and return a
+      # JSON object shaped like {"IsTor": bool, "IP": str} --
+      # scripts/search_transport/canary.py validates and rejects any
+      # unsafe/malformed target before making any request, and a
+      # schema-incompatible neutral endpoint will correctly fail Tor-route
+      # verification (see docs/PRODUCTION_RUNBOOK.md's Phase 3.4L section).
+      TOR_IP_CHECK_URL: ${TOR_IP_CHECK_URL:-https://check.torproject.org/api/ip}
+      SEARCH_TRANSPORT_PROXY_PROBE_TIMEOUT_MS: "3000"
+      SEARCH_TRANSPORT_PROXY_CONNECT_TIMEOUT_MS: "30000"
+      SEARCH_TRANSPORT_PROXY_READ_TIMEOUT_MS: "10000"
+
+    # Wrapped in the repository's existing in-container process-group
+    # deadline (scripts/run_with_deadline.py) -- Playwright's own
+    # connect/read timeouts (SEARCH_TRANSPORT_PROXY_*_TIMEOUT_MS above)
+    # only bound navigation/actions AFTER a page exists; they do not
+    # bound sync_playwright() startup or chromium.launch() itself. This
+    # is the second, independent, process-wide bound: --seconds 60 is
+    # comfortably above the sum of the probe/connect/read timeouts above
+    # (3s + 30s + 10s = 43s) plus browser-launch overhead, and
+    # --kill-after 5 matches the grace period convention already used by
+    # scripts/run_collection_cycle_safe.sh's other run_with_deadline call
+    # sites. If this deadline fires (exit 124) or the runner is signaled
+    # (128+signum), the canary process is killed before it can print its
+    # own final JSON result line -- that is a distinct, hard failure mode
+    # from the canary's own documented EXIT_* contract (see the runbook).
+    # This does not add a retry: run_with_deadline runs the command
+    # exactly once and never re-invokes it on timeout.
+    command:
+      [
+        "python", "-m", "scripts.run_with_deadline",
+        "--seconds", "60",
+        "--kill-after", "5",
+        "--",
+        "python", "-m", "scripts.search_transport.canary",
+      ]
+
+    # No ports, no env_file, no volumes, no Docker socket. Never calls
+    # collector/provider/queue code -- this image's default command
+    # (running the API server) is overridden above with the dedicated,
+    # standalone canary module only, wrapped by run_with_deadline (also
+    # collector/provider/queue-free -- see scripts/run_with_deadline.py).

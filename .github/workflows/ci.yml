@@ -134,7 +134,7 @@ jobs:
             tests/test_tor_runtime_monitor.py \
             -v
 
-      - name: Run focused Phase 3.4K search-transport unit suite (no real Tor, no real LinkedIn traffic)
+      - name: Run focused Phase 3.4K/3.4L search-transport unit suite (no real Tor, no real LinkedIn traffic)
         # Scoped, network-free suite covering the Phase 3.4K search
         # transport abstraction (scripts/search_transport/) and its
         # collector/queue integration points, plus the Phase 3.4K
@@ -144,13 +144,17 @@ jobs:
         # per-query collector_postgres subprocess deadline, plus the Final
         # Pre-Commit Safety Pass's structural/behavioral proof
         # (tests/test_no_automatic_tor_rotation.py) that no collection
-        # runtime module can automatically trigger a Tor circuit change.
-        # Every file here uses fakes/stubs for Playwright, subprocess, and
-        # psycopg2 -- none opens a real browser, contacts a real Tor
-        # daemon, makes real LinkedIn traffic, or requires production
-        # credentials. This is DELIBERATELY separate from the Tor unit
-        # suite step above so a failure here is attributable to this
-        # phase specifically.
+        # runtime module can automatically trigger a Tor circuit change,
+        # plus the Phase 3.4L isolated SOCKS-only neutral canary
+        # (tests/test_search_transport_canary.py) -- fully mocked
+        # Playwright/transport, proving the canary's exit-code contract,
+        # IsTor/IP semantic verification, and LinkedIn/control-plane
+        # isolation guards. Every file here uses fakes/stubs for
+        # Playwright, subprocess, and psycopg2 -- none opens a real
+        # browser, contacts a real Tor daemon, makes real LinkedIn
+        # traffic, or requires production credentials. This is
+        # DELIBERATELY separate from the Tor unit suite step above so a
+        # failure here is attributable to this phase specifically.
         run: |
           PYTHONPATH=. python -m pytest \
             tests/test_search_transport_classifier.py \
@@ -158,6 +162,7 @@ jobs:
             tests/test_search_transport_metrics.py \
             tests/test_search_transport_retry_policy.py \
             tests/test_search_transport_transport.py \
+            tests/test_search_transport_canary.py \
             tests/test_linkedin_browser_provider_transport.py \
             tests/test_search_demand_queue_retry_budget.py \
             tests/test_linkedin_auth_preflight_transport.py \
