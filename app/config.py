@@ -184,3 +184,116 @@ def get_tor_stale_draining_threshold_seconds():
     never auto-recovers the circuit -- only an explicit
     recover_circuit() call does (see scripts/tor/circuit_manager.py)."""
     return _get_int_env_value("TOR_STALE_DRAINING_THRESHOLD_SECONDS", 300)
+
+
+# -----------------------------------------------------------------------------
+# Search transport (Phase 3.4K, controlled rollout -- see
+# scripts/search_transport/). Deliberately independent of TOR_ENABLED above:
+# TOR_ENABLED governs whether the Tor capability/infra is considered live at
+# all (dark launch, monitoring, container health) and this repository has an
+# actively-enforced invariant (tests/test_tor_production_dark_launch.py::
+# test_tor_enabled_setters_are_a_closed_allowlist and
+# ::test_no_collection_script_sets_tor_enabled_true) that no collection code
+# path may read or depend on it. SEARCH_TRANSPORT is this phase's own,
+# self-sufficient rollout flag for whether LinkedIn *traffic* is routed
+# through proxy transport. Default is "direct", which preserves the
+# previous no-proxy network route and the same connect/read timeout
+# defaults collectors always used. Phase 3.4K still adds classification,
+# observability, bounded-retry, auth-safety, and process deadline
+# control-flow on top of that default route.
+# -----------------------------------------------------------------------------
+class InvalidSearchTransportConfigError(ValueError):
+    """Raised when SEARCH_TRANSPORT is explicitly set to a value that is
+    neither "direct" nor "proxy". Deliberately NOT the same code path as
+    "genuinely unset" (see get_search_transport_mode()) -- a typo such as
+    SEARCH_TRANSPORT=proxxy must fail closed with a clear configuration
+    error, never silently fall back to "direct" and produce unexpected
+    direct-network traffic instead of the proxy transport an operator
+    actually intended."""
+
+
+def get_search_transport_mode():
+    """"direct" when SEARCH_TRANSPORT is genuinely unset (or set to an
+    empty string) -- this is the documented, pre-existing default value.
+    Any other explicitly-configured value that isn't "direct" or
+    "proxy" (case-insensitive) raises InvalidSearchTransportConfigError
+    rather than being coerced to "direct" -- see
+    InvalidSearchTransportConfigError for why."""
+    raw_value = os.environ.get("SEARCH_TRANSPORT")
+
+    if raw_value is None or raw_value.strip() == "":
+        return "direct"
+
+    value = raw_value.strip().lower()
+
+    if value not in ("direct", "proxy"):
+        raise InvalidSearchTransportConfigError(
+            f"Invalid SEARCH_TRANSPORT={raw_value!r}: must be 'direct' or "
+            "'proxy' (or unset, which defaults to 'direct')."
+        )
+
+    return value
+
+
+def get_search_transport_direct_connect_timeout_ms():
+    """Matches the navigation timeout LinkedInBrowserProvider hardcoded
+    before this phase (120000ms) -- direct mode's default connect timeout
+    value must remain exactly that."""
+    return _get_int_env_value("SEARCH_TRANSPORT_DIRECT_CONNECT_TIMEOUT_MS", 120000)
+
+
+def get_search_transport_direct_read_timeout_ms():
+    """Matches the default Playwright action timeout LinkedInBrowserProvider
+    hardcoded before this phase (30000ms)."""
+    return _get_int_env_value("SEARCH_TRANSPORT_DIRECT_READ_TIMEOUT_MS", 30000)
+
+
+def get_search_transport_proxy_connect_timeout_ms():
+    """Wider than direct mode by default: Tor circuit build/handshake time
+    is higher-latency and higher-variance than a direct connection. A slow
+    Tor connect must not be misclassified as a LinkedIn block."""
+    return _get_int_env_value("SEARCH_TRANSPORT_PROXY_CONNECT_TIMEOUT_MS", 180000)
+
+
+def get_search_transport_proxy_read_timeout_ms():
+    return _get_int_env_value("SEARCH_TRANSPORT_PROXY_READ_TIMEOUT_MS", 45000)
+
+
+def get_search_transport_proxy_probe_timeout_ms():
+    """How long the proxy transport waits for a TCP connect to the SOCKS
+    port before declaring the proxy unavailable (see
+    scripts/search_transport/transport.py). Deliberately short and
+    separate from the navigation timeouts above -- this only proves the
+    SOCKS port accepts TCP connections, not that Tor is bootstrapped."""
+    return _get_int_env_value("SEARCH_TRANSPORT_PROXY_PROBE_TIMEOUT_MS", 3000)
+
+
+def get_linkedin_plan_collect_query_timeout_seconds():
+    """Per-query deadline (Phase 3.4K Stabilization, Section 7) around the
+    scripts.collector_postgres subprocess scripts/linkedin_plan_collect.py
+    launches per query, enforced via scripts.run_with_deadline. Without
+    this, ONE wedged collector subprocess (a Playwright hang, a blocked
+    network call, etc.) could silently consume the entire OUTER step
+    budget (see scripts/run_collection_cycle_safe.sh's
+    STEP_TIMEOUT_SECONDS, which wraps the whole
+    process_search_demand_queue run) and abort every OTHER, healthy query
+    in the same batch along with it. Generous relative to this phase's own
+    transport timeouts (proxy connect timeout alone can be up to 180s) --
+    a single query can involve many pages and per-job detail-panel
+    clicks."""
+    return max(60, _get_int_env_value("LINKEDIN_PLAN_COLLECT_QUERY_TIMEOUT_SECONDS", 900))
+
+
+def get_linkedin_plan_collect_query_kill_after_seconds():
+    """SIGKILL grace period for the deadline above -- passed straight
+    through as scripts.run_with_deadline's own --kill-after."""
+    return max(1, _get_int_env_value("LINKEDIN_PLAN_COLLECT_QUERY_KILL_AFTER_SECONDS", 15))
+
+
+def get_search_demand_max_attempts():
+    """Per-task retry budget for job_search_demand_queue rows (see
+    scripts/process_search_demand_queue.py). A row's fail_count reaching
+    this value moves it to the terminal 'failed' status instead of being
+    requeued to 'pending' again -- the fix for the previously-unbounded
+    retry loop (Phase 3.4K, Section 8)."""
+    return max(1, _get_int_env_value("SEARCH_DEMAND_MAX_ATTEMPTS", 3))
