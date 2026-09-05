@@ -600,6 +600,326 @@ def test_tor_diagnostic_service_only_appears_under_tor_ops_profile(compose_valid
 
 
 # ---------------------------------------------------------------------
+# 3b. Phase 3.4L: search-transport-canary structural regression tests.
+#     A SEPARATE sibling service to tor-diagnostic, under the same
+#     tor-ops profile -- proves the new service is SOCKS-only,
+#     database-free, ControlPort-free, and secret-free, and that
+#     tor-diagnostic itself is untouched by this addition.
+# ---------------------------------------------------------------------
+
+def _profiled_config(compose_validation_dir, monkeypatch):
+    monkeypatch.setenv("JOBPULSE_TOR_IMAGE", "ghcr.io/mrezamaghouli/jobpulse-tor:test-sha")
+    import os
+    result = subprocess.run(
+        ["docker", "compose", "--profile", "tor-ops",
+         "-f", "docker-compose.prod.yml", "-f", "docker-compose.prod.tor.yml",
+         "config", "--format", "json"],
+        cwd=str(compose_validation_dir), capture_output=True, text=True, timeout=30, env=os.environ.copy(),
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@requires_docker_compose
+def test_search_transport_canary_only_appears_under_tor_ops_profile(compose_validation_dir, monkeypatch):
+    monkeypatch.setenv("JOBPULSE_TOR_IMAGE", "ghcr.io/mrezamaghouli/jobpulse-tor:test-sha")
+    import os
+    default_config = _run_compose_config(
+        compose_validation_dir, "docker-compose.prod.tor.yml", env=os.environ.copy(),
+    )
+    assert "search-transport-canary" not in default_config["services"]
+
+    profiled_config = _profiled_config(compose_validation_dir, monkeypatch)
+    assert "search-transport-canary" in profiled_config["services"]
+
+
+@requires_docker_compose
+def test_search_transport_canary_restart_no_and_no_ports_no_volumes_no_env_file(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    canary = config["services"]["search-transport-canary"]
+
+    assert canary["restart"] == "no"
+    assert "ports" not in canary
+    assert "volumes" not in canary
+    assert "env_file" not in canary
+
+
+@requires_docker_compose
+def test_search_transport_canary_depends_on_tor_healthy(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    canary = config["services"]["search-transport-canary"]
+
+    depends_on = canary.get("depends_on", {})
+    assert "tor" in depends_on
+    assert depends_on["tor"]["condition"] == "service_healthy"
+
+
+@requires_docker_compose
+def test_search_transport_canary_environment_is_proxy_socks_only(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    env = config["services"]["search-transport-canary"]["environment"]
+
+    assert env["SEARCH_TRANSPORT"] == "proxy"
+    assert env["TOR_SOCKS_HOST"] == "tor"
+    assert env["TOR_SOCKS_PORT"] == "9050"
+
+    # Bounded, canary-specific timeout values -- distinct from (tighter
+    # than) app/config.py's global proxy-mode defaults.
+    assert env["SEARCH_TRANSPORT_PROXY_PROBE_TIMEOUT_MS"] == "3000"
+    assert env["SEARCH_TRANSPORT_PROXY_CONNECT_TIMEOUT_MS"] == "30000"
+    assert env["SEARCH_TRANSPORT_PROXY_READ_TIMEOUT_MS"] == "10000"
+
+
+@requires_docker_compose
+def test_search_transport_canary_has_no_control_plane_db_or_enabled_vars(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    env = config["services"]["search-transport-canary"]["environment"]
+
+    forbidden_prefixes = ("TOR_CONTROL_", "POSTGRES_")
+    forbidden_exact = ("TOR_ENABLED", "TOR_CONTROL_PASSWORD_FILE", "DATABASE_URL", "DSN")
+
+    for key in env:
+        assert not key.startswith(forbidden_prefixes), f"unexpected control-plane/DB var: {key}"
+        assert key not in forbidden_exact, f"unexpected forbidden var: {key}"
+
+
+@requires_docker_compose
+def test_search_transport_canary_command_is_dedicated_canary_module(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    canary = config["services"]["search-transport-canary"]
+
+    command = canary["command"]
+    joined = " ".join(command) if isinstance(command, list) else str(command)
+    assert "scripts.search_transport.canary" in joined
+
+    for forbidden in (
+        "collector_postgres", "process_search_demand_queue",
+        "linkedin_plan_collect", "linkedin_browser_provider",
+        "production_dark_launch_check",
+    ):
+        assert forbidden not in joined
+
+
+@requires_docker_compose
+def test_search_transport_canary_command_wrapped_in_run_with_deadline(compose_validation_dir, monkeypatch):
+    """Playwright's own connect/read timeouts only bound navigation AFTER
+    a page exists -- they do not bound sync_playwright() startup or
+    chromium.launch(). scripts/run_with_deadline.py is the second,
+    process-wide bound; this proves the resolved Compose command actually
+    wraps the canary module with it (not merely mentions both module
+    names somewhere)."""
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    command = config["services"]["search-transport-canary"]["command"]
+
+    assert isinstance(command, list)
+    separator_index = command.index("--")
+    before, after = command[:separator_index], command[separator_index + 1:]
+
+    assert "scripts.run_with_deadline" in " ".join(before)
+    assert "--seconds" in before
+    assert "--kill-after" in before
+    assert after == ["python", "-m", "scripts.search_transport.canary"]
+
+
+@requires_docker_compose
+def test_search_transport_canary_no_secret_mount(compose_validation_dir, monkeypatch):
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    canary = config["services"]["search-transport-canary"]
+    assert "volumes" not in canary
+
+
+@requires_docker_compose
+def test_tor_diagnostic_service_unchanged_by_canary_addition(compose_validation_dir, monkeypatch):
+    """The pre-existing tor-diagnostic service must keep its own purpose
+    (PostgreSQL config, ControlPort config, TOR_CONTROL_PASSWORD_FILE
+    secret mount, Phase 2 bootstrap persistence) -- proving the new
+    search-transport-canary service was added as a separate sibling, not
+    a modification of tor-diagnostic.
+
+    `docker compose config --format json` returns Compose's canonical
+    RESOLVED model, which is free to inline env_file-sourced variables
+    directly into `environment` -- it is not required to retain an
+    `env_file` source key, so that key is not asserted here. Source-level
+    env_file *declaration* is proven separately, against the raw YAML, by
+    test_raw_yaml_tor_diagnostic_purpose_unchanged_by_canary_addition
+    below. What this test instead proves is that the declared `env_file:
+    - .env` actually resolves: compose_validation_dir's own .env fixture
+    file is empty by default, so dummy PostgreSQL credentials are written
+    into it here (the same per-test override pattern used by
+    test_dark_launch_process_env_pinning_overrides_hostile_production_env
+    above) and their exact values are confirmed present in the resolved
+    environment."""
+    dummy_env_file_values = {
+        "POSTGRES_DB": "jobpulse_test_db",
+        "POSTGRES_USER": "jobpulse_test_user",
+        "POSTGRES_PASSWORD": "jobpulse-test-dummy-password",
+    }
+    (compose_validation_dir / ".env").write_text(
+        "\n".join(f"{key}={value}" for key, value in dummy_env_file_values.items()) + "\n"
+    )
+
+    config = _profiled_config(compose_validation_dir, monkeypatch)
+    diagnostic = config["services"]["tor-diagnostic"]
+    env = diagnostic["environment"]
+
+    assert env["TOR_ENABLED"] == "true"
+    assert env["POSTGRES_HOST"] == "db"
+    assert env["POSTGRES_PORT"] == "5432"
+    assert env["TOR_CONTROL_HOST"] == "tor"
+    assert env["TOR_CONTROL_PORT"] == "9051"
+    assert env["TOR_CONTROL_PASSWORD_FILE"] == "/run/secrets/tor_control_password"
+    for key, value in dummy_env_file_values.items():
+        assert env[key] == value
+    assert diagnostic["command"] == ["python", "-m", "scripts.tor.production_dark_launch_check"]
+
+
+# ---------------------------------------------------------------------
+# 3c. Phase 3.4L stabilization: NETWORK-FREE, Docker-FREE raw-YAML
+#     structural checks for search-transport-canary. The tests in 3b
+#     above depend on a working `docker` CLI and are skipped without one
+#     (as this sandbox currently is -- see requires_docker_compose). The
+#     load-bearing security invariants must not depend exclusively on
+#     that: these tests parse docker-compose.prod.tor.yml directly with
+#     PyYAML (no `docker` binary invoked, no containers started, no
+#     `docker compose config` merge/rendering involved) and always run.
+#
+#     The actual guarantee that this service never starts on ordinary
+#     `up`/`up -d` is Compose-spec-level, not a rendering quirk of any
+#     particular `docker compose config` invocation: a service is only
+#     started by `docker compose up` if it has no `profiles:` entry, or
+#     one of its profiles is explicitly activated (--profile /
+#     COMPOSE_PROFILES). raw_config below proves the service's raw
+#     `profiles:` list is exactly ["tor-ops"] -- that fact alone is what
+#     keeps it out of ordinary startup, independent of how `docker
+#     compose config` chooses to render profile-gated services in its
+#     JSON output (which the Docker-dependent 3b tests separately probe,
+#     mirroring the identical, already-established pattern
+#     tor-diagnostic's own profile test above uses).
+# ---------------------------------------------------------------------
+
+def _raw_tor_compose_yaml():
+    import yaml
+
+    with open(REPO_ROOT / "docker-compose.prod.tor.yml") as f:
+        return yaml.safe_load(f)
+
+
+def _raw_canary_service():
+    return _raw_tor_compose_yaml()["services"]["search-transport-canary"]
+
+
+def test_raw_yaml_search_transport_canary_service_exists():
+    doc = _raw_tor_compose_yaml()
+    assert "search-transport-canary" in doc["services"]
+    assert "tor-diagnostic" in doc["services"]
+    assert "tor" in doc["services"]
+
+
+def test_raw_yaml_canary_profile_is_tor_ops_only():
+    canary = _raw_canary_service()
+    assert canary["profiles"] == ["tor-ops"]
+
+
+def test_raw_yaml_canary_restart_is_no():
+    canary = _raw_canary_service()
+    assert canary["restart"] == "no"
+
+
+def test_raw_yaml_canary_has_no_ports_volumes_env_file():
+    canary = _raw_canary_service()
+    assert "ports" not in canary
+    assert "volumes" not in canary
+    assert "env_file" not in canary
+
+
+def test_raw_yaml_canary_no_privileged_no_host_network_no_docker_socket():
+    canary = _raw_canary_service()
+    assert canary.get("privileged", False) is False
+    assert canary.get("network_mode") != "host"
+    for volume in canary.get("volumes", []):
+        source = volume.get("source") if isinstance(volume, dict) else str(volume).split(":")[0]
+        assert source != "/var/run/docker.sock"
+
+
+def test_raw_yaml_canary_depends_on_tor_healthy_only():
+    canary = _raw_canary_service()
+    assert canary["depends_on"] == {"tor": {"condition": "service_healthy"}}
+
+
+def test_raw_yaml_canary_environment_is_proxy_socks_only():
+    env = _raw_canary_service()["environment"]
+    assert env["SEARCH_TRANSPORT"] == "proxy"
+    assert env["TOR_SOCKS_HOST"] == "tor"
+    assert env["TOR_SOCKS_PORT"] == "9050"
+    assert env["SEARCH_TRANSPORT_PROXY_PROBE_TIMEOUT_MS"] == "3000"
+    assert env["SEARCH_TRANSPORT_PROXY_CONNECT_TIMEOUT_MS"] == "30000"
+    assert env["SEARCH_TRANSPORT_PROXY_READ_TIMEOUT_MS"] == "10000"
+
+
+def test_raw_yaml_canary_environment_forbidden_keys_absent():
+    env = _raw_canary_service()["environment"]
+    forbidden = (
+        "TOR_ENABLED", "TOR_CONTROL_HOST", "TOR_CONTROL_PORT",
+        "TOR_CONTROL_PASSWORD", "TOR_CONTROL_PASSWORD_FILE",
+        "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB",
+        "POSTGRES_USER", "POSTGRES_PASSWORD", "DATABASE_URL", "DSN",
+    )
+    for key in forbidden:
+        assert key not in env, f"forbidden env var present: {key}"
+
+
+def test_raw_yaml_canary_command_wrapped_in_run_with_deadline():
+    command = _raw_canary_service()["command"]
+    assert isinstance(command, list)
+
+    separator_index = command.index("--")
+    before, after = command[:separator_index], command[separator_index + 1:]
+
+    assert "scripts.run_with_deadline" in " ".join(before)
+    assert "--seconds" in before
+    assert "--kill-after" in before
+    assert after == ["python", "-m", "scripts.search_transport.canary"]
+
+
+def test_raw_yaml_canary_command_has_no_collector_or_control_plane_invocation():
+    joined = " ".join(_raw_canary_service()["command"])
+    for forbidden in (
+        "collector_postgres", "process_search_demand_queue",
+        "linkedin_plan_collect", "linkedin_browser_provider",
+        "circuit_manager", "verify_tor_connectivity",
+        "production_dark_launch_check",
+    ):
+        assert forbidden not in joined
+
+
+def test_raw_yaml_canary_no_fixed_container_name():
+    """A one-shot `docker compose run --rm` service does not need a fixed
+    container_name -- Compose already names each run uniquely, and a
+    fixed name would only reintroduce a collision risk across repeated
+    invocations (unlike the long-lived tor/tor-diagnostic services,
+    which keep theirs unchanged)."""
+    assert "container_name" not in _raw_canary_service()
+
+
+def test_raw_yaml_tor_diagnostic_purpose_unchanged_by_canary_addition():
+    diagnostic = _raw_tor_compose_yaml()["services"]["tor-diagnostic"]
+    env = diagnostic["environment"]
+    assert env["TOR_ENABLED"] == "true"
+    assert env["POSTGRES_HOST"] == "db"
+    assert env["POSTGRES_PORT"] == "5432"
+    assert env["TOR_CONTROL_HOST"] == "tor"
+    assert env["TOR_CONTROL_PASSWORD_FILE"] == "/run/secrets/tor_control_password"
+    assert "env_file" in diagnostic
+
+
+def test_raw_yaml_tor_service_unaffected_by_canary_addition():
+    tor = _raw_tor_compose_yaml()["services"]["tor"]
+    assert "ports" not in tor
+    assert tor["read_only"] is True
+    assert tor["environment"]["TOR_CONTROL_PASSWORD_FILE"] == "/run/secrets/tor_control_password"
+
+
+# ---------------------------------------------------------------------
 # 4. Static regression guard: closed set of files touching TOR_ENABLED /
 #    get_proxy_config -- proves production collection paths stay direct
 #    without needing to re-derive the full trace by hand every time.
