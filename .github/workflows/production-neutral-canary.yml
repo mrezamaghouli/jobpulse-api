@@ -1,0 +1,557 @@
+name: Production Neutral Canary
+
+# Manual-only. There is deliberately no push/pull_request/workflow_run/
+# schedule/repository_dispatch trigger -- the ONLY way this workflow can
+# ever run is an operator explicitly clicking "Run workflow" (or the
+# dispatch API) and typing the exact confirmation token below. This is
+# NOT Deploy Production (.github/workflows/deploy.yml, left unchanged):
+# it never touches jobpulse-api-prod's configuration, never restarts it,
+# and never updates the production git checkout. It performs exactly one
+# real outbound request from the already-running production Tor SOCKS
+# listener to a fixed, non-LinkedIn, neutral verification endpoint. See
+# docs/PRODUCTION_RUNBOOK.md's Phase 3.4M section for the full procedure
+# and safety rationale.
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: >-
+          Must be exactly the reviewed Phase 3.4L commit/merge SHA
+          f4765f857355c6543f68cea0e481b7f20a917147 -- this runner version
+          only trusts that one specific, already-reviewed commit for a
+          real production-topology canary (being merely an ancestor of
+          main is not the same as having been specifically reviewed for
+          this). The image used is exactly
+          ghcr.io/mrezamaghouli/jobpulse-api:<image_sha> -- never :main
+          or :latest. A future reviewed workflow change may update the
+          accepted SHA once a newer commit has been through its own
+          review.
+        required: true
+        type: string
+      confirmation:
+        description: >-
+          Type exactly RUN_NEUTRAL_CANARY to confirm. This makes ONE real
+          outbound request from the production Tor SOCKS listener to the
+          fixed neutral endpoint https://check.torproject.org/api/ip. It
+          never modifies jobpulse-api-prod, never routes LinkedIn
+          traffic, and never restarts/recreates/rotates Tor.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-neutral-canary
+  cancel-in-progress: false
+
+env:
+  VM_HOST: "35.192.251.190"
+  VM_USER: "mrezamaghouli"
+  VM_PORT: "22"
+  # Fixed, non-configurable neutral verification target. There is no
+  # workflow input for this -- it can never be pointed at LinkedIn or any
+  # other target by an operator.
+  NEUTRAL_TARGET_URL: "https://check.torproject.org/api/ip"
+  # The one specific commit this runner version trusts for a real
+  # production canary -- see the image_sha input description above and
+  # docs/PRODUCTION_RUNBOOK.md's Phase 3.4M section.
+  REVIEWED_IMAGE_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  IMAGE_SHA: ${{ inputs.image_sha }}
+  CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  neutral-canary:
+    runs-on: ubuntu-latest
+    # Safety ceiling, not a retry mechanism. The canary's own internal
+    # scripts.run_with_deadline bound (60s + 5s kill-after grace, see
+    # docker-compose.prod.tor.yml) only bounds the single `docker compose
+    # run` invocation itself -- it does NOT bound GitHub's own checkout/
+    # fetch, ssh-keyscan, scp, SSH connection establishment, an immutable
+    # image pull, Compose config inspection, or the host-level curl
+    # health checks. Budget: checkout+SHA validation (~30s) + SSH/SCP
+    # setup (~15s) + remote preflight/topology checks (~15s) + a cold
+    # immutable-image pull in the worst case the layers aren't already
+    # cached (~2-3 min) + Compose config validation (~10s) + the bounded
+    # canary invocation itself (~65s max) + post-run invariant checks and
+    # a second bounded health check (~20s) totals to roughly 5-6 minutes
+    # in the worst realistic case; 12 minutes leaves close to 2x margin
+    # without leaving an effectively-unbounded job hanging indefinitely.
+    timeout-minutes: 12
+    steps:
+      # Must run before anything that prepares SSH or contacts
+      # production: a workflow_dispatch can technically be launched
+      # against any ref, so this fails closed unless the dispatch was
+      # made from main.
+      - name: Require dispatch from main
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${{ github.ref }}')" >&2
+            exit 1
+          fi
+
+      - name: Require exact confirmation token
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRMATION" != "RUN_NEUTRAL_CANARY" ]; then
+            echo "ERROR: confirmation input must be exactly RUN_NEUTRAL_CANARY" >&2
+            exit 1
+          fi
+
+      - name: Validate image_sha shape and pin to the reviewed Phase 3.4L SHA
+        run: |
+          set -euo pipefail
+          if ! [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: image_sha must be exactly a 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+
+          # Being an ancestor of main is broader than "the exact commit
+          # that was reviewed for this production-topology canary" -- a
+          # later ancestor commit could touch
+          # scripts/search_transport/canary.py or the
+          # search-transport-canary service definition without having
+          # gone through the same review. This runner version only
+          # trusts REVIEWED_IMAGE_SHA; a later reviewed workflow change
+          # may update it once a newer commit has been through its own
+          # review.
+          if [ "$IMAGE_SHA" != "$REVIEWED_IMAGE_SHA" ]; then
+            echo "ERROR: image_sha must be exactly the reviewed Phase 3.4L SHA ($REVIEWED_IMAGE_SHA); got '$IMAGE_SHA'" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prove image_sha is a reviewed ancestor of main and extract its overlay
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git cat-file -e "${IMAGE_SHA}^{commit}"
+          git merge-base --is-ancestor "$IMAGE_SHA" origin/main
+
+          # Prove this exact commit is the one that actually contains the
+          # reviewed Phase 3.4L canary -- not merely any ancestor of main.
+          git show "${IMAGE_SHA}:scripts/search_transport/canary.py" > /dev/null
+
+          # The canary Compose overlay MUST come from image_sha itself,
+          # never from this workflow branch's own working tree, so the
+          # API image SHA and the canary service definition are provably
+          # from the same reviewed commit. Fixed path (not mktemp): this
+          # file is handed off to a LATER step, and GitHub Actions steps
+          # share a filesystem but not shell variables, so a stable path
+          # both steps agree on is required. This is acceptable because
+          # the job's own concurrency group already prevents two runs of
+          # this workflow from ever executing on the same or a different
+          # ephemeral, single-use GitHub-hosted runner at once.
+          git show "${IMAGE_SHA}:docker-compose.prod.tor.yml" > /tmp/reviewed-overlay.yml
+          grep -q "search-transport-canary:" /tmp/reviewed-overlay.yml
+
+          echo "Reviewed overlay SHA-256: $(sha256sum /tmp/reviewed-overlay.yml | awk '{print $1}')"
+
+      - name: Validate VM_SSH_KEY secret is present
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "ERROR: VM_SSH_KEY secret is missing" >&2
+            exit 1
+          fi
+
+      - name: Run the one-shot neutral canary on production
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_neutral_canary_key
+          chmod 600 ~/.ssh/jobpulse_neutral_canary_key
+
+          # -T bounds the key-fetch connection itself. Populating
+          # known_hosts up front lets StrictHostKeyChecking=yes below
+          # fail closed on a mismatch instead of prompting.
+          ssh-keyscan -T 10 -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          # Bounded SSH/SCP options, applied consistently to every
+          # connection this step makes: ConnectTimeout bounds the initial
+          # handshake, ConnectionAttempts=1 guarantees OpenSSH itself
+          # never retries (the effective connection-attempt count stays
+          # exactly one), ServerAliveInterval/CountMax detect and close a
+          # genuinely dead network path without being confused by a
+          # remote command that is legitimately silent for a while (SSH's
+          # keepalive is a protocol-level probe, independent of the
+          # remote shell's own stdout), and BatchMode=yes/
+          # StrictHostKeyChecking=yes guarantee no interactive prompt can
+          # ever hang the job.
+          SSH_OPTS=(-o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          SSH_KEY_PATH=~/.ssh/jobpulse_neutral_canary_key
+
+          REMOTE_SCRIPT_LOCAL="$(mktemp)"
+          cat > "$REMOTE_SCRIPT_LOCAL" <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          REMOTE_OVERLAY_PATH="$1"
+          LOCAL_OVERLAY_SHA256="$2"
+          API_IMAGE="$3"
+          NEUTRAL_TARGET_URL="$4"
+          HAS_TOKEN="$5"
+          REMOTE_SCRIPT_SELF="$0"
+
+          cleanup_remote() {
+            rm -f "$REMOTE_OVERLAY_PATH"
+            [ -n "${TMP_DOCKER_CONFIG:-}" ] && rm -rf "$TMP_DOCKER_CONFIG"
+            rm -f "$REMOTE_SCRIPT_SELF"
+          }
+          trap cleanup_remote EXIT
+
+          echo "--- production checkout (read-only; never fetched/pulled/reset/checked out by this workflow) ---"
+          git -C /opt/jobpulse rev-parse HEAD || true
+          git -C /opt/jobpulse status --short || true
+
+          echo "--- verifying transferred overlay checksum ---"
+          REMOTE_OVERLAY_SHA256="$(sha256sum "$REMOTE_OVERLAY_PATH" | awk '{print $1}')"
+          if [ "$REMOTE_OVERLAY_SHA256" != "$LOCAL_OVERLAY_SHA256" ]; then
+            echo "ERROR: transferred overlay checksum mismatch" >&2
+            exit 1
+          fi
+
+          echo "--- requiring existing production containers (no fallback discovery / creation) ---"
+          if ! docker inspect jobpulse-api-prod > /dev/null 2>&1; then
+            echo "ERROR: jobpulse-api-prod container does not exist" >&2
+            exit 1
+          fi
+          if ! docker inspect jobpulse-tor-prod > /dev/null 2>&1; then
+            echo "ERROR: jobpulse-tor-prod container does not exist" >&2
+            exit 1
+          fi
+
+          echo "--- verifying Compose service labels identify the expected services ---"
+          API_SERVICE_LABEL="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' jobpulse-api-prod)"
+          TOR_SERVICE_LABEL="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' jobpulse-tor-prod)"
+          if [ "$API_SERVICE_LABEL" != "api" ]; then
+            echo "ERROR: jobpulse-api-prod does not carry com.docker.compose.service=api (got '$API_SERVICE_LABEL') -- refusing to treat it as production topology" >&2
+            exit 1
+          fi
+          if [ "$TOR_SERVICE_LABEL" != "tor" ]; then
+            echo "ERROR: jobpulse-tor-prod does not carry com.docker.compose.service=tor (got '$TOR_SERVICE_LABEL') -- refusing to treat it as production topology" >&2
+            exit 1
+          fi
+
+          echo "--- verifying API and Tor share the same production Compose project ---"
+          API_PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' jobpulse-api-prod)"
+          TOR_PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' jobpulse-tor-prod)"
+          if [ -z "$API_PROJECT" ] || [ "$API_PROJECT" != "$TOR_PROJECT" ]; then
+            echo "ERROR: jobpulse-api-prod (project '$API_PROJECT') and jobpulse-tor-prod (project '$TOR_PROJECT') do not share a Compose project" >&2
+            exit 1
+          fi
+          PRODUCTION_PROJECT="$API_PROJECT"
+
+          API_ID_BEFORE="$(docker inspect -f '{{.Id}}' jobpulse-api-prod)"
+          API_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
+          API_HEALTH_BEFORE="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
+          API_RESTARTS_BEFORE="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
+          API_IMAGE_ID_BEFORE="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+          API_IMAGE_REF_BEFORE="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+
+          TOR_ID_BEFORE="$(docker inspect -f '{{.Id}}' jobpulse-tor-prod)"
+          TOR_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-tor-prod)"
+          TOR_HEALTH_BEFORE="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-tor-prod)"
+          TOR_RESTARTS_BEFORE="$(docker inspect -f '{{.RestartCount}}' jobpulse-tor-prod)"
+          TOR_IMAGE_ID_BEFORE="$(docker inspect -f '{{.Image}}' jobpulse-tor-prod)"
+          TOR_IMAGE_REF_BEFORE="$(docker inspect -f '{{.Config.Image}}' jobpulse-tor-prod)"
+
+          echo "API before: running=$API_RUNNING_BEFORE health=$API_HEALTH_BEFORE restarts=$API_RESTARTS_BEFORE image=$API_IMAGE_REF_BEFORE"
+          echo "Tor before: running=$TOR_RUNNING_BEFORE health=$TOR_HEALTH_BEFORE restarts=$TOR_RESTARTS_BEFORE image=$TOR_IMAGE_REF_BEFORE"
+
+          echo "--- hard precondition: Tor must already be running and healthy (never started/restarted/recreated here) ---"
+          if [ "$TOR_RUNNING_BEFORE" != "true" ] || [ "$TOR_HEALTH_BEFORE" != "healthy" ]; then
+            echo "ERROR: jobpulse-tor-prod is not already running+healthy -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          if [ "$API_RUNNING_BEFORE" != "true" ]; then
+            echo "ERROR: jobpulse-api-prod is not running" >&2
+            exit 1
+          fi
+
+          echo "--- discovering the exact network on which Tor carries alias 'tor' (must be exactly one) ---"
+          NETWORK_ALIAS_LINES="$(docker inspect jobpulse-tor-prod --format '{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}}|{{join $cfg.Aliases ","}}
+          {{end}}')"
+
+          MATCHING_NETWORKS=()
+          while IFS='|' read -r net_name net_aliases; do
+            [ -z "$net_name" ] && continue
+            case ",$net_aliases," in
+              *,tor,*) MATCHING_NETWORKS+=("$net_name") ;;
+            esac
+          done <<< "$NETWORK_ALIAS_LINES"
+
+          if [ "${#MATCHING_NETWORKS[@]}" -eq 0 ]; then
+            echo "ERROR: no network on jobpulse-tor-prod carries alias 'tor' -- cannot prove topology" >&2
+            exit 1
+          fi
+          if [ "${#MATCHING_NETWORKS[@]}" -gt 1 ]; then
+            echo "ERROR: ambiguous topology -- multiple networks on jobpulse-tor-prod carry alias 'tor': ${MATCHING_NETWORKS[*]}" >&2
+            exit 1
+          fi
+          NETWORK_NAME="${MATCHING_NETWORKS[0]}"
+
+          echo "--- confirming the discovered network belongs to the production Compose project ---"
+          NETWORK_PROJECT_LABEL="$(docker network inspect "$NETWORK_NAME" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
+          if [ "$NETWORK_PROJECT_LABEL" != "$PRODUCTION_PROJECT" ]; then
+            echo "ERROR: network $NETWORK_NAME is labeled project '$NETWORK_PROJECT_LABEL', expected '$PRODUCTION_PROJECT'" >&2
+            exit 1
+          fi
+
+          echo "--- confirming jobpulse-api-prod is also attached to that same network ---"
+          API_NETWORKS=" $(docker inspect -f '{{range $net, $cfg := .NetworkSettings.Networks}}{{$net}} {{end}}' jobpulse-api-prod)"
+          case "$API_NETWORKS" in
+            *" $NETWORK_NAME "*) ;;
+            *)
+              echo "ERROR: jobpulse-api-prod is not attached to network $NETWORK_NAME -- unexpected topology" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Compose project: $PRODUCTION_PROJECT  network: $NETWORK_NAME"
+
+          echo "--- API health baseline (bounded, no retry) ---"
+          curl --connect-timeout 5 --max-time 10 -fsS http://127.0.0.1:8000/health > /dev/null
+
+          echo "--- API transport/enabled invariant baseline (narrow inspect only, never full env dump) ---"
+          API_SEARCH_TRANSPORT_VALUE_BEFORE="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^SEARCH_TRANSPORT=//p' | head -n1 || true)"
+          API_TOR_ENABLED_VALUE_BEFORE="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TOR_ENABLED=//p' | head -n1 || true)"
+          echo "API SEARCH_TRANSPORT before: ${API_SEARCH_TRANSPORT_VALUE_BEFORE:-<unset>}"
+          echo "API TOR_ENABLED before: ${API_TOR_ENABLED_VALUE_BEFORE:-<unset>}"
+
+          if [ -n "$API_SEARCH_TRANSPORT_VALUE_BEFORE" ] && [ "$API_SEARCH_TRANSPORT_VALUE_BEFORE" != "direct" ]; then
+            echo "ERROR: API SEARCH_TRANSPORT must be unset or exactly 'direct'; got '$API_SEARCH_TRANSPORT_VALUE_BEFORE' -- refusing to proceed" >&2
+            exit 1
+          fi
+          # docker-compose.prod.yml explicitly sets TOR_ENABLED=false on
+          # the api service -- an absent value during this preflight is
+          # therefore unexpected, not equivalent, and must fail closed.
+          if [ "$API_TOR_ENABLED_VALUE_BEFORE" != "false" ]; then
+            echo "ERROR: API TOR_ENABLED must be exactly 'false'; got '${API_TOR_ENABLED_VALUE_BEFORE:-<unset>}' -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "--- pre-run leftover guard, scoped to this production Compose project ---"
+          PRE_LEFTOVER="$(docker ps -a --filter "label=com.docker.compose.project=${PRODUCTION_PROJECT}" --filter "label=com.docker.compose.service=search-transport-canary" --format '{{.ID}}' || true)"
+          if [ -n "$PRE_LEFTOVER" ]; then
+            echo "ERROR: pre-existing search-transport-canary container(s) already present in project $PRODUCTION_PROJECT: $PRE_LEFTOVER -- refusing to start a new attempt" >&2
+            exit 1
+          fi
+
+          echo "--- pinning immutable API image (never :main/:latest) ---"
+          if docker image inspect "$API_IMAGE" > /dev/null 2>&1; then
+            echo "Immutable API image already present locally; no GHCR auth needed"
+          else
+            # Always isolate the pull in its own temporary Docker config
+            # dir, regardless of HAS_TOKEN -- an unset/blank DOCKER_CONFIG
+            # is indistinguishable to the Docker CLI from "not set", which
+            # falls back to the production user's real ~/.docker/config.json.
+            # Creating this unconditionally (before the optional login)
+            # guarantees docker pull below never touches that default.
+            TMP_DOCKER_CONFIG="$(mktemp -d)"
+            if [ "$HAS_TOKEN" = "true" ]; then
+              # The GHCR token arrives on THIS script's own stdin, piped
+              # through the SSH session that invoked it -- never as a
+              # command-line argument/argv, never Base64-transformed in
+              # transit, never printed.
+              DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker login ghcr.io -u mrezamaghouli --password-stdin
+            fi
+            DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$API_IMAGE"
+          fi
+          API_IMAGE_ID="$(docker image inspect "$API_IMAGE" --format '{{.Id}}')"
+
+          echo "--- safe pre-run Compose validation (services/profiles only, never the full resolved config) ---"
+          export JOBPULSE_API_IMAGE="$API_IMAGE"
+          export JOBPULSE_TOR_IMAGE="$TOR_IMAGE_REF_BEFORE"
+          export TOR_IP_CHECK_URL="$NEUTRAL_TARGET_URL"
+
+          COMPOSE_SERVICES="$(docker compose --project-directory /opt/jobpulse -p "$PRODUCTION_PROJECT" -f /opt/jobpulse/docker-compose.prod.yml -f "$REMOTE_OVERLAY_PATH" --profile tor-ops config --services)"
+          echo "$COMPOSE_SERVICES" | grep -qx "search-transport-canary"
+
+          COMPOSE_PROFILES="$(docker compose --project-directory /opt/jobpulse -p "$PRODUCTION_PROJECT" -f /opt/jobpulse/docker-compose.prod.yml -f "$REMOTE_OVERLAY_PATH" --profile tor-ops config --profiles)"
+          echo "$COMPOSE_PROFILES" | grep -qx "tor-ops"
+
+          echo "--- executing exactly ONE canary attempt (no retry, no loop) ---"
+          echo "Selected immutable API image: $API_IMAGE"
+          echo "Docker image ID: $API_IMAGE_ID"
+          echo "Selected Tor image: $TOR_IMAGE_REF_BEFORE"
+          echo "Compose project: $PRODUCTION_PROJECT"
+          echo "Network: $NETWORK_NAME"
+          echo "Neutral target hostname: check.torproject.org"
+
+          # Captured to a temporary file, then rejected post-run if it
+          # exceeds a 1 MiB threshold, rather than an unbounded command
+          # substitution -- this is a post-run size-threshold check, not
+          # a hard OS/filesystem cap on the file itself, but it still
+          # keeps a misbehaving child process from growing this script's
+          # own memory/log volume without bound. -T disables pseudo-TTY
+          # allocation and `< /dev/null` detaches stdin explicitly (this
+          # SSH session's own stdin was the now-drained GHCR token pipe)
+          # so the canary can never block waiting on it.
+          CANARY_OUTPUT_FILE="$(mktemp)"
+          CANARY_OUTPUT_CAP=1048576
+
+          set +e
+          docker compose --project-directory /opt/jobpulse -p "$PRODUCTION_PROJECT" -f /opt/jobpulse/docker-compose.prod.yml -f "$REMOTE_OVERLAY_PATH" --profile tor-ops run --rm --no-deps -T search-transport-canary < /dev/null > "$CANARY_OUTPUT_FILE" 2>&1
+          CANARY_EXIT=$?
+          set -e
+
+          CANARY_OUTPUT_BYTES="$(wc -c < "$CANARY_OUTPUT_FILE")"
+          OUTPUT_CAP_EXCEEDED=false
+          if [ "$CANARY_OUTPUT_BYTES" -gt "$CANARY_OUTPUT_CAP" ]; then
+            echo "ERROR: canary output exceeded the ${CANARY_OUTPUT_CAP}-byte safety cap ($CANARY_OUTPUT_BYTES bytes)" >&2
+            OUTPUT_CAP_EXCEEDED=true
+            head -c 4096 "$CANARY_OUTPUT_FILE"
+            echo "... (log truncated for safety only; the workflow fails below, it does not retry)"
+          else
+            # RequestExecutor may emit its own SEARCH_TRANSPORT_METRIC
+            # line before the canary's final JSON result line -- print
+            # the whole captured output, do not assume a single line.
+            cat "$CANARY_OUTPUT_FILE"
+          fi
+          echo "Canary exit code: $CANARY_EXIT"
+
+          FINAL_JSON_LINE=""
+          if [ "$OUTPUT_CAP_EXCEEDED" != "true" ]; then
+            FINAL_JSON_LINE="$(grep -v '^$' "$CANARY_OUTPUT_FILE" | tail -n1 || true)"
+          fi
+          rm -f "$CANARY_OUTPUT_FILE"
+
+          echo "--- post-run production invariant check (always runs, regardless of canary result) ---"
+          API_ID_AFTER="$(docker inspect -f '{{.Id}}' jobpulse-api-prod)"
+          API_RESTARTS_AFTER="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
+          API_RUNNING_AFTER="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
+          API_HEALTH_AFTER="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
+          API_IMAGE_ID_AFTER="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+          API_IMAGE_REF_AFTER="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+
+          TOR_ID_AFTER="$(docker inspect -f '{{.Id}}' jobpulse-tor-prod)"
+          TOR_RESTARTS_AFTER="$(docker inspect -f '{{.RestartCount}}' jobpulse-tor-prod)"
+          TOR_RUNNING_AFTER="$(docker inspect -f '{{.State.Running}}' jobpulse-tor-prod)"
+          TOR_HEALTH_AFTER="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-tor-prod)"
+          TOR_IMAGE_ID_AFTER="$(docker inspect -f '{{.Image}}' jobpulse-tor-prod)"
+          TOR_IMAGE_REF_AFTER="$(docker inspect -f '{{.Config.Image}}' jobpulse-tor-prod)"
+
+          INVARIANTS_OK=true
+          [ "$API_ID_AFTER" = "$API_ID_BEFORE" ] || { echo "ERROR: API container ID changed" >&2; INVARIANTS_OK=false; }
+          [ "$API_RESTARTS_AFTER" = "$API_RESTARTS_BEFORE" ] || { echo "ERROR: API restart count changed" >&2; INVARIANTS_OK=false; }
+          [ "$API_RUNNING_AFTER" = "true" ] || { echo "ERROR: API no longer running" >&2; INVARIANTS_OK=false; }
+          [ "$API_HEALTH_AFTER" = "$API_HEALTH_BEFORE" ] || { echo "ERROR: API health changed" >&2; INVARIANTS_OK=false; }
+          [ "$API_IMAGE_ID_AFTER" = "$API_IMAGE_ID_BEFORE" ] || { echo "ERROR: API image ID changed" >&2; INVARIANTS_OK=false; }
+          [ "$API_IMAGE_REF_AFTER" = "$API_IMAGE_REF_BEFORE" ] || { echo "ERROR: API image reference changed" >&2; INVARIANTS_OK=false; }
+
+          [ "$TOR_ID_AFTER" = "$TOR_ID_BEFORE" ] || { echo "ERROR: Tor container ID changed" >&2; INVARIANTS_OK=false; }
+          [ "$TOR_RESTARTS_AFTER" = "$TOR_RESTARTS_BEFORE" ] || { echo "ERROR: Tor restart count changed" >&2; INVARIANTS_OK=false; }
+          [ "$TOR_RUNNING_AFTER" = "true" ] || { echo "ERROR: Tor no longer running" >&2; INVARIANTS_OK=false; }
+          [ "$TOR_HEALTH_AFTER" = "healthy" ] || { echo "ERROR: Tor no longer healthy" >&2; INVARIANTS_OK=false; }
+          [ "$TOR_IMAGE_ID_AFTER" = "$TOR_IMAGE_ID_BEFORE" ] || { echo "ERROR: Tor image ID changed" >&2; INVARIANTS_OK=false; }
+          [ "$TOR_IMAGE_REF_AFTER" = "$TOR_IMAGE_REF_BEFORE" ] || { echo "ERROR: Tor image reference changed" >&2; INVARIANTS_OK=false; }
+
+          curl --connect-timeout 5 --max-time 10 -fsS http://127.0.0.1:8000/health > /dev/null || { echo "ERROR: API health check failed after canary" >&2; INVARIANTS_OK=false; }
+
+          API_SEARCH_TRANSPORT_VALUE_AFTER="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^SEARCH_TRANSPORT=//p' | head -n1 || true)"
+          if [ "${API_SEARCH_TRANSPORT_VALUE_AFTER:-}" != "${API_SEARCH_TRANSPORT_VALUE_BEFORE:-}" ]; then
+            echo "ERROR: API SEARCH_TRANSPORT changed" >&2
+            INVARIANTS_OK=false
+          fi
+
+          API_TOR_ENABLED_VALUE_AFTER="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TOR_ENABLED=//p' | head -n1 || true)"
+          if [ "${API_TOR_ENABLED_VALUE_AFTER:-}" != "${API_TOR_ENABLED_VALUE_BEFORE:-}" ]; then
+            echo "ERROR: API TOR_ENABLED changed" >&2
+            INVARIANTS_OK=false
+          fi
+
+          POST_LEFTOVER="$(docker ps -a --filter "label=com.docker.compose.project=${PRODUCTION_PROJECT}" --filter "label=com.docker.compose.service=search-transport-canary" --format '{{.ID}}' || true)"
+          if [ -n "$POST_LEFTOVER" ]; then
+            echo "ERROR: leftover search-transport-canary container(s) found in project $PRODUCTION_PROJECT: $POST_LEFTOVER" >&2
+            INVARIANTS_OK=false
+          fi
+
+          if [ "$INVARIANTS_OK" != "true" ]; then
+            echo "FATAL: post-run production invariant check failed" >&2
+            exit 1
+          fi
+
+          if [ "$OUTPUT_CAP_EXCEEDED" = "true" ]; then
+            echo "FATAL: canary output exceeded the safety cap -- treating as failure, not retrying" >&2
+            exit 1
+          fi
+
+          if [ "$CANARY_EXIT" -ne 0 ]; then
+            echo "Canary failed with exit code $CANARY_EXIT -- this workflow makes exactly ONE attempt and does NOT retry" >&2
+            exit "$CANARY_EXIT"
+          fi
+
+          echo "--- cross-checking the canary's final JSON line against its own exit-code claim of success ---"
+          # The canary's own exit code remains authoritative for failure
+          # (any non-zero exit above already stopped this script). This
+          # is a defensive sanity cross-check on top of that, not a
+          # replacement for it -- full semantic JSON validation (IsTor,
+          # IP shape, etc.) already happens inside the already-reviewed
+          # scripts.search_transport.canary implementation itself.
+          # python3/jq are not established host-level dependencies on
+          # this production VM (deploy.yml's own remote script uses only
+          # bash/awk/curl/docker/git), so this uses plain substring
+          # checks against the exact literal fields documented in
+          # docs/PRODUCTION_RUNBOOK.md's Phase 3.4L "Expected output"
+          # section rather than introducing a JSON parser.
+          for expected in '"ok": true' '"mode": "proxy"' '"proxy_listener_reachable": true' '"neutral_request_success": true' '"tor_route_verified": true'; do
+            case "$FINAL_JSON_LINE" in
+              *"$expected"*) ;;
+              *)
+                echo "FATAL: canary exited 0 but its final output line is inconsistent with success (missing $expected)" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          OBSERVED_EXIT_IP="$(printf '%s' "$FINAL_JSON_LINE" | grep -o '"observed_exit_ip": *"[^"]*"' || true)"
+          echo "Neutral canary succeeded; production invariants unchanged. ${OBSERVED_EXIT_IP}"
+          REMOTE_SCRIPT
+
+          cleanup_runner() {
+            rm -f ~/.ssh/jobpulse_neutral_canary_key /tmp/reviewed-overlay.yml "$REMOTE_SCRIPT_LOCAL"
+          }
+          trap cleanup_runner EXIT
+
+          REMOTE_OVERLAY_PATH="/tmp/jobpulse-neutral-canary-${RUN_ID}.yml"
+          REMOTE_SCRIPT_PATH="/tmp/jobpulse-neutral-canary-remote-${RUN_ID}.sh"
+          LOCAL_OVERLAY_SHA256="$(sha256sum /tmp/reviewed-overlay.yml | awk '{print $1}')"
+          API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"
+          HAS_TOKEN="false"
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            HAS_TOKEN="true"
+          fi
+
+          # Only these two temporary files are transferred -- never .env,
+          # .api_keys.env, .admin.env, .auth, cookies, storage state, the
+          # ControlPort password file, or database credentials.
+          scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -P "$VM_PORT" \
+            /tmp/reviewed-overlay.yml "$VM_USER@$VM_HOST:${REMOTE_OVERLAY_PATH}"
+          scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -P "$VM_PORT" \
+            "$REMOTE_SCRIPT_LOCAL" "$VM_USER@$VM_HOST:${REMOTE_SCRIPT_PATH}"
+
+          # The GHCR token (if any) travels ONLY through this ssh
+          # invocation's own stdin, piped straight into the remote
+          # script's `docker login --password-stdin` -- it is never
+          # Base64-encoded, never part of the ssh remote command
+          # string/argv, and never printed. If the immutable image is
+          # already present on the VM, the remote script never reads
+          # this stdin at all.
+          printf '%s' "${GHCR_TOKEN:-}" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            "bash '$REMOTE_SCRIPT_PATH' '$REMOTE_OVERLAY_PATH' '$LOCAL_OVERLAY_SHA256' '$API_IMAGE' '$NEUTRAL_TARGET_URL' '$HAS_TOKEN'"

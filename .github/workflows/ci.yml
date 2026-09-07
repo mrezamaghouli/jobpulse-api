@@ -173,6 +173,25 @@ jobs:
             tests/test_config.py \
             -v
 
+      - name: Run workflow structural regression tests
+        # Static/structural regression coverage for GitHub Actions
+        # workflow files themselves -- network-free, no Docker daemon,
+        # no SSH. tests/test_production_neutral_canary_workflow.py
+        # (Phase 3.4M) parses .github/workflows/production-neutral-canary.yml
+        # as YAML/text and its embedded shell (bash -n, generic
+        # docker-compose/ssh-keyscan/curl invocation detectors, Docker-auth
+        # branch semantics, etc.) without ever dispatching that
+        # workflow_dispatch-only workflow. tests/test_ci_workflow_structure.py
+        # performs the equivalent static audit of this CI workflow and
+        # deploy.yml. Kept as its own step (not folded into the suites
+        # above) so a failure here is attributable to workflow-file
+        # structure specifically.
+        run: |
+          PYTHONPATH=. python -m pytest \
+            tests/test_production_neutral_canary_workflow.py \
+            tests/test_ci_workflow_structure.py \
+            -q
+
       - name: Create dummy prod env files for compose validation
         shell: bash
         run: |
