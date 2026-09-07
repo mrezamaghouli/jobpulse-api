@@ -1873,3 +1873,289 @@ actually runs it:
   container image, comparable to the still-open Playwright/Chromium
   sandbox-flags item noted for `tor-diagnostic` above.
 
+## Phase 3.4M: Production Neutral Canary Runner Workflow
+
+The interactive session that develops and reviews this repository does
+not itself have SSH access to the production VM -- no `~/.ssh`
+directory, no `VM_SSH_KEY` material, and no TCP reachability to the
+host's SSH port from that environment. Running the Phase 3.4L neutral
+canary (above) against real production therefore cannot be done directly
+from that session. Instead, `.github/workflows/production-neutral-canary.yml`
+("Production Neutral Canary") provides a dedicated, manual-only GitHub
+Actions workflow that uses the repository's existing `VM_SSH_KEY` secret
+(the same one `.github/workflows/deploy.yml` already uses) to reach the
+VM on an operator's explicit request.
+
+**This is a separate workflow from Deploy Production, not a repurposing
+of it.** It never fetches/pulls/resets/checks out the production git
+checkout, never modifies `jobpulse-api-prod`'s configuration, never
+restarts or recreates it, and never runs
+`scripts/deploy_prod_from_ghcr.sh`.
+
+### Trigger and inputs
+
+`workflow_dispatch` only -- there is no push/pull_request/workflow_run/
+schedule trigger, so this workflow can never fire automatically. The job
+itself carries a `timeout-minutes: 12` ceiling (a safety backstop, not a
+retry mechanism -- see "Bounded execution" below). Two required inputs:
+
+- `image_sha` -- must be exactly the reviewed Phase 3.4L SHA,
+  `f4765f857355c6543f68cea0e481b7f20a917147` (also pinned as the
+  workflow's own `REVIEWED_IMAGE_SHA` constant). Being *an ancestor of
+  `main`* is a strictly broader condition than *the exact commit that
+  was specifically reviewed for this production-topology canary* -- a
+  later ancestor commit could touch `scripts/search_transport/canary.py`
+  or the `search-transport-canary` service definition without having
+  gone through the same review, so this runner version only trusts that
+  one exact SHA. A later reviewed workflow change may update
+  `REVIEWED_IMAGE_SHA` once a newer commit has been through its own
+  review. The workflow still independently proves the SHA is a real
+  commit, an ancestor of `origin/main`, and that it actually contains
+  `scripts/search_transport/canary.py` and a `search-transport-canary`
+  service in `docker-compose.prod.tor.yml` -- before ever touching SSH.
+  The runtime image is always `ghcr.io/mrezamaghouli/jobpulse-api:<image_sha>`,
+  never the mutable `:main`/`:latest` tags.
+- `confirmation` -- the operator must type exactly `RUN_NEUTRAL_CANARY`.
+  Any other value fails the workflow before SSH is even prepared.
+
+There is deliberately no input for a target URL, Tor host, SOCKS port,
+production host, arbitrary command, SSH command, Compose project, or
+ControlPort setting. The neutral endpoint is hard-coded to
+`https://check.torproject.org/api/ip` and cannot be overridden by an
+operator through this workflow.
+
+### What the workflow does, in order
+
+1. Fails closed unless the dispatch's ref is `refs/heads/main`.
+2. Fails closed unless `confirmation` is exactly `RUN_NEUTRAL_CANARY`.
+3. Validates `image_sha` is a 40-character lowercase hex SHA AND exactly
+   equals `REVIEWED_IMAGE_SHA`.
+4. Checks out the repository (full history) and proves `image_sha` is an
+   ancestor of `origin/main` that actually contains the reviewed canary
+   files, extracting `docker-compose.prod.tor.yml` from that exact
+   commit (never from this workflow branch's own working tree) as a
+   temporary overlay file, and records its SHA-256.
+5. Confirms `VM_SSH_KEY` is present (never printed).
+6. Writes the entire remote preflight/canary/invariant script to a local
+   temp file, SSHes to the VM using the existing host/user/port from
+   `deploy.yml` with bounded connection options (see "Bounded execution"
+   below), transfers that script plus the one temporary overlay file via
+   `scp`, and verifies the overlay's SHA-256 matches on the remote side
+   before doing anything else. Any optional GHCR token travels only
+   through this SSH invocation's own stdin (see "GHCR credential
+   handling" below) -- the remote script self-deletes on exit.
+7. On the VM (read-only first): records the production checkout's
+   current `HEAD`/`git status` without ever fetching/pulling/resetting
+   it; requires `jobpulse-api-prod` and `jobpulse-tor-prod` to already
+   exist; requires both containers to carry
+   `com.docker.compose.service=api`/`=tor` respectively and to share the
+   same `com.docker.compose.project` label (refusing to treat a
+   same-named unrelated container as production topology); requires Tor
+   to already be `running` and `healthy` (never
+   started/restarted/recreated by this workflow); discovers the exact
+   single network on which Tor carries the `tor` alias (failing closed on
+   zero or more than one match), cross-checks that network's own
+   `com.docker.compose.project` label against the discovered project, and
+   confirms the API container is attached to that same network; requires
+   the API's local `/health` endpoint (bounded, `--connect-timeout 5
+   --max-time 10`, no `--retry`) to already succeed; reads the API's
+   `SEARCH_TRANSPORT`/`TOR_ENABLED` values via a narrowly filtered
+   `docker inspect` (never a full environment dump) and refuses to
+   proceed unless `SEARCH_TRANSPORT` is unset or exactly `direct` (any
+   other value, not merely `proxy`, fails closed) and `TOR_ENABLED` is
+   exactly `false` (an absent value is now treated as unexpected and
+   fails closed, since `docker-compose.prod.yml` always sets it
+   explicitly); and checks, scoped to the discovered production Compose
+   project, that no pre-existing `search-transport-canary` container is
+   already present (refusing to start a new attempt without deleting
+   anything automatically).
+8. Reuses Tor's exact running image as `JOBPULSE_TOR_IMAGE` (never
+   pulling a new Tor image).
+9. Pins `JOBPULSE_API_IMAGE` to the immutable `:<image_sha>` tag; pulls it
+   only if not already present locally. GHCR authentication is skipped
+   entirely when the image is already present -- see "GHCR credential
+   handling" below for how the token is transported when a pull is
+   genuinely needed.
+10. Runs exactly ONE
+    `docker compose --project-directory /opt/jobpulse -p <project> -f docker-compose.prod.yml -f <overlay> --profile tor-ops run --rm --no-deps -T search-transport-canary < /dev/null`
+    -- `--no-deps` is mandatory so Compose can never start/recreate Tor
+    as a side effect; `-T`/`< /dev/null` detach stdin explicitly. No
+    retry, no loop, no command override. Output is written to a
+    temporary file rather than an unbounded shell variable; a post-run
+    1&nbsp;MiB output-size threshold check (not a hard filesystem cap)
+    fails the workflow outright if exceeded (never silently truncated)
+    after still running the post-run invariant checks below.
+11. Regardless of the canary's own exit code (including the internal
+    `run_with_deadline` deadline exit `124`), re-checks every invariant
+    above (container IDs, restart counts, running/health state, image
+    ID *and* image reference for both containers, API `/health`,
+    `SEARCH_TRANSPORT`, `TOR_ENABLED`, no leftover
+    `search-transport-canary` container scoped to the production
+    project) and fails the workflow if any of them changed -- this
+    check always runs before the workflow ever looks at the canary's own
+    exit code.
+12. On a `0` exit, cross-checks the canary's own last non-empty output
+    line against the literal success fields documented below (defensive
+    only -- the exit code remains authoritative for failure; see
+    "Canary output validation").
+13. Cleans up the temporary overlay file, the remote script itself
+    (self-deleting), and the temporary Docker auth directory via
+    `trap ... EXIT` on both the runner and the remote side, for every
+    failure that occurs once the remote script has started running --
+    see "Temporary file cleanup limitations" below for the narrower set
+    of earlier failure points this does not cover.
+
+### Bounded execution
+
+The canary's own internal `scripts.run_with_deadline` bound (60s + 5s
+kill-after grace) only bounds the single `docker compose run`
+invocation -- it does not bound GitHub's checkout/fetch, `ssh-keyscan`,
+`scp`, SSH connection establishment, an immutable image pull, Compose
+config inspection, or the host-level curl health checks. Two independent
+layers of bounding exist on top of that:
+
+- **Job-level ceiling**: `timeout-minutes: 12` on the `neutral-canary`
+  job -- an emergency ceiling, not a retry mechanism. Budget: checkout +
+  SHA validation (~30s) + SSH/SCP setup (~15s) + remote preflight/
+  topology checks (~15s) + a cold immutable-image pull in the worst case
+  the layers aren't already cached (~2-3 min) + Compose config validation
+  (~10s) + the bounded canary invocation itself (~65s max) + post-run
+  invariant checks and a second bounded health check (~20s) totals to
+  roughly 5-6 minutes in the worst realistic case; 12 minutes leaves
+  close to 2x margin. If the entire job is itself forcibly terminated by
+  this ceiling (as opposed to a normal script failure), GitHub Actions
+  may not give the in-progress remote `trap ... EXIT` handlers a chance
+  to run to completion -- this is a distinct, more severe failure mode
+  than every other documented failure path, which always runs the
+  post-run invariant checks and cleanup traps normally.
+- **SSH/SCP options**: every `ssh-keyscan`/`scp`/`ssh` call uses
+  `ConnectTimeout=10`, `ConnectionAttempts=1` (the effective connection
+  attempt count is always exactly one -- no OpenSSH-level retry),
+  `ServerAliveInterval=15`/`ServerAliveCountMax=4` (a protocol-level
+  keepalive that detects a genuinely dead network path without being
+  confused by a remote command that is legitimately silent for a while),
+  and `BatchMode=yes`/`StrictHostKeyChecking=yes` (no interactive prompt
+  can ever hang the job). Both API `/health` checks use
+  `--connect-timeout 5 --max-time 10` and never `--retry`.
+
+### Temporary file cleanup limitations
+
+The runner transfers two run-specific temporary files to the VM in
+sequence -- the overlay, then the remote script -- and only then
+executes the remote script over SSH. The remote script's own
+`trap cleanup_remote EXIT` (which removes its own file, the transferred
+overlay, and any temporary Docker auth directory) only starts running
+once that remote script itself begins executing. This means cleanup is
+**not** guaranteed for every failure mode:
+
+- If the overlay `scp` succeeds but the remote-script `scp` fails, the
+  overlay file is left behind on the VM under `/tmp` -- the runner's own
+  `cleanup_runner` trap only removes local files (the SSH key, the local
+  overlay copy, the local script copy), not anything already uploaded.
+- If both `scp` transfers succeed but the subsequent `ssh` invocation
+  fails to connect or exits before the remote script's own trap has
+  registered, both uploaded files can be left behind on the VM.
+- If the entire GitHub Actions job is forcibly terminated by the
+  `timeout-minutes: 12` ceiling, in-progress cleanup traps (local or
+  remote) may not get a chance to run to completion at all.
+
+This is accepted as a known, narrow limitation of the current transfer
+architecture rather than a reason to add a second SSH round-trip solely
+to sweep up this edge case. It is safe to accept because:
+
+- Every temporary path is scoped by the workflow run's own
+  `GITHUB_RUN_ID` (e.g. `/tmp/jobpulse-neutral-canary-<run-id>.yml`), so
+  a leftover file from one run can never collide with or be picked up
+  by another run.
+- Neither transferred file contains the GHCR token or any other secret
+  -- the token travels separately, directly over the SSH stdin pipe
+  into `docker login`, and is never written to either file.
+- No production application file, container, or configuration is
+  touched by a leftover temp file; it is inert data sitting under
+  `/tmp` on the VM.
+- This workflow never attempts to automatically delete arbitrary stale
+  files it does not recognize -- only the exact paths it itself created
+  in the current run, which is why a failure before the remote trap
+  registers can leave a same-run file behind instead of being swept by
+  some broader (and riskier) glob-based cleanup.
+
+Normal failures that occur *after* the remote script has started
+executing -- including the canary itself failing, invariant failures,
+or the output-size threshold being exceeded -- are still fully covered
+by the remote trap and do not leak temporary files.
+
+### GHCR credential handling
+
+The runner step reads the `GHCR_TOKEN` secret into its own environment
+(as any step referencing `secrets.GHCR_TOKEN` must) to derive a
+non-secret `HAS_TOKEN` boolean and to pipe the token into the SSH
+connection's stdin -- this happens on every invocation, regardless of
+whether the image later turns out to already be present. The accurate
+guarantee is about what happens to that token downstream, not whether
+the runner reads it:
+
+- It never appears in argv (only the non-secret `HAS_TOKEN` flag is
+  passed as a positional argument to the remote script) and is never
+  printed to logs.
+- It is never Base64-encoded or otherwise transformed in transit.
+- `docker image inspect` is checked first on the VM; when the image is
+  already present, the remote script never runs `docker login` or
+  `docker pull` at all, so the token is never consumed even though it
+  was already sitting in the (now-drained) SSH stdin pipe.
+- When a pull is genuinely needed, the remote script unconditionally
+  creates one temporary `DOCKER_CONFIG` directory first. If (and only
+  if) `HAS_TOKEN` is true, `docker login ghcr.io --password-stdin`
+  consumes the token from that stdin, scoped to that temporary
+  `DOCKER_CONFIG`. The subsequent `docker pull` -- whether or not a
+  login just happened -- always uses that same isolated temporary
+  `DOCKER_CONFIG`, never a blank/unset value, so it can never silently
+  fall back to the production user's default `~/.docker/config.json`.
+  That temporary directory is removed by the remote cleanup trap.
+- No token is ever persisted into the production user's normal Docker
+  config, and that normal config is never read or written by this
+  workflow's pull path in any of the three branches (image present;
+  image absent with a token; image absent without a token).
+
+### Canary output validation
+
+Canary stdout/stderr is written to a temporary file rather than an
+unbounded command substitution, and is rejected as a failure if it
+exceeds a post-run 1&nbsp;MiB output-size safety threshold -- this is a
+threshold checked with `wc -c` after the child process has already
+exited, not a hard OS/filesystem cap enforced on the file while it is
+being written. On a `0` exit, the
+last non-empty output line is checked for the literal success fields
+documented in this file's "Expected output" section
+(`"ok": true`, `"mode": "proxy"`, `"proxy_listener_reachable": true`,
+`"neutral_request_success": true`, `"tor_route_verified": true`) using
+plain substring matching -- not a JSON parser, since `python3`/`jq` are
+not established host-level dependencies on this production VM
+(`deploy.yml`'s own remote script uses only bash/awk/curl/docker/git).
+This is a defensive cross-check on top of the canary's own exit code,
+which remains authoritative for failure; full semantic validation
+(`IsTor`, IP shape, etc.) already happens inside the already-reviewed
+`scripts.search_transport.canary` implementation itself. The observed
+exit IP may be logged; nothing else from the output is treated as
+sensitive.
+
+### What this workflow will not do
+
+- It will not enable `SEARCH_TRANSPORT=proxy` on `jobpulse-api-prod`.
+- It will not send LinkedIn traffic through Tor -- the target is always
+  the fixed neutral endpoint.
+- It will not touch Tor's ControlPort, call `NEWNYM`, or rotate any
+  circuit -- the canary's only Tor path is the SOCKS listener
+  (`tor:9050`), exactly as in Phase 3.4L.
+- It will not update, reset, or check out the production git repository.
+- It will not start, restart, or recreate `tor` or `jobpulse-api-prod`.
+- It will not retry a failed canary attempt, regardless of which of the
+  canary's own exit codes (or the internal deadline's `124`) it failed
+  with.
+
+### Authorization
+
+Implementing and structurally testing this workflow (Phase 3.4M-A) is a
+separate, prior step from actually dispatching it against production. A
+later, separate authorization is required before an operator runs it for
+real.
+
