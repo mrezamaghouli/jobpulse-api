@@ -38,6 +38,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Create CI env file
         run: |
@@ -181,7 +183,12 @@ jobs:
         # as YAML/text and its embedded shell (bash -n, generic
         # docker-compose/ssh-keyscan/curl invocation detectors, Docker-auth
         # branch semantics, etc.) without ever dispatching that
-        # workflow_dispatch-only workflow. tests/test_ci_workflow_structure.py
+        # workflow_dispatch-only workflow. tests/test_production_direct_runtime_upgrade_workflow.py
+        # (Phase 3.4N-B) performs the equivalent static/ordering audit of
+        # .github/workflows/production-direct-runtime-upgrade.yml --
+        # including proving the candidate-before-git-reset ordering and
+        # the rollback structure -- without ever dispatching that
+        # workflow_dispatch-only workflow either. tests/test_ci_workflow_structure.py
         # performs the equivalent static audit of this CI workflow and
         # deploy.yml. Kept as its own step (not folded into the suites
         # above) so a failure here is attributable to workflow-file
@@ -189,6 +196,7 @@ jobs:
         run: |
           PYTHONPATH=. python -m pytest \
             tests/test_production_neutral_canary_workflow.py \
+            tests/test_production_direct_runtime_upgrade_workflow.py \
             tests/test_ci_workflow_structure.py \
             -q
 

@@ -1,0 +1,1441 @@
+name: Production Direct Runtime Upgrade
+
+# Manual-only. There is deliberately no push/pull_request/workflow_run/
+# schedule/repository_dispatch trigger -- the ONLY way this workflow can
+# ever run is an operator explicitly clicking "Run workflow" (or the
+# dispatch API) and typing the exact confirmation token below. This is a
+# SEPARATE, dedicated runner from .github/workflows/deploy.yml (left
+# entirely untouched by this workflow): deploy.yml's workflow_dispatch
+# path resolves to the floating :main tag / origin/main ref with zero
+# SHA pinning, has no confirmation-token gate, and its rollback logic
+# would corrupt an immutable SHA tag if ever pointed at one (see
+# docs/PRODUCTION_RUNBOOK.md's Phase 3.4N-B section for the full
+# rationale). This workflow exists to perform exactly ONE thing: move
+# production's API runtime from the exact currently-live commit to the
+# exact reviewed target commit, with SEARCH_TRANSPORT staying "direct"
+# and TOR_ENABLED staying "false" throughout. It never sets
+# SEARCH_TRANSPORT=proxy, never configures TOR_SOCKS_*/TOR_CONTROL_*,
+# never contacts LinkedIn, never runs a collector/queue script, and never
+# recreates db/frontend/tor -- only the api service is reconciled. See
+# docs/PRODUCTION_RUNBOOK.md's Phase 3.4N-B section for the full
+# procedure and safety rationale.
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: >-
+          Must be exactly the reviewed direct-mode target commit/merge
+          SHA f4765f857355c6543f68cea0e481b7f20a917147 -- this runner
+          version only trusts that one specific, already-reviewed commit
+          as a real production runtime-upgrade target (being merely an
+          ancestor of main is not the same as having been specifically
+          reviewed for this). A future reviewed workflow change may
+          update the accepted SHA once a newer commit has been through
+          its own review.
+        required: true
+        type: string
+      confirmation:
+        description: >-
+          Type exactly UPGRADE_DIRECT_RUNTIME to confirm. This recreates
+          ONLY the production api container on the reviewed immutable
+          target image and, only after that candidate is verified
+          healthy/direct/unchanged-topology, advances the production git
+          checkout to the same target commit. It never modifies db,
+          frontend, or tor, never sets SEARCH_TRANSPORT=proxy or any
+          TOR_SOCKS_*/TOR_CONTROL_* value, and never runs a
+          collector/queue script.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-direct-runtime-upgrade
+  cancel-in-progress: false
+
+env:
+  VM_HOST: "35.192.251.190"
+  VM_USER: "mrezamaghouli"
+  VM_PORT: "22"
+  # The one specific commit this runner version trusts as a direct-mode
+  # runtime-upgrade target -- see the image_sha input description above.
+  REVIEWED_TARGET_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  # The exact commit this runner version requires production to already
+  # be running before it will touch anything -- refuses to guess/adapt
+  # to a different live runtime.
+  EXPECTED_CURRENT_SHA: "148bd362b37c82c92737382d181fbdeac4d2187b"
+  IMAGE_SHA: ${{ inputs.image_sha }}
+  CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  direct-runtime-upgrade:
+    runs-on: ubuntu-latest
+    # Safety ceiling, not a retry mechanism -- this runner makes exactly
+    # one candidate attempt and, on any failure, performs at most one
+    # rollback attempt; nothing here loops or re-dispatches. Budget:
+    # checkout+SHA/compose validation (~30s) + SSH/SCP setup (~15s) +
+    # remote preflight/lock/process checks, INCLUDING the
+    # scheduler-provenance scan (crontab/root-crontab/cron.d reads plus
+    # a systemd unit-file enumeration, each external call individually
+    # bounded by a 5s `timeout` backstop -- typically well under a
+    # minute in practice, observed ~20s against a few hundred systemd
+    # units; a pathological case where every call hangs to its full
+    # backstop is bounded only by (unit count x 5s), which is why this
+    # job-level ceiling exists as the final backstop) + a cold immutable
+    # image pull in the worst case (~2-3 min) + bounded candidate health
+    # checks (up to 30 attempts x2s = 60s, x2 for direct+nginx paths) +
+    # git reset + final bounded health re-verification (another ~120s
+    # worst case) totals to roughly 7-8 minutes in the typical worst
+    # case; 15 minutes leaves comfortable margin without leaving an
+    # effectively-unbounded job hanging indefinitely.
+    timeout-minutes: 15
+    steps:
+      # Must run before anything that prepares SSH or contacts
+      # production: a workflow_dispatch can technically be launched
+      # against any ref, so this fails closed unless the dispatch was
+      # made from main.
+      - name: Require dispatch from main
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${{ github.ref }}')" >&2
+            exit 1
+          fi
+
+      - name: Require exact confirmation token
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRMATION" != "UPGRADE_DIRECT_RUNTIME" ]; then
+            echo "ERROR: confirmation input must be exactly UPGRADE_DIRECT_RUNTIME" >&2
+            exit 1
+          fi
+
+      - name: Validate image_sha shape and pin to the reviewed target SHA
+        run: |
+          set -euo pipefail
+          if ! [[ "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: image_sha must be exactly a 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+
+          # Being an ancestor of main is broader than "the exact commit
+          # that was reviewed for this direct-mode runtime upgrade" -- a
+          # later ancestor commit could touch app/config.py or
+          # docker-compose.prod.yml without having gone through the same
+          # review. This runner version only trusts REVIEWED_TARGET_SHA;
+          # a later reviewed workflow change may update it once a newer
+          # commit has been through its own review.
+          if [ "$IMAGE_SHA" != "$REVIEWED_TARGET_SHA" ]; then
+            echo "ERROR: image_sha must be exactly the reviewed target SHA ($REVIEWED_TARGET_SHA); got '$IMAGE_SHA'" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prove target SHA is a reviewed ancestor of main and extract its compose file
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git cat-file -e "${IMAGE_SHA}^{commit}"
+          git merge-base --is-ancestor "$IMAGE_SHA" origin/main
+
+          # Prove this exact commit actually contains the reviewed
+          # direct-mode runtime -- not merely any ancestor of main.
+          git show "${IMAGE_SHA}:app/config.py" > /dev/null
+          git show "${IMAGE_SHA}:scripts/search_transport/transport.py" > /dev/null
+          git show "${IMAGE_SHA}:scripts/search_transport/executor.py" > /dev/null
+          git show "${IMAGE_SHA}:scripts/providers/linkedin_browser_provider.py" > /dev/null
+          git show "${IMAGE_SHA}:scripts/repair_jobpulse_schema.py" > /dev/null
+
+          # The candidate compose file MUST come from the target commit
+          # itself, never from this workflow branch's own working tree,
+          # so the production compose comparison below is provably
+          # anchored to the same reviewed commit as the image. Fixed
+          # path (not mktemp): handed off to a LATER step, and GitHub
+          # Actions steps share a filesystem but not shell variables.
+          # This job's own concurrency group already prevents two runs
+          # of this workflow from ever executing at once on the same or
+          # a different ephemeral, single-use GitHub-hosted runner.
+          git show "${IMAGE_SHA}:docker-compose.prod.yml" > /tmp/target-compose.yml
+
+          echo "Target compose SHA-256: $(sha256sum /tmp/target-compose.yml | awk '{print $1}')"
+
+      - name: Verify target compose invariants (api stays direct, no Tor wiring)
+        run: |
+          python3 - <<'PY'
+          import sys
+          import yaml
+
+          with open("/tmp/target-compose.yml") as fh:
+              compose = yaml.safe_load(fh)
+
+          api = compose["services"]["api"]
+
+          errors = []
+
+          image = api.get("image", "")
+          if "JOBPULSE_API_IMAGE" not in image:
+              errors.append(f"api.image is not controlled by JOBPULSE_API_IMAGE: {image!r}")
+
+          env = api.get("environment", {}) or {}
+          tor_enabled = env.get("TOR_ENABLED")
+          if tor_enabled != "false":
+              errors.append(f"api.environment.TOR_ENABLED is not the literal 'false': {tor_enabled!r}")
+
+          if "TOR_SOCKS_HOST" in env:
+              errors.append("api.environment must not set TOR_SOCKS_HOST")
+          if "TOR_SOCKS_PORT" in env:
+              errors.append("api.environment must not set TOR_SOCKS_PORT")
+          if env.get("SEARCH_TRANSPORT") == "proxy":
+              errors.append("api.environment must not set SEARCH_TRANSPORT=proxy")
+
+          depends_on = api.get("depends_on", {}) or {}
+          if "tor" in depends_on:
+              errors.append("api.depends_on must not include tor")
+
+          command = api.get("command", "")
+          schema_index = command.find("scripts.repair_jobpulse_schema")
+          uvicorn_index = command.find("uvicorn")
+          if schema_index == -1:
+              errors.append("api.command no longer runs scripts.repair_jobpulse_schema")
+          if uvicorn_index == -1:
+              errors.append("api.command no longer runs uvicorn")
+          if schema_index != -1 and uvicorn_index != -1 and schema_index > uvicorn_index:
+              errors.append("api.command does not run schema repair before uvicorn")
+
+          if errors:
+              for error in errors:
+                  print(f"ERROR: {error}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Target compose invariants verified: api stays direct, no Tor wiring.")
+          PY
+
+      - name: Validate VM_SSH_KEY secret is present
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "ERROR: VM_SSH_KEY secret is missing" >&2
+            exit 1
+          fi
+
+      - name: Run the immutable direct-runtime upgrade on production
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          TARGET_COMPOSE_SHA256="$(sha256sum /tmp/target-compose.yml | awk '{print $1}')"
+          TARGET_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_direct_upgrade_key
+          chmod 600 ~/.ssh/jobpulse_direct_upgrade_key
+
+          # -T bounds the key-fetch connection itself. Populating
+          # known_hosts up front lets StrictHostKeyChecking=yes below
+          # fail closed on a mismatch instead of prompting.
+          ssh-keyscan -T 10 -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          # Bounded SSH/SCP options, applied consistently to every
+          # connection this step makes -- identical discipline to the
+          # already-reviewed, already-production-proven Phase 3.4M
+          # Production Neutral Canary runner.
+          SSH_OPTS=(-o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          SSH_KEY_PATH=~/.ssh/jobpulse_direct_upgrade_key
+
+          REMOTE_SCRIPT_LOCAL="$(mktemp)"
+          cat > "$REMOTE_SCRIPT_LOCAL" <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          TARGET_COMPOSE_SHA256="$1"
+          TARGET_IMAGE="$2"
+          TARGET_SHA="$3"
+          HAS_TOKEN="$4"
+          REMOTE_SCRIPT_SELF="$0"
+
+          PRODUCTION_PROJECT="jobpulse"
+          COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"
+          # CYCLE_LOCK_PATH is NOT hard-coded here -- it is resolved at
+          # runtime (see "checking for launcher-level" and "resolving
+          # effective production collection-cycle lock path" below) by
+          # checking for a launcher-level (crontab/systemd) override and
+          # then sourcing $ROOT/.collection.env exactly like
+          # scripts/run_collection_cycle_safe.sh does, before flock is
+          # ever invoked.
+          EXPECTED_CURRENT_SHA="148bd362b37c82c92737382d181fbdeac4d2187b"
+
+          WORKFLOW_SUCCESS=false
+          # *_MUTATION_STARTED is set IMMEDIATELY BEFORE its mutating
+          # command runs (not after it returns) so the EXIT trap's
+          # rollback-eligibility decision is correct even when that
+          # mutating command itself partially applies and then exits
+          # non-zero. CANDIDATE_API_RECREATED/GIT_RESET_DONE are kept as
+          # separate post-success reporting flags only -- they must never
+          # be used to decide rollback eligibility.
+          API_MUTATION_STARTED=false
+          GIT_MUTATION_STARTED=false
+          CANDIDATE_API_RECREATED=false
+          GIT_RESET_DONE=false
+          ROLLBACK_TAG=""
+          TMP_DOCKER_CONFIG=""
+          CYCLE_LOCK_FD=""
+
+          rollback_api() {
+            echo "ROLLBACK: recreating api with previous image (ID $API_IMAGE_ID_BEFORE) via $ROLLBACK_TAG" >&2
+            JOBPULSE_API_IMAGE="$ROLLBACK_TAG" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps api
+
+            local rb_healthy=false
+            local attempt
+            for attempt in $(seq 1 30); do
+              if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1; then
+                rb_healthy=true
+                break
+              fi
+              sleep 2
+            done
+
+            # Additional defense-in-depth check: bounded nginx-path
+            # health, same as the candidate's own two-path validation.
+            local rb_nginx_healthy=false
+            for attempt in $(seq 1 30); do
+              if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null 2>&1; then
+                rb_nginx_healthy=true
+                break
+              fi
+              sleep 2
+            done
+
+            local rb_running rb_health rb_image_id
+            rb_running="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
+            rb_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
+            rb_image_id="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+
+            if [ "$rb_healthy" != "true" ] || [ "$rb_nginx_healthy" != "true" ] || [ "$rb_running" != "true" ] || [ "$rb_health" != "healthy" ] || [ "$rb_image_id" != "$API_IMAGE_ID_BEFORE" ]; then
+              echo "FATAL: API rollback did not restore expected running/healthy/image-id state" >&2
+              return 1
+            fi
+
+            # The old (pre-upgrade) image predates the reviewed
+            # SearchTransport abstraction -- it cannot be trusted to
+            # expose get_search_transport_mode(). Re-prove the same
+            # direct/no-Tor invariant this runner requires everywhere
+            # else via narrow env inspection only (never a full env dump).
+            local rb_search_transport rb_tor_enabled
+            rb_search_transport="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^SEARCH_TRANSPORT=//p' | head -n1 || true)"
+            rb_tor_enabled="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TOR_ENABLED=//p' | head -n1 || true)"
+
+            if [ -n "$rb_search_transport" ] && [ "$rb_search_transport" != "direct" ]; then
+              echo "FATAL: rollback API SEARCH_TRANSPORT is not unset/direct (got '$rb_search_transport')" >&2
+              return 1
+            fi
+            if [ "$rb_tor_enabled" != "false" ]; then
+              echo "FATAL: rollback API TOR_ENABLED is not exactly 'false' (got '${rb_tor_enabled:-<unset>}')" >&2
+              return 1
+            fi
+
+            echo "ROLLBACK: API restored to previous image, running+healthy, direct/no-Tor invariant holds" >&2
+            return 0
+          }
+
+          rollback_git() {
+            echo "ROLLBACK: restoring production git checkout to $EXPECTED_CURRENT_SHA" >&2
+            git fetch origin main
+            git reset --hard "$EXPECTED_CURRENT_SHA"
+
+            local head_after
+            head_after="$(git rev-parse HEAD)"
+            if [ "$head_after" != "$EXPECTED_CURRENT_SHA" ]; then
+              echo "FATAL: git rollback did not land on expected SHA (got $head_after)" >&2
+              return 1
+            fi
+
+            echo "ROLLBACK: production git checkout restored to $EXPECTED_CURRENT_SHA" >&2
+            return 0
+          }
+
+          capture_container_state() {
+            local name="$1"
+            if docker inspect "$name" > /dev/null 2>&1; then
+              docker inspect -f '{{.Id}}|{{.RestartCount}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Image}}|{{.Config.Image}}' "$name"
+            else
+              echo "ABSENT"
+            fi
+          }
+
+          # ---------------------------------------------------------------
+          # Restricted, non-executing scheduler-provenance parser. Every
+          # function below treats crontab/systemd/.collection.env
+          # content as DATA ONLY -- never sourced, never eval'd. Called
+          # at top level (never inside a `$(...)` subshell) wherever
+          # `exit` must terminate the real script, not a throwaway
+          # subshell.
+          # ---------------------------------------------------------------
+
+          # parse_assignment_line <line> -- matches "[export ]NAME=value"
+          # (NAME a plain shell identifier). Sets ASSIGN_NAME/
+          # ASSIGN_VALUE_RAW on success.
+          parse_assignment_line() {
+            local line="$1"
+            if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+              ASSIGN_NAME="${BASH_REMATCH[2]}"
+              ASSIGN_VALUE_RAW="${BASH_REMATCH[3]}"
+              return 0
+            fi
+            return 1
+          }
+
+          # extract_literal_value <raw> <context> -- <context> "shell"
+          # additionally strips one trailing " #comment" (real
+          # .collection.env sourcing semantics); "cron" does not (cron's
+          # own variable-assignment parsing never strips comments). Only
+          # single/double-quoted LITERAL values (double-quoted values
+          # containing $ or a backtick are rejected -- that would be
+          # real shell expansion, which this parser never performs) or a
+          # bare unquoted value built ONLY from an explicit allowlist of
+          # path-safe characters are accepted. Prints the literal value
+          # and returns 0 on success; returns 1 (prints nothing) for any
+          # other form -- $VAR, ${VAR}, $(...), backticks, arithmetic
+          # expansion, or any other shell construct are never evaluated,
+          # only ever rejected as unsupported.
+          extract_literal_value() {
+            local raw="$1" context="$2" value
+
+            if [ "$context" = "shell" ]; then
+              if [[ "$raw" =~ ^([^\#]*[^[:space:]\#])[[:space:]]+\#.*$ ]]; then
+                value="${BASH_REMATCH[1]}"
+              elif [[ "$raw" != *"#"* ]]; then
+                value="$raw"
+              else
+                return 1
+              fi
+            else
+              value="$raw"
+            fi
+
+            value="${value%"${value##*[![:space:]]}"}"
+
+            if [[ "$value" =~ ^\'(.*)\'$ ]]; then
+              value="${BASH_REMATCH[1]}"
+              [[ "$value" == *"'"* ]] && return 1
+            elif [[ "$value" =~ ^\"(.*)\"$ ]]; then
+              value="${BASH_REMATCH[1]}"
+              [[ "$value" == *'"'* ]] && return 1
+              if [[ "$value" == *'$'* ]] || [[ "$value" == *'`'* ]]; then
+                return 1
+              fi
+            else
+              # Allowlist, not a denylist: only plain path-safe
+              # characters are accepted for a bare unquoted value.
+              if ! [[ "$value" =~ ^[A-Za-z0-9/._-]+$ ]]; then
+                return 1
+              fi
+            fi
+
+            [ -z "$value" ] && return 1
+            printf '%s' "$value"
+            return 0
+          }
+
+          # parse_job_line <line> <mode:user|system> -- "user" is the
+          # 5-schedule-field format `crontab -l` prints; "system" is
+          # /etc/crontab's and /etc/cron.d/*'s extended format with an
+          # extra user field. Also accepts the `@keyword command` form.
+          # Sets JOB_COMMAND on success.
+          parse_job_line() {
+            local line="$1" mode="$2"
+            if [[ "$line" =~ ^[[:space:]]*@[A-Za-z]+[[:space:]]+(.+)$ ]]; then
+              JOB_COMMAND="${BASH_REMATCH[1]}"
+              return 0
+            fi
+            local f1 f2 f3 f4 f5 f6 remainder
+            if [ "$mode" = "system" ]; then
+              read -r f1 f2 f3 f4 f5 f6 remainder <<< "$line"
+              if [ -z "${f1:-}" ] || [ -z "${f2:-}" ] || [ -z "${f3:-}" ] || [ -z "${f4:-}" ] || [ -z "${f5:-}" ] || [ -z "${f6:-}" ] || [ -z "${remainder:-}" ]; then
+                return 1
+              fi
+              JOB_COMMAND="$remainder"
+              return 0
+            else
+              read -r f1 f2 f3 f4 f5 remainder <<< "$line"
+              if [ -z "${f1:-}" ] || [ -z "${f2:-}" ] || [ -z "${f3:-}" ] || [ -z "${f4:-}" ] || [ -z "${f5:-}" ] || [ -z "${remainder:-}" ]; then
+                return 1
+              fi
+              JOB_COMMAND="$remainder"
+              return 0
+            fi
+          }
+
+          # classify_wrapper_command <command> -- prints IRRELEVANT if
+          # <command> does not mention run_collection_cycle_safe.sh at
+          # all; WRAPPER_SIMPLE if it is a plain, directly-understood
+          # invocation (optional leading path, the script name as its
+          # own word, only an output-redirection suffix allowed after
+          # it); WRAPPER_UNSUPPORTED for anything shell-wrapped
+          # (bash/sh -c, env, source/., pipes, &&/||/;, command
+          # substitution, backticks) or otherwise not directly
+          # understood.
+          classify_wrapper_command() {
+            local command="$1"
+            if [[ "$command" != *"run_collection_cycle_safe.sh"* ]]; then
+              printf 'IRRELEVANT'
+              return 0
+            fi
+            if [[ "$command" =~ (\&\&|\|\||;|\||\`|\$\(|(^|[[:space:]])bash[[:space:]]+-c([[:space:]]|$)|(^|[[:space:]])sh[[:space:]]+-c([[:space:]]|$)|(^|[[:space:]])env([[:space:]]|$)|(^|[[:space:]])source([[:space:]]|$)|(^|[[:space:]])\.[[:space:]]) ]]; then
+              printf 'WRAPPER_UNSUPPORTED'
+              return 0
+            fi
+            if [[ "$command" =~ ^[[:space:]]*([A-Za-z0-9_./-]*/)?run_collection_cycle_safe\.sh([[:space:]]|$) ]]; then
+              local trailing="${command#*run_collection_cycle_safe.sh}"
+              if [[ "$trailing" =~ ^[[:space:]]*(\>\>?[[:space:]]*[A-Za-z0-9_./-]+([[:space:]]+[0-9]*\>\&[0-9])?)?[[:space:]]*$ ]]; then
+                printf 'WRAPPER_SIMPLE'
+                return 0
+              fi
+            fi
+            printf 'WRAPPER_UNSUPPORTED'
+            return 0
+          }
+
+          DISCOVERED_LAUNCHERS=()
+
+          # scan_cron_source <label> <mode:user|system> <content> --
+          # walks <content> IN ORDER, maintaining the currently-effective
+          # values of the two relevant variables as it goes (matching
+          # real cron semantics: an assignment only affects JOB LINES
+          # that follow it). Appends "root|lock|label" to the global
+          # DISCOVERED_LAUNCHERS array for every recognized invocation of
+          # run_collection_cycle_safe.sh. Any line that mentions either
+          # relevant variable name or the script name, but does not
+          # cleanly resolve to exactly one well-understood form, fails
+          # the whole script closed immediately -- a line mentioning
+          # neither is skipped without further inspection, since it
+          # cannot affect this resolver's concerns regardless of shape.
+          scan_cron_source() {
+            local label="$1" mode="$2" content="$3"
+            local cur_root="" cur_lock=""
+            local line
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+              local mentions_var=false mentions_script=false
+              if [[ "$line" == *"JOBPULSE_COLLECTION_ROOT"* ]] || [[ "$line" == *"JOBPULSE_COLLECTION_CYCLE_LOCK_PATH"* ]]; then
+                mentions_var=true
+              fi
+              if [[ "$line" == *"run_collection_cycle_safe.sh"* ]]; then
+                mentions_script=true
+              fi
+              if [ "$mentions_var" = "false" ] && [ "$mentions_script" = "false" ]; then
+                continue
+              fi
+
+              if [ "$mentions_var" = "true" ]; then
+                if [ "$mentions_script" = "true" ]; then
+                  echo "ERROR: $label has a single line referencing both a relevant variable and the wrapper script -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                fi
+                if ! parse_assignment_line "$line"; then
+                  echo "ERROR: $label references a relevant variable in a line that is not a recognizable assignment -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                fi
+                case "$ASSIGN_NAME" in
+                  JOBPULSE_COLLECTION_ROOT|JOBPULSE_COLLECTION_CYCLE_LOCK_PATH)
+                    local extracted
+                    if ! extracted="$(extract_literal_value "$ASSIGN_VALUE_RAW" "cron")"; then
+                      echo "ERROR: $label sets $ASSIGN_NAME in an unsupported form -- refusing to guess, failing closed (${line})" >&2
+                      exit 1
+                    fi
+                    if [ "$ASSIGN_NAME" = "JOBPULSE_COLLECTION_ROOT" ]; then
+                      cur_root="$extracted"
+                    else
+                      cur_lock="$extracted"
+                    fi
+                    ;;
+                  *)
+                    echo "ERROR: $label: assignment target does not match either relevant variable name exactly -- refusing to guess, failing closed (${line})" >&2
+                    exit 1
+                    ;;
+                esac
+                continue
+              fi
+
+              # mentions_script = true, mentions_var = false here
+              if ! parse_job_line "$line" "$mode"; then
+                echo "ERROR: $label references run_collection_cycle_safe.sh in a line that is not a recognizable job entry -- refusing to guess, failing closed (${line})" >&2
+                exit 1
+              fi
+              local classification
+              classification="$(classify_wrapper_command "$JOB_COMMAND")"
+              case "$classification" in
+                WRAPPER_SIMPLE)
+                  DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}|${label}")
+                  ;;
+                *)
+                  echo "ERROR: $label invokes (or references) run_collection_cycle_safe.sh in an unsupported/unrecognized form -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                  ;;
+              esac
+            done <<< "$content"
+          }
+
+          # scan_systemd_unit <unit> -- reads the EFFECTIVE (base unit +
+          # every drop-in, already merged by systemd itself)
+          # configuration via `systemctl cat`, so a drop-in that adds an
+          # Environment= line without repeating ExecStart= is still
+          # accounted for. `EnvironmentFile=` is unsupported (it points
+          # at another file this resolver cannot safely parse as data
+          # without knowing its format) and fails closed. Only a single
+          # bare `Environment=NAME=value` line (no other NAME=value pair
+          # sharing it) is a supported form for a relevant variable.
+          scan_systemd_unit() {
+            local unit="$1"
+            local effective
+            if ! effective="$(timeout 5 systemctl cat "$unit" 2>&1)"; then
+              echo "ERROR: could not read effective configuration for systemd unit $unit (systemctl cat failed) -- refusing to proceed" >&2
+              exit 1
+            fi
+
+            local cur_root="" cur_lock="" found_exec=false
+            local line
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^[[:space:]]*EnvironmentFile= ]]; then
+                echo "ERROR: systemd unit $unit uses EnvironmentFile=, which this resolver does not follow as data -- refusing to proceed" >&2
+                exit 1
+              fi
+
+              local mentions_var=false mentions_script=false
+              if [[ "$line" == *"JOBPULSE_COLLECTION_ROOT"* ]] || [[ "$line" == *"JOBPULSE_COLLECTION_CYCLE_LOCK_PATH"* ]]; then
+                mentions_var=true
+              fi
+              if [[ "$line" == *"run_collection_cycle_safe.sh"* ]]; then
+                mentions_script=true
+              fi
+              if [ "$mentions_var" = "false" ] && [ "$mentions_script" = "false" ]; then
+                continue
+              fi
+
+              if [ "$mentions_var" = "true" ]; then
+                if [ "$mentions_script" = "true" ]; then
+                  echo "ERROR: systemd unit $unit has a single line referencing both a relevant variable and the wrapper script -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                fi
+                if [[ "$line" =~ ^[[:space:]]*Environment=\"?(JOBPULSE_COLLECTION_ROOT|JOBPULSE_COLLECTION_CYCLE_LOCK_PATH)=([^[:space:]\"]*)\"?[[:space:]]*$ ]]; then
+                  local name="${BASH_REMATCH[1]}" raw="${BASH_REMATCH[2]}"
+                  local extracted
+                  if ! extracted="$(extract_literal_value "$raw" "cron")"; then
+                    echo "ERROR: systemd unit $unit sets $name in an unsupported form -- refusing to guess, failing closed (${line})" >&2
+                    exit 1
+                  fi
+                  if [ "$name" = "JOBPULSE_COLLECTION_ROOT" ]; then
+                    cur_root="$extracted"
+                  else
+                    cur_lock="$extracted"
+                  fi
+                else
+                  echo "ERROR: systemd unit $unit references a relevant variable in an unsupported Environment= form -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                fi
+                continue
+              fi
+
+              # mentions_script = true here
+              if [[ "$line" =~ ^[[:space:]]*ExecStart(Pre|Post)?=(.*)$ ]]; then
+                local exec_body="${BASH_REMATCH[2]}"
+                exec_body="${exec_body#[-+!@]}"
+                local classification
+                classification="$(classify_wrapper_command "$exec_body")"
+                case "$classification" in
+                  WRAPPER_SIMPLE)
+                    found_exec=true
+                    ;;
+                  *)
+                    echo "ERROR: systemd unit $unit invokes run_collection_cycle_safe.sh in an unsupported form -- refusing to guess, failing closed (${line})" >&2
+                    exit 1
+                    ;;
+                esac
+              else
+                echo "ERROR: systemd unit $unit references run_collection_cycle_safe.sh outside a recognized ExecStart= line -- refusing to guess, failing closed (${line})" >&2
+                exit 1
+              fi
+            done <<< "$effective"
+
+            if [ "$found_exec" = "true" ]; then
+              DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}|systemd:${unit}")
+            fi
+          }
+
+          # scan_launchers -- populates DISCOVERED_LAUNCHERS from every
+          # source this SSH-authenticated account can read: its own
+          # crontab, /etc/crontab, every file under /etc/cron.d, root's
+          # crontab (via a bounded, non-interactive `sudo -n` read --
+          # never prompts for a password, never installs/changes sudo
+          # rules), and every readable systemd service unit's effective
+          # configuration. Every external command is bounded by
+          # `timeout`. Any source that cannot be read/enumerated in a
+          # bounded way -- including root's crontab if no
+          # passwordless-sudo grant for exactly that command exists --
+          # fails the whole script closed rather than proceeding on an
+          # unproven assumption.
+          scan_launchers() {
+            DISCOVERED_LAUNCHERS=()
+
+            if command -v crontab > /dev/null 2>&1; then
+              local status=0 output
+              output="$(timeout 5 crontab -l 2>&1)" || status=$?
+              if [ "$status" -ne 0 ]; then
+                if printf '%s' "$output" | grep -qi "no crontab for"; then
+                  output=""
+                else
+                  echo "ERROR: could not read this account's own crontab in a bounded way (exit $status: ${output}) -- refusing to proceed" >&2
+                  exit 1
+                fi
+              fi
+              scan_cron_source "this account's crontab" "user" "$output"
+            else
+              echo "ERROR: crontab command unavailable -- cannot establish this account's own scheduled launchers, refusing to proceed" >&2
+              exit 1
+            fi
+
+            if [ -e /etc/crontab ]; then
+              if [ ! -r /etc/crontab ]; then
+                echo "ERROR: /etc/crontab exists but is not readable by this account -- refusing to proceed" >&2
+                exit 1
+              fi
+              scan_cron_source "/etc/crontab" "system" "$(timeout 5 cat /etc/crontab)"
+            fi
+
+            if [ -d /etc/cron.d ]; then
+              local find_status=0 cron_d_files
+              cron_d_files="$(timeout 5 find /etc/cron.d -maxdepth 1 -type f 2>&1)" || find_status=$?
+              if [ "$find_status" -ne 0 ]; then
+                echo "ERROR: could not list /etc/cron.d in a bounded way -- refusing to proceed" >&2
+                exit 1
+              fi
+              while IFS= read -r cron_d_file; do
+                [ -z "$cron_d_file" ] && continue
+                if [ ! -r "$cron_d_file" ]; then
+                  echo "ERROR: $cron_d_file exists but is not readable by this account -- refusing to proceed" >&2
+                  exit 1
+                fi
+                scan_cron_source "$cron_d_file" "system" "$(timeout 5 cat "$cron_d_file")"
+              done <<< "$cron_d_files"
+            fi
+
+            if command -v sudo > /dev/null 2>&1 && command -v crontab > /dev/null 2>&1; then
+              local status=0 output
+              output="$(timeout 5 sudo -n crontab -u root -l 2>&1)" || status=$?
+              if [ "$status" -eq 0 ]; then
+                scan_cron_source "root's crontab" "user" "$output"
+              elif printf '%s' "$output" | grep -qi "no crontab for"; then
+                :
+              else
+                echo "ERROR: cannot establish root's crontab configuration read-only (sudo -n crontab -u root -l: ${output}) -- this requires a passwordless-sudo grant for exactly this command, which is not confirmed to exist; refusing to proceed without proven root-cron provenance" >&2
+                exit 1
+              fi
+            else
+              echo "ERROR: sudo or crontab command unavailable -- cannot establish root's crontab configuration, refusing to proceed without proven root-cron provenance" >&2
+              exit 1
+            fi
+
+            if command -v systemctl > /dev/null 2>&1; then
+              local unit_names
+              unit_names="$(timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
+              while IFS= read -r unit; do
+                [ -z "$unit" ] && continue
+                local frag_and_dropins is_candidate=false path p
+                frag_and_dropins="$(timeout 5 systemctl show --property=FragmentPath,DropInPaths --value "$unit" 2>/dev/null || true)"
+                while IFS= read -r path; do
+                  [ -z "$path" ] && continue
+                  for p in $path; do
+                    if [ -r "$p" ] && grep -q 'run_collection_cycle_safe.sh' "$p" 2>/dev/null; then
+                      is_candidate=true
+                    fi
+                  done
+                done <<< "$frag_and_dropins"
+                if [ "$is_candidate" = "true" ]; then
+                  scan_systemd_unit "$unit"
+                fi
+              done <<< "$unit_names"
+            fi
+          }
+
+          # reconcile_launchers -- every discovered launcher must agree
+          # on the SAME effective ROOT (which must itself be
+          # /opt/jobpulse, since every other precondition/mutation in
+          # this workflow is hardcoded to it) and the SAME effective
+          # lock path; multiple launchers producing different values
+          # fail the workflow closed rather than picking one. Sets
+          # EFFECTIVE_COLLECTION_ROOT and LAUNCHER_LOCK_CONSENSUS (empty
+          # if no launcher was found anywhere).
+          reconcile_launchers() {
+            EFFECTIVE_COLLECTION_ROOT="/opt/jobpulse"
+            LAUNCHER_LOCK_CONSENSUS=""
+            local first=true
+            local entry
+            for entry in "${DISCOVERED_LAUNCHERS[@]}"; do
+              local l_root l_lock l_label
+              IFS='|' read -r l_root l_lock l_label <<< "$entry"
+              local effective_root="${l_root:-/opt/jobpulse}"
+              if [ "$effective_root" != "/opt/jobpulse" ]; then
+                echo "ERROR: launcher '$l_label' resolves JOBPULSE_COLLECTION_ROOT to '$effective_root', not /opt/jobpulse -- refusing to proceed" >&2
+                exit 1
+              fi
+              local effective_lock="${l_lock:-$effective_root/state/run_collection_cycle.lock}"
+              if [ "$first" = "true" ]; then
+                LAUNCHER_LOCK_CONSENSUS="$effective_lock"
+                first=false
+              elif [ "$effective_lock" != "$LAUNCHER_LOCK_CONSENSUS" ]; then
+                echo "ERROR: discovered launchers resolve to different effective lock paths ('$LAUNCHER_LOCK_CONSENSUS' vs '$effective_lock' from '$l_label') -- refusing to guess which is authoritative, failing closed" >&2
+                exit 1
+              fi
+            done
+            if [ "$first" = "true" ]; then
+              echo "No launcher of run_collection_cycle_safe.sh found in any inspected source (this account's crontab, /etc/crontab, /etc/cron.d/*, root's crontab, readable systemd units)."
+            else
+              echo "All ${#DISCOVERED_LAUNCHERS[@]} discovered launcher(s) agree: ROOT=/opt/jobpulse, effective lock=$LAUNCHER_LOCK_CONSENSUS"
+            fi
+          }
+
+          # resolve_collection_env_lock_override -- parses
+          # $EFFECTIVE_COLLECTION_ROOT/.collection.env as DATA ONLY
+          # (never sourced/eval'd) for JOBPULSE_COLLECTION_CYCLE_LOCK_PATH.
+          # Sets COLLECTION_ENV_LOCK_OVERRIDE (empty if unset/absent).
+          resolve_collection_env_lock_override() {
+            COLLECTION_ENV_LOCK_OVERRIDE=""
+            local envfile="$EFFECTIVE_COLLECTION_ROOT/.collection.env"
+            [ -f "$envfile" ] || return 0
+            if [ ! -r "$envfile" ]; then
+              echo "ERROR: $envfile exists but is not readable -- refusing to proceed" >&2
+              exit 1
+            fi
+            local content line
+            content="$(timeout 5 cat "$envfile")"
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+              local mentions_var=false
+              if [[ "$line" == *"JOBPULSE_COLLECTION_ROOT"* ]] || [[ "$line" == *"JOBPULSE_COLLECTION_CYCLE_LOCK_PATH"* ]]; then
+                mentions_var=true
+              fi
+              [ "$mentions_var" = "false" ] && continue
+
+              if ! parse_assignment_line "$line"; then
+                echo "ERROR: $envfile references a relevant variable in a line that is not a recognizable assignment -- refusing to guess, failing closed (${line})" >&2
+                exit 1
+              fi
+              case "$ASSIGN_NAME" in
+                JOBPULSE_COLLECTION_ROOT|JOBPULSE_COLLECTION_CYCLE_LOCK_PATH)
+                  local extracted
+                  if ! extracted="$(extract_literal_value "$ASSIGN_VALUE_RAW" "shell")"; then
+                    echo "ERROR: $envfile sets $ASSIGN_NAME in an unsupported form -- refusing to guess, failing closed (${line})" >&2
+                    exit 1
+                  fi
+                  if [ "$ASSIGN_NAME" = "JOBPULSE_COLLECTION_CYCLE_LOCK_PATH" ]; then
+                    if [ -n "$COLLECTION_ENV_LOCK_OVERRIDE" ] && [ "$COLLECTION_ENV_LOCK_OVERRIDE" != "$extracted" ]; then
+                      echo "ERROR: $envfile sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH multiple times with conflicting values -- refusing to guess, failing closed" >&2
+                      exit 1
+                    fi
+                    COLLECTION_ENV_LOCK_OVERRIDE="$extracted"
+                  fi
+                  # JOBPULSE_COLLECTION_ROOT here is inert for ROOT
+                  # purposes (the real wrapper computes ROOT before
+                  # sourcing this file) -- syntax is still validated
+                  # above so a garbled assignment fails closed rather
+                  # than being silently ignored.
+                  ;;
+                *)
+                  echo "ERROR: $envfile: assignment target does not match either relevant variable name exactly -- refusing to guess, failing closed (${line})" >&2
+                  exit 1
+                  ;;
+              esac
+            done <<< "$content"
+          }
+
+          # resolve_final_lock_path -- real wrapper precedence: a
+          # launcher-level env value is visible when the wrapper starts,
+          # then .collection.env is sourced and can override it, then
+          # the final ${VAR:-default} expression reads whatever is in
+          # scope at that point. Sets CYCLE_LOCK_PATH.
+          resolve_final_lock_path() {
+            CYCLE_LOCK_PATH="${COLLECTION_ENV_LOCK_OVERRIDE:-${LAUNCHER_LOCK_CONSENSUS:-$EFFECTIVE_COLLECTION_ROOT/state/run_collection_cycle.lock}}"
+            case "$CYCLE_LOCK_PATH" in
+              /*) : ;;
+              *)
+                echo "ERROR: resolved collection-cycle lock path '$CYCLE_LOCK_PATH' is not an absolute path -- refusing to proceed" >&2
+                exit 1
+                ;;
+            esac
+            echo "Effective collection-cycle lock path resolved: $CYCLE_LOCK_PATH"
+          }
+
+          final_exit_trap() {
+            local ec=$?
+            set +e
+
+            if [ "$WORKFLOW_SUCCESS" != "true" ]; then
+              echo "--- upgrade did not complete successfully -- evaluating rollback state ---" >&2
+
+              # Rollback eligibility is keyed off *_MUTATION_STARTED, not
+              # the post-success-only CANDIDATE_API_RECREATED/
+              # GIT_RESET_DONE flags: `docker compose ... up` or
+              # `git reset --hard` can itself partially apply and then
+              # exit non-zero, and in that case a success-only flag would
+              # still read false even though production state changed.
+              if [ "$API_MUTATION_STARTED" = "true" ]; then
+                if rollback_api; then
+                  if [ "$GIT_MUTATION_STARTED" = "true" ]; then
+                    rollback_git || echo "FATAL: git rollback failed -- API is restored but git checkout may still be at $TARGET_SHA; manual operator review required" >&2
+                  fi
+                else
+                  echo "FATAL: API rollback failed -- production may be running the unverified candidate image; manual operator review required" >&2
+                fi
+              else
+                echo "No candidate API mutation had started -- nothing to roll back." >&2
+              fi
+            fi
+
+            [ -n "$TMP_DOCKER_CONFIG" ] && rm -rf "$TMP_DOCKER_CONFIG"
+            if [ -n "$ROLLBACK_TAG" ]; then
+              docker rmi "$ROLLBACK_TAG" > /dev/null 2>&1 || true
+            fi
+            if [ -n "$CYCLE_LOCK_FD" ]; then
+              exec {CYCLE_LOCK_FD}>&- 2>/dev/null || true
+            fi
+            rm -f "$REMOTE_SCRIPT_SELF"
+
+            exit "$ec"
+          }
+          trap final_exit_trap EXIT
+
+          echo "--- production checkout precondition (read-only) ---"
+          cd /opt/jobpulse
+          CURRENT_HEAD="$(git rev-parse HEAD)"
+          if [ "$CURRENT_HEAD" != "$EXPECTED_CURRENT_SHA" ]; then
+            echo "ERROR: production git HEAD is $CURRENT_HEAD, expected exactly $EXPECTED_CURRENT_SHA -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          # Tracked worktree must be clean. Untracked files (e.g. the
+          # pre-existing .tor_control_password secret file and the
+          # state/ directory) are expected production artifacts and are
+          # explicitly allowed -- only tracked-file drift is rejected.
+          DIRTY_TRACKED="$(git status --porcelain | grep -v '^??' || true)"
+          if [ -n "$DIRTY_TRACKED" ]; then
+            echo "ERROR: production tracked worktree is not clean:" >&2
+            echo "$DIRTY_TRACKED" >&2
+            exit 1
+          fi
+
+          # Existence-only snapshot (never reads secret contents) of the
+          # known untracked artifacts, taken before any mutation. This is
+          # compared against an after-reset snapshot later -- an
+          # unconditional "must exist" check would incorrectly fail if
+          # one of these was already absent before this run ever started.
+          TOR_SECRET_PATH_EXISTED_BEFORE=false
+          [ -e "/opt/jobpulse/.tor_control_password" ] && TOR_SECRET_PATH_EXISTED_BEFORE=true
+          STATE_PATH_EXISTED_BEFORE=false
+          [ -e "/opt/jobpulse/state" ] && STATE_PATH_EXISTED_BEFORE=true
+          echo "Untracked artifact existence before: .tor_control_password=$TOR_SECRET_PATH_EXISTED_BEFORE state=$STATE_PATH_EXISTED_BEFORE"
+
+          echo "--- requiring existing production api container (no fallback discovery/creation) ---"
+          if ! docker inspect jobpulse-api-prod > /dev/null 2>&1; then
+            echo "ERROR: jobpulse-api-prod container does not exist" >&2
+            exit 1
+          fi
+
+          API_SERVICE_LABEL="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' jobpulse-api-prod)"
+          API_PROJECT_LABEL="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' jobpulse-api-prod)"
+          if [ "$API_SERVICE_LABEL" != "api" ]; then
+            echo "ERROR: jobpulse-api-prod does not carry com.docker.compose.service=api (got '$API_SERVICE_LABEL')" >&2
+            exit 1
+          fi
+          if [ "$API_PROJECT_LABEL" != "$PRODUCTION_PROJECT" ]; then
+            echo "ERROR: jobpulse-api-prod project label '$API_PROJECT_LABEL' != expected '$PRODUCTION_PROJECT'" >&2
+            exit 1
+          fi
+
+          API_IMAGE_REF_BEFORE="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+          EXPECTED_CURRENT_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${EXPECTED_CURRENT_SHA}"
+          if [ "$API_IMAGE_REF_BEFORE" != "$EXPECTED_CURRENT_IMAGE" ]; then
+            echo "ERROR: current API image reference '$API_IMAGE_REF_BEFORE' != expected '$EXPECTED_CURRENT_IMAGE'" >&2
+            exit 1
+          fi
+
+          API_ID_BEFORE="$(docker inspect -f '{{.Id}}' jobpulse-api-prod)"
+          API_IMAGE_ID_BEFORE="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+          API_RESTARTS_BEFORE="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
+          API_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
+          API_HEALTH_BEFORE="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
+
+          if [ "$API_RUNNING_BEFORE" != "true" ] || [ "$API_HEALTH_BEFORE" != "healthy" ]; then
+            echo "ERROR: jobpulse-api-prod is not already running+healthy -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "API before: id=$API_ID_BEFORE image=$API_IMAGE_REF_BEFORE imageId=$API_IMAGE_ID_BEFORE restarts=$API_RESTARTS_BEFORE running=$API_RUNNING_BEFORE health=$API_HEALTH_BEFORE"
+
+          echo "--- capturing unrelated production containers (must remain untouched) ---"
+          DB_STATE_BEFORE="$(capture_container_state jobpulse-postgres-prod)"
+          FRONTEND_STATE_BEFORE="$(capture_container_state jobpulse-frontend-prod)"
+          TOR_STATE_BEFORE="$(capture_container_state jobpulse-tor-prod)"
+
+          echo "DB before: $DB_STATE_BEFORE"
+          echo "Frontend before: $FRONTEND_STATE_BEFORE"
+          echo "Tor before: $TOR_STATE_BEFORE"
+
+          # DB and frontend are unrelated services this workflow never
+          # reconciles, but an ABSENT snapshot must not be allowed to
+          # silently compare equal to another ABSENT snapshot later --
+          # require both to already exist and be running (and healthy,
+          # where a healthcheck is defined) before touching anything.
+          # Tor remains optional for this direct-mode upgrade: if present
+          # its state must stay unchanged (checked later), but its
+          # absence is not itself an error.
+          if [ "$DB_STATE_BEFORE" = "ABSENT" ]; then
+            echo "ERROR: jobpulse-postgres-prod does not exist -- refusing to proceed" >&2
+            exit 1
+          fi
+          DB_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-postgres-prod)"
+          if [ "$DB_RUNNING_BEFORE" != "true" ]; then
+            echo "ERROR: jobpulse-postgres-prod is not running -- refusing to proceed" >&2
+            exit 1
+          fi
+          DB_HEALTH_BEFORE="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-postgres-prod)"
+          if [ "$DB_HEALTH_BEFORE" != "none" ] && [ "$DB_HEALTH_BEFORE" != "healthy" ]; then
+            echo "ERROR: jobpulse-postgres-prod health status is '$DB_HEALTH_BEFORE', expected healthy (or no healthcheck defined) -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          if [ "$FRONTEND_STATE_BEFORE" = "ABSENT" ]; then
+            echo "ERROR: jobpulse-frontend-prod does not exist -- refusing to proceed" >&2
+            exit 1
+          fi
+          FRONTEND_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-frontend-prod)"
+          if [ "$FRONTEND_RUNNING_BEFORE" != "true" ]; then
+            echo "ERROR: jobpulse-frontend-prod is not running -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "--- direct-mode precondition (narrow env inspect only, never full env dump) ---"
+          API_SEARCH_TRANSPORT_BEFORE="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^SEARCH_TRANSPORT=//p' | head -n1 || true)"
+          API_TOR_ENABLED_BEFORE="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TOR_ENABLED=//p' | head -n1 || true)"
+
+          echo "API SEARCH_TRANSPORT before: ${API_SEARCH_TRANSPORT_BEFORE:-<unset>}"
+          echo "API TOR_ENABLED before: ${API_TOR_ENABLED_BEFORE:-<unset>}"
+
+          if [ -n "$API_SEARCH_TRANSPORT_BEFORE" ] && [ "$API_SEARCH_TRANSPORT_BEFORE" != "direct" ]; then
+            echo "ERROR: API SEARCH_TRANSPORT must be unset or exactly 'direct'; got '$API_SEARCH_TRANSPORT_BEFORE' -- refusing to proceed" >&2
+            exit 1
+          fi
+          if [ "$API_TOR_ENABLED_BEFORE" != "false" ]; then
+            echo "ERROR: API TOR_ENABLED must be exactly 'false'; got '${API_TOR_ENABLED_BEFORE:-<unset>}' -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "--- narrow env-file inspection for a secretly-forced proxy assignment ---"
+          for env_file in .api_keys.env /opt/jobpulse/.admin.env .env; do
+            if [ -f "$env_file" ]; then
+              FOUND_LINE="$(grep -E '^SEARCH_TRANSPORT=' "$env_file" | tail -n1 || true)"
+              if [ -n "$FOUND_LINE" ]; then
+                FOUND_VALUE="${FOUND_LINE#SEARCH_TRANSPORT=}"
+                if [ "$FOUND_VALUE" != "direct" ]; then
+                  echo "ERROR: $env_file sets SEARCH_TRANSPORT=${FOUND_VALUE} -- must be unset or exactly 'direct'" >&2
+                  exit 1
+                fi
+                echo "$env_file: SEARCH_TRANSPORT=direct (OK)"
+              fi
+            fi
+          done
+
+          echo "--- proving scheduler-level launcher provenance for run_collection_cycle_safe.sh (bounded, read-only, non-executing) ---"
+          # scripts/run_collection_cycle_safe.sh's own ROOT and
+          # CYCLE_LOCK_PATH expressions --
+          #   ROOT="${JOBPULSE_COLLECTION_ROOT:-/opt/jobpulse}"
+          #   CYCLE_LOCK_PATH="${JOBPULSE_COLLECTION_CYCLE_LOCK_PATH:-$ROOT/state/run_collection_cycle.lock}"
+          # -- can each be set by WHATEVER ACTUALLY INVOKES the wrapper
+          # (a cron entry or a systemd unit), entirely outside
+          # .collection.env and outside this repository. This proves
+          # the effective configuration of every launcher this account
+          # can discover -- this account's own crontab, /etc/crontab,
+          # every file under /etc/cron.d, root's crontab (via a
+          # passwordless-sudo read, see below), and every readable
+          # systemd service unit's EFFECTIVE (base+drop-in-merged)
+          # configuration -- and requires them all to agree before
+          # anything is touched. It never sources/evals ANY of these
+          # files: crontab/systemd files are parsed as data by a
+          # deliberately restricted grammar (see the helper functions
+          # above), and any relevant-variable occurrence or wrapper
+          # invocation that does not match a fully-understood literal
+          # form fails the whole workflow closed rather than being
+          # guessed at.
+          if ! command -v timeout > /dev/null 2>&1; then
+            echo "ERROR: GNU coreutils 'timeout' is required to bound every launcher-discovery command -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          scan_launchers
+          reconcile_launchers
+
+          echo "--- resolving effective production collection-cycle lock path (\$ROOT/.collection.env parsed as data, never sourced/eval'd) ---"
+          # A syntax-error-tolerant restricted parser is used instead of
+          # sourcing this file: sourcing (even in a subshell) is NOT
+          # read-only -- it can execute commands, write files, spawn
+          # processes, or make network calls, and a subshell only
+          # isolates shell VARIABLES, never those side effects. Only
+          # JOBPULSE_COLLECTION_ROOT/JOBPULSE_COLLECTION_CYCLE_LOCK_PATH
+          # are inspected; JOBPULSE_COLLECTION_ROOT here is inert for
+          # ROOT purposes (the real wrapper computes ROOT from the
+          # environment BEFORE sourcing this file), but its syntax is
+          # still validated so a garbled/dynamic-looking assignment
+          # fails closed rather than being silently ignored.
+          resolve_collection_env_lock_override
+          resolve_final_lock_path
+
+          echo "--- acquiring non-blocking top-level collection-cycle lock (held for the entire operation) ---"
+          mkdir -p "$(dirname "$CYCLE_LOCK_PATH")"
+          exec {CYCLE_LOCK_FD}>"$CYCLE_LOCK_PATH" || {
+            echo "ERROR: failed to open collection-cycle lock file $CYCLE_LOCK_PATH" >&2
+            exit 1
+          }
+          if ! flock -n "$CYCLE_LOCK_FD"; then
+            echo "ERROR: collection-cycle lock $CYCLE_LOCK_PATH is busy -- a collection cycle is active, refusing to proceed" >&2
+            exit 1
+          fi
+          echo "Collection-cycle lock acquired: $CYCLE_LOCK_PATH"
+
+          echo "--- active-collector process check (read-only, no kill) ---"
+          # Enumerated from the actual production wrapper
+          # (scripts/run_collection_cycle_safe.sh), not merely a subset
+          # recalled from memory: linkedin_auth_preflight (auth step),
+          # seed_priority_coverage_queue (seed step),
+          # process_search_demand_queue (process step, which itself
+          # subprocess-invokes linkedin_plan_collect, which itself
+          # subprocess-invokes collector_postgres -- both would show as
+          # their own `docker top` process entries), and
+          # reconcile_priority_coverage (reconciliation step).
+          # scripts.run_collection_cycle is also matched even though the
+          # wrapper never invokes it as a module -- see
+          # docs/PRODUCTION_RUNBOOK.md's note that scripts/run_collection_cycle.py
+          # is orphaned -- kept only as a harmless extra safety net.
+          COLLECTOR_PROCESSES="$(docker top jobpulse-api-prod 2>/dev/null | grep -E 'scripts\.linkedin_auth_preflight|scripts\.seed_priority_coverage_queue|scripts\.process_search_demand_queue|scripts\.linkedin_plan_collect|scripts\.collector_postgres|scripts\.reconcile_priority_coverage|scripts\.run_collection_cycle' || true)"
+          if [ -n "$COLLECTOR_PROCESSES" ]; then
+            echo "ERROR: active collector process(es) detected inside jobpulse-api-prod -- refusing to proceed:" >&2
+            echo "$COLLECTOR_PROCESSES" >&2
+            exit 1
+          fi
+          echo "No active collector processes detected."
+
+          echo "--- verifying current production compose matches the reviewed target compose ---"
+          CURRENT_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
+          echo "Current compose SHA-256: $CURRENT_COMPOSE_SHA256"
+          echo "Target compose SHA-256:  $TARGET_COMPOSE_SHA256"
+          if [ "$CURRENT_COMPOSE_SHA256" != "$TARGET_COMPOSE_SHA256" ]; then
+            echo "ERROR: current docker-compose.prod.yml does not match the target checkout's compose file -- refusing to reuse it for candidate recreation" >&2
+            exit 1
+          fi
+          echo "Compose files match: safe to reuse the current checkout's compose file for candidate recreation."
+
+          echo "--- proving the effective candidate Compose environment cannot be proxy (before any pull/mutation) ---"
+          # A narrow grep over individual env files (done above) is not a
+          # complete proof of Docker Compose's own effective-environment
+          # semantics (env_file + environment: precedence, interpolation,
+          # etc.). Resolve the ACTUAL merged configuration Compose would
+          # use for the candidate `up`, via `docker compose ... config`,
+          # so the candidate can never even briefly start in proxy mode
+          # and only be caught after the fact. Only the two specific
+          # values needed are extracted -- the rest of the resolved
+          # config (which can include other env vars) is never printed.
+          # JOBPULSE_API_IMAGE is deliberately NOT set here: it only
+          # interpolates the `image:` field, never the `environment:`
+          # section this check reads, so the resolved SEARCH_TRANSPORT/
+          # TOR_ENABLED values are identical either way -- and omitting
+          # it keeps this invocation textually distinct from the actual
+          # candidate recreation command below.
+          EFFECTIVE_CANDIDATE_CONFIG="$(docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)"
+          EFFECTIVE_CANDIDATE_API_ENV_BLOCK="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_CONFIG" | awk '
+            /^  api:/ { in_api=1; next }
+            in_api && /^  [A-Za-z0-9_.-]+:/ { in_api=0 }
+            in_api && /^    environment:/ { in_env=1; next }
+            in_api && in_env && /^    [A-Za-z0-9_.-]+:/ { in_env=0 }
+            in_api && in_env { print }
+          ')"
+          EFFECTIVE_CANDIDATE_SEARCH_TRANSPORT="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_API_ENV_BLOCK" | sed -n 's/^[[:space:]]*SEARCH_TRANSPORT:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          EFFECTIVE_CANDIDATE_TOR_ENABLED="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_API_ENV_BLOCK" | sed -n 's/^[[:space:]]*TOR_ENABLED:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+
+          echo "Effective candidate SEARCH_TRANSPORT: ${EFFECTIVE_CANDIDATE_SEARCH_TRANSPORT:-<unset>}"
+          echo "Effective candidate TOR_ENABLED: ${EFFECTIVE_CANDIDATE_TOR_ENABLED:-<unset>}"
+
+          if [ -n "$EFFECTIVE_CANDIDATE_SEARCH_TRANSPORT" ] && [ "$EFFECTIVE_CANDIDATE_SEARCH_TRANSPORT" != "direct" ]; then
+            echo "ERROR: effective candidate Compose SEARCH_TRANSPORT is not unset/direct (got '$EFFECTIVE_CANDIDATE_SEARCH_TRANSPORT') -- refusing to proceed" >&2
+            exit 1
+          fi
+          if [ "$EFFECTIVE_CANDIDATE_TOR_ENABLED" != "false" ]; then
+            echo "ERROR: effective candidate Compose TOR_ENABLED is not exactly 'false' (got '${EFFECTIVE_CANDIDATE_TOR_ENABLED:-<unset>}') -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "--- pinning immutable target API image (never :main/:latest) ---"
+          TMP_DOCKER_CONFIG="$(mktemp -d)"
+          if [ "$HAS_TOKEN" = "true" ]; then
+            # The GHCR token arrives on THIS script's own stdin, piped
+            # through the SSH session that invoked it -- never as a
+            # command-line argument/argv, never Base64-transformed in
+            # transit, never printed.
+            DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker login ghcr.io -u mrezamaghouli --password-stdin
+          fi
+          DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$TARGET_IMAGE"
+          TARGET_IMAGE_ID="$(docker image inspect "$TARGET_IMAGE" --format '{{.Id}}')"
+          echo "Target image ID: $TARGET_IMAGE_ID"
+
+          echo "--- preparing rollback handle (never overwrites the target immutable SHA tag) ---"
+          ROLLBACK_TAG="jobpulse-api-rollback:${TARGET_SHA:0:12}-$$"
+          if docker image inspect "$ROLLBACK_TAG" > /dev/null 2>&1; then
+            echo "ERROR: rollback tag $ROLLBACK_TAG already exists -- refusing to reuse it" >&2
+            exit 1
+          fi
+          docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"
+          echo "Rollback handle prepared: $ROLLBACK_TAG -> $API_IMAGE_ID_BEFORE"
+
+          echo "--- recreating ONLY api with the candidate target image (--no-build --no-deps; no db/frontend/tor) ---"
+          # Set immediately BEFORE the mutating command, not after it
+          # returns: `docker compose ... up` can itself partially
+          # recreate/change the container and then still exit non-zero,
+          # and the EXIT trap's rollback eligibility is keyed off this
+          # flag, not off a success-only flag set after the fact.
+          API_MUTATION_STARTED=true
+          JOBPULSE_API_IMAGE="$TARGET_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps api
+          CANDIDATE_API_RECREATED=true
+
+          echo "--- bounded candidate direct-health check (http://127.0.0.1:8000/health) ---"
+          CANDIDATE_HEALTHY=false
+          for attempt in $(seq 1 30); do
+            if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              CANDIDATE_HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$CANDIDATE_HEALTHY" != "true" ]; then
+            echo "ERROR: candidate API failed bounded direct health check" >&2
+            exit 1
+          fi
+
+          echo "--- bounded candidate container health-state check ---"
+          CANDIDATE_CONTAINER_HEALTHY=false
+          for attempt in $(seq 1 30); do
+            h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
+            if [ "$h" = "healthy" ]; then
+              CANDIDATE_CONTAINER_HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$CANDIDATE_CONTAINER_HEALTHY" != "true" ]; then
+            echo "ERROR: candidate API container health status never became healthy" >&2
+            exit 1
+          fi
+
+          echo "--- bounded nginx-path health check (http://127.0.0.1/api/health) ---"
+          NGINX_HEALTHY=false
+          for attempt in $(seq 1 30); do
+            if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null 2>&1; then
+              NGINX_HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$NGINX_HEALTHY" != "true" ]; then
+            echo "ERROR: candidate API failed bounded nginx-path health check" >&2
+            exit 1
+          fi
+
+          echo "--- verifying candidate API image reference/ID ---"
+          API_IMAGE_REF_AFTER="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+          API_IMAGE_ID_AFTER="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+          if [ "$API_IMAGE_REF_AFTER" != "$TARGET_IMAGE" ]; then
+            echo "ERROR: candidate API image reference '$API_IMAGE_REF_AFTER' != expected target '$TARGET_IMAGE'" >&2
+            exit 1
+          fi
+          if [ "$API_IMAGE_ID_AFTER" != "$TARGET_IMAGE_ID" ]; then
+            echo "ERROR: candidate API image ID '$API_IMAGE_ID_AFTER' != expected target image ID '$TARGET_IMAGE_ID'" >&2
+            exit 1
+          fi
+          CANDIDATE_RESTARTS_AFTER="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
+          echo "Candidate API: image=$API_IMAGE_REF_AFTER imageId=$API_IMAGE_ID_AFTER restarts=$CANDIDATE_RESTARTS_AFTER"
+
+          echo "--- verifying actual SearchTransport mode inside candidate API (read-only, no proxy probe) ---"
+          TRANSPORT_MODE="$(docker exec jobpulse-api-prod python -c 'from app.config import get_search_transport_mode; print(get_search_transport_mode())')"
+          if [ "$TRANSPORT_MODE" != "direct" ]; then
+            echo "ERROR: candidate API get_search_transport_mode() returned '$TRANSPORT_MODE', expected 'direct'" >&2
+            exit 1
+          fi
+          echo "Candidate API SearchTransport mode: $TRANSPORT_MODE"
+
+          CANDIDATE_TOR_ENABLED="$(docker exec jobpulse-api-prod printenv TOR_ENABLED || true)"
+          if [ "$CANDIDATE_TOR_ENABLED" != "false" ]; then
+            echo "ERROR: candidate API TOR_ENABLED='$CANDIDATE_TOR_ENABLED', expected 'false'" >&2
+            exit 1
+          fi
+          echo "Candidate API TOR_ENABLED: $CANDIDATE_TOR_ENABLED"
+
+          echo "--- verifying unrelated services remain unchanged (DB/frontend/Tor) ---"
+          DB_STATE_AFTER="$(capture_container_state jobpulse-postgres-prod)"
+          FRONTEND_STATE_AFTER="$(capture_container_state jobpulse-frontend-prod)"
+          TOR_STATE_AFTER="$(capture_container_state jobpulse-tor-prod)"
+
+          if [ "$DB_STATE_AFTER" != "$DB_STATE_BEFORE" ]; then
+            echo "ERROR: jobpulse-postgres-prod state changed unexpectedly" >&2
+            exit 1
+          fi
+          if [ "$FRONTEND_STATE_AFTER" != "$FRONTEND_STATE_BEFORE" ]; then
+            echo "ERROR: jobpulse-frontend-prod state changed unexpectedly" >&2
+            exit 1
+          fi
+          if [ "$TOR_STATE_AFTER" != "$TOR_STATE_BEFORE" ]; then
+            echo "ERROR: jobpulse-tor-prod state changed unexpectedly" >&2
+            exit 1
+          fi
+          echo "DB/frontend/Tor unchanged: OK"
+
+          echo "--- candidate API fully validated -- now advancing production git checkout to target SHA ---"
+          git fetch origin main
+          git cat-file -e "${TARGET_SHA}^{commit}"
+          git merge-base --is-ancestor "$TARGET_SHA" origin/main
+          # Set immediately BEFORE the mutating command, not after it
+          # returns: `git reset --hard` can itself partially apply and
+          # then still exit non-zero, and the EXIT trap's git-recovery
+          # eligibility is keyed off this flag, not off a success-only
+          # flag set after the fact.
+          GIT_MUTATION_STARTED=true
+          git reset --hard "$TARGET_SHA"
+          GIT_RESET_DONE=true
+
+          HEAD_AFTER_RESET="$(git rev-parse HEAD)"
+          if [ "$HEAD_AFTER_RESET" != "$TARGET_SHA" ]; then
+            echo "ERROR: production git HEAD after reset is '$HEAD_AFTER_RESET', expected exactly '$TARGET_SHA'" >&2
+            exit 1
+          fi
+          echo "Production git checkout advanced to: $HEAD_AFTER_RESET"
+
+          echo "--- verifying known untracked production artifacts' existence is unchanged across git reset ---"
+          # Compare against the pre-mutation existence snapshot rather
+          # than unconditionally requiring existence -- an artifact that
+          # was already absent before this run started must not become a
+          # late post-candidate failure just because it is still absent.
+          TOR_SECRET_PATH_EXISTS_AFTER=false
+          [ -e "/opt/jobpulse/.tor_control_password" ] && TOR_SECRET_PATH_EXISTS_AFTER=true
+          STATE_PATH_EXISTS_AFTER=false
+          [ -e "/opt/jobpulse/state" ] && STATE_PATH_EXISTS_AFTER=true
+
+          if [ "$TOR_SECRET_PATH_EXISTS_AFTER" != "$TOR_SECRET_PATH_EXISTED_BEFORE" ]; then
+            echo "ERROR: existence of /opt/jobpulse/.tor_control_password changed across git reset (before=$TOR_SECRET_PATH_EXISTED_BEFORE after=$TOR_SECRET_PATH_EXISTS_AFTER)" >&2
+            exit 1
+          fi
+          if [ "$STATE_PATH_EXISTS_AFTER" != "$STATE_PATH_EXISTED_BEFORE" ]; then
+            echo "ERROR: existence of /opt/jobpulse/state changed across git reset (before=$STATE_PATH_EXISTED_BEFORE after=$STATE_PATH_EXISTS_AFTER)" >&2
+            exit 1
+          fi
+          echo "Untracked production artifact existence unchanged (.tor_control_password=$TOR_SECRET_PATH_EXISTS_AFTER state=$STATE_PATH_EXISTS_AFTER)."
+
+          echo "--- verifying final compose hash still matches the reviewed target ---"
+          FINAL_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
+          if [ "$FINAL_COMPOSE_SHA256" != "$TARGET_COMPOSE_SHA256" ]; then
+            echo "ERROR: post-reset compose SHA-256 '$FINAL_COMPOSE_SHA256' != target '$TARGET_COMPOSE_SHA256'" >&2
+            exit 1
+          fi
+          echo "Final compose hash verified: $FINAL_COMPOSE_SHA256"
+
+          echo "--- final post-upgrade bounded health re-verification ---"
+          FINAL_HEALTHY=false
+          for attempt in $(seq 1 30); do
+            if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              FINAL_HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$FINAL_HEALTHY" != "true" ]; then
+            echo "ERROR: final direct health check failed" >&2
+            exit 1
+          fi
+
+          FINAL_NGINX_HEALTHY=false
+          for attempt in $(seq 1 30); do
+            if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null 2>&1; then
+              FINAL_NGINX_HEALTHY=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$FINAL_NGINX_HEALTHY" != "true" ]; then
+            echo "ERROR: final nginx-path health check failed" >&2
+            exit 1
+          fi
+
+          FINAL_TRANSPORT_MODE="$(docker exec jobpulse-api-prod python -c 'from app.config import get_search_transport_mode; print(get_search_transport_mode())')"
+          if [ "$FINAL_TRANSPORT_MODE" != "direct" ]; then
+            echo "ERROR: final transport mode check failed: $FINAL_TRANSPORT_MODE" >&2
+            exit 1
+          fi
+
+          FINAL_TOR_ENABLED="$(docker exec jobpulse-api-prod printenv TOR_ENABLED || true)"
+          if [ "$FINAL_TOR_ENABLED" != "false" ]; then
+            echo "ERROR: final TOR_ENABLED check failed: $FINAL_TOR_ENABLED" >&2
+            exit 1
+          fi
+
+          FINAL_IMAGE_REF="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+          if [ "$FINAL_IMAGE_REF" != "$TARGET_IMAGE" ]; then
+            echo "ERROR: final image reference check failed: $FINAL_IMAGE_REF" >&2
+            exit 1
+          fi
+
+          echo "Direct runtime upgrade succeeded: production API is now $TARGET_IMAGE, git checkout $HEAD_AFTER_RESET, transport=direct, TOR_ENABLED=false, db/frontend/tor unchanged."
+          WORKFLOW_SUCCESS=true
+          REMOTE_SCRIPT
+
+          cleanup_runner() {
+            rm -f ~/.ssh/jobpulse_direct_upgrade_key "$REMOTE_SCRIPT_LOCAL"
+          }
+          trap cleanup_runner EXIT
+
+          REMOTE_SCRIPT_PATH="/tmp/jobpulse-direct-runtime-upgrade-remote-${RUN_ID}.sh"
+
+          # Only this one temporary file is transferred -- never .env,
+          # .api_keys.env, .admin.env, .auth, cookies, storage state, the
+          # ControlPort password file, or database credentials.
+          scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -P "$VM_PORT" \
+            "$REMOTE_SCRIPT_LOCAL" "$VM_USER@$VM_HOST:${REMOTE_SCRIPT_PATH}"
+
+          HAS_TOKEN="false"
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            HAS_TOKEN="true"
+          fi
+
+          # The GHCR token (if any) travels ONLY through this ssh
+          # invocation's own stdin, piped straight into the remote
+          # script's `docker login --password-stdin` -- it is never
+          # Base64-encoded, never placed in the remote command
+          # string/argv, and never logged. The remote script performs an
+          # exact immutable `docker pull` of $TARGET_IMAGE on every run
+          # regardless of local caching -- exact-tag registry resolution
+          # is always performed -- and it reads this stdin and runs
+          # `docker login` whenever HAS_TOKEN=true, independent of
+          # whether the image layers happen to already be cached on the
+          # VM. Docker auth uses an isolated temporary DOCKER_CONFIG
+          # (never the production user's default config), so no
+          # credential persists in ~/.docker/config.json.
+          printf '%s' "${GHCR_TOKEN:-}" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            "bash '$REMOTE_SCRIPT_PATH' '$TARGET_COMPOSE_SHA256' '$TARGET_IMAGE' '$IMAGE_SHA' '$HAS_TOKEN'"
