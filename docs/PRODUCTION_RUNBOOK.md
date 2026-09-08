@@ -2159,3 +2159,311 @@ separate, prior step from actually dispatching it against production. A
 later, separate authorization is required before an operator runs it for
 real.
 
+## Phase 3.4N-B: Production Direct Runtime Upgrade Runner
+
+### Purpose
+
+`.github/workflows/production-direct-runtime-upgrade.yml`
+("Production Direct Runtime Upgrade") is a dedicated, manual-only
+GitHub Actions workflow whose only job is moving production's `api`
+runtime from the exact commit it is currently running to one specific,
+already-reviewed target commit -- **while collection stays DIRECT the
+entire time.** It is a **separate workflow from Deploy Production**
+(`.github/workflows/deploy.yml`, left entirely unmodified by this
+phase): that workflow resolves to the floating `:main` tag /
+`origin/main` ref with no SHA pinning and no confirmation-token gate,
+and its rollback logic (`docker tag "$previous_image_id" "$IMAGE"`)
+would corrupt an immutable SHA tag if `IMAGE` were ever pinned to one
+(see the Phase 3.4N-A2 deployment-path audit). This runner exists
+because that gap needed a purpose-built, narrowly-scoped alternative
+instead of a hardening change to the shared, currently-functioning
+automatic-deploy-capable workflow.
+
+**Guaranteed unchanged by this workflow:**
+
+- `SEARCH_TRANSPORT` remains `direct` (verified both by narrow env
+  inspection before the upgrade and by an in-container
+  `get_search_transport_mode()` call after)
+- `TOR_ENABLED` remains exactly `false` (verified before, on the
+  candidate, and again at the very end)
+- No proxy rollout: the workflow never sets `SEARCH_TRANSPORT=proxy`,
+  `TOR_SOCKS_HOST`, `TOR_SOCKS_PORT`, `TOR_CONTROL_HOST`, or
+  `TOR_CONTROL_PORT` anywhere
+- No LinkedIn request: the only HTTP calls this workflow makes are
+  bounded health checks against `127.0.0.1:8000/health` and
+  `127.0.0.1/api/health`
+- No collector run: it never executes `scripts.collector_postgres`,
+  `scripts.linkedin_plan_collect`, `scripts.process_search_demand_queue`,
+  or `scripts.run_collection_cycle`
+- `db`, `frontend`, and `tor` (if present) are never reconciled,
+  restarted, or recreated -- only `api` is touched, via
+  `up -d --no-build --no-deps api`
+
+### Current -> target
+
+- **Current (required precondition):**
+  `148bd362b37c82c92737382d181fbdeac4d2187b`
+- **Target (hard-pinned in the workflow as `REVIEWED_TARGET_SHA`):**
+  `f4765f857355c6543f68cea0e481b7f20a917147`
+
+A future different target requires a separately reviewed workflow
+change to `REVIEWED_TARGET_SHA` -- the `image_sha` input is validated
+against that one hard-pinned constant, not accepted as an arbitrary
+value.
+
+### Trigger and inputs
+
+`workflow_dispatch` only, gated first on `github.ref ==
+'refs/heads/main'`. Two required inputs: `image_sha` (must equal
+`REVIEWED_TARGET_SHA` exactly -- a 40-character lowercase hex SHA
+mismatch or a different-but-valid commit both fail closed) and
+`confirmation` (must equal `UPGRADE_DIRECT_RUNTIME` exactly).
+`permissions: contents: read`. `concurrency.group:
+jobpulse-production-direct-runtime-upgrade`,
+`cancel-in-progress: false`. Job `timeout-minutes: 15`.
+
+### Preconditions (all fail closed, no fallback/auto-recovery)
+
+- Current production git checkout is exactly
+  `148bd362b37c82c92737382d181fbdeac4d2187b`, and the tracked worktree
+  is clean (known untracked artifacts -- `.tor_control_password`,
+  `state/` -- are explicitly allowed; their contents are never read)
+- `jobpulse-api-prod` exists, carries
+  `com.docker.compose.service=api` and
+  `com.docker.compose.project=jobpulse`, and is already running+healthy
+  on exactly `ghcr.io/mrezamaghouli/jobpulse-api:148bd362...`
+- `SEARCH_TRANSPORT` is unset or exactly `direct`, and `TOR_ENABLED` is
+  exactly `false`, both on the running container's env and via a narrow
+  grep of `.api_keys.env` / `/opt/jobpulse/.admin.env` / `.env` for an
+  active `SEARCH_TRANSPORT=` assignment (fails closed on anything other
+  than unset/`direct`)
+- `jobpulse-postgres-prod` and `jobpulse-frontend-prod` must already
+  exist and be running (DB additionally healthy where a healthcheck is
+  defined) -- an absent unrelated service is refused, not treated as an
+  acceptable starting snapshot to compare against later. Tor stays
+  optional for this direct-mode upgrade: if present, its state must
+  remain unchanged, but its absence is not itself an error
+- The non-blocking top-level collection-cycle lock is acquired and held
+  for the entire operation; busy means refuse, not wait. The lock path
+  is **proven from actual scheduler configuration, in two stages, both
+  completing before any image pull or API mutation, and both treating
+  every configuration source strictly as DATA -- nothing is ever
+  sourced or `eval`'d**:
+  1. **Scheduler-provenance scan (bounded, read-only, order-aware).**
+     `scripts/run_collection_cycle_safe.sh`'s own `ROOT` and
+     `CYCLE_LOCK_PATH` expressions read `JOBPULSE_COLLECTION_ROOT` /
+     `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH` from whatever *invokes* the
+     wrapper -- a cron entry or a systemd unit -- entirely outside
+     `.collection.env` and outside this repository (no cron/systemd
+     schedule for this script is installed by this repository; see
+     above). This workflow reads and reconciles **every** source it can
+     discover: this SSH-authenticated account's own `crontab -l`,
+     `/etc/crontab`, every file under `/etc/cron.d`, root's crontab (via
+     a bounded, non-interactive `sudo -n crontab -u root -l` -- never
+     prompts for a password, never installs or changes a sudo rule),
+     and the **effective** (base-unit-plus-every-drop-in-merged, via
+     `systemctl cat`, not a raw file grep that a drop-in could bypass)
+     configuration of every systemd service unit whose fragment or
+     drop-in files mention the wrapper script. Every external command
+     (`crontab`, `sudo`, `cat`, `find`, `systemctl`) is individually
+     bounded by a `timeout` backstop.
+
+     Crontab/`/etc/crontab`/`/etc/cron.d` content is walked **in
+     order**, maintaining the currently-effective value of each
+     relevant variable as it goes -- matching real cron semantics
+     exactly: an assignment appearing *after* the line that invokes the
+     wrapper does not affect that invocation. Only a small set of
+     literal forms is understood as either a variable assignment
+     (`[export ]NAME=value`, quoted or bare, no `$`/backtick/command
+     substitution) or a direct wrapper invocation (optionally
+     redirected, never piped, chained, or wrapped in `bash -c`/`sh
+     -c`/`env`/`source`). Any line that mentions a relevant variable
+     name or the wrapper script but does not cleanly match one of those
+     forms -- and any `EnvironmentFile=` indirection, any
+     multi-variable or quoted-oddly `Environment=` line, any crontab or
+     systemd read that fails for a reason other than "no crontab for
+     this account" / "no crontab for root", and any two discovered
+     launchers that resolve to different effective `ROOT` or lock
+     values -- fails the workflow closed immediately, before touching
+     anything else. A discovered `ROOT` that resolves to anything other
+     than `/opt/jobpulse` also fails closed, since every other
+     precondition/mutation in this workflow is itself hardcoded to
+     `/opt/jobpulse`. If literally no launcher is found in any of the
+     inspected sources, the wrapper's own default is used -- but only
+     because every required source was successfully, fully inspected
+     and confirmed empty, never because a source could not be read.
+
+     **Stated scope, not overclaimed:** root's crontab specifically
+     requires a passwordless-sudo grant, for exactly the read-only
+     command `crontab -u root -l`, that does not currently exist
+     anywhere in this repository, its documented configuration, or any
+     other evidence available -- nothing else in this codebase's
+     production automation ever uses `sudo`. Without that grant, this
+     precondition will correctly and safely refuse to proceed every
+     time (a fail-closed outcome, not a defect); granting it is a
+     separate, explicit production-authorization decision for an
+     operator to make, not something this preflight assumes or attempts
+     to establish on its own.
+  2. **`.collection.env` parsed as data, never sourced or `eval`'d.**
+     Sourcing a file -- even inside a subshell -- is **not** read-only:
+     it can execute commands, write files, spawn processes, or make
+     network calls, since a subshell only isolates shell *variables*,
+     never those side effects. This workflow instead reads the file's
+     bytes and applies the exact same restricted, non-executing
+     assignment grammar as stage 1 (quoted or bare literals only,
+     trailing `# comment` stripped as real shell sourcing would, no
+     `$`/backtick/expansion of any kind) to
+     `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH` only --
+     `JOBPULSE_COLLECTION_ROOT` inside this file is inert for `ROOT`
+     purposes (the real wrapper computes `ROOT` from the environment
+     *before* sourcing this file), though its syntax is still validated
+     so a garbled or dynamic-looking assignment still fails closed
+     rather than being silently ignored. The final effective lock path
+     follows the real wrapper's own precedence exactly: a value found
+     here overrides whatever stage 1 discovered (since `.collection.env`
+     is sourced *after* the launcher's environment is already in
+     scope), which in turn overrides the wrapper's hardcoded default.
+- A read-only `docker top jobpulse-api-prod` check finds no active
+  collection process. The detector's module names are sourced directly
+  from the real wrapper (`scripts/run_collection_cycle_safe.sh`), not
+  merely recalled from memory: `scripts.linkedin_auth_preflight` (auth
+  step), `scripts.seed_priority_coverage_queue` (seed step),
+  `scripts.process_search_demand_queue` (process step -- which itself
+  subprocess-invokes `scripts.linkedin_plan_collect`, which itself
+  subprocess-invokes `scripts.collector_postgres`, both detected as
+  their own `docker top` entries), and `scripts.reconcile_priority_coverage`
+  (reconciliation step) -- refuses to proceed rather than interrupting
+  an in-flight collection cycle
+- The current `/opt/jobpulse/docker-compose.prod.yml`'s SHA-256 exactly
+  matches the SHA-256 of `docker-compose.prod.yml` as it exists at the
+  **target** commit (extracted by the runner via `git show`, never
+  trusted from a prior audit) -- this is what makes it safe to reuse the
+  existing 148bd-checkout compose file for the candidate recreation
+  *before* the git checkout itself moves
+- The **effective** candidate Compose environment -- resolved via
+  `docker compose ... config` against the real production compose/env-file
+  semantics, not merely a narrow grep of individual env files -- must
+  show `SEARCH_TRANSPORT` unset/`direct` and `TOR_ENABLED` exactly
+  `false` before any pull or API mutation. Only those two values are
+  ever extracted; the rest of the resolved configuration is never
+  printed. This closes the gap where the candidate could briefly start
+  in proxy mode and only be caught after the fact
+
+### Sequence (candidate validated fully before git checkout moves)
+
+1. Acquire the collection-cycle lock; verify no active collector process
+2. Verify current compose SHA-256 == target compose SHA-256; verify the
+   effective (resolved) candidate Compose environment cannot be proxy
+3. Pull the exact immutable target image
+   (`ghcr.io/mrezamaghouli/jobpulse-api:f4765f85...`, never `:main`/
+   `:latest`) via an isolated temporary `DOCKER_CONFIG` -- the
+   production user's real `~/.docker/config.json` is never read or
+   written
+4. Prepare a rollback handle: tag the *previous* image ID with a unique,
+   run-scoped local tag (`jobpulse-api-rollback:<sha-prefix>-<pid>`) --
+   the target's own immutable SHA tag is never retagged or overwritten
+5. Set `API_MUTATION_STARTED=true` **immediately before** recreating
+   `api` (`docker compose ... up -d --no-build --no-deps api`) -- `db`,
+   `frontend`, and `tor` are never named in this command. The flag is
+   set before the command runs, not after it returns, because `docker
+   compose ... up` can itself partially recreate the container and then
+   still exit non-zero; rollback eligibility must not depend on the
+   mutating command having reported success
+6. Bounded candidate validation: direct health
+   (`127.0.0.1:8000/health`), container health status, nginx-path
+   health (`127.0.0.1/api/health`), exact image reference/ID match,
+   in-container `get_search_transport_mode() == "direct"`,
+   `TOR_ENABLED == "false"`, and DB/frontend/Tor state byte-for-byte
+   unchanged from their captured pre-upgrade snapshots
+7. **Only after every check in step 6 passes** does the production git
+   checkout move: `git fetch origin main`, re-validate the target SHA is
+   still an ancestor of `origin/main`, set `GIT_MUTATION_STARTED=true`
+   **immediately before** `git reset --hard f4765f85...` (never `git
+   clean`) for the same partial-mutation reason as step 5
+8. Verify the post-reset compose SHA-256 still matches the target hash;
+   verify the known untracked artifacts' (`.tor_control_password`,
+   `state/`) existence is **unchanged** from their pre-mutation snapshot
+   (an artifact already absent before the run is not treated as a
+   failure just because it is still absent), then repeat the full
+   bounded health/transport validation from step 6 one final time
+
+### Rollback
+
+If any check from step 6 onward fails, the workflow's own `EXIT` trap
+(not a separate retry path) performs rollback automatically. Eligibility
+is keyed off `API_MUTATION_STARTED` / `GIT_MUTATION_STARTED` (set
+*before* their respective mutating commands, per steps 5 and 7 above),
+never off a post-success-only flag -- so rollback still runs even if the
+candidate `docker compose ... up` or the target `git reset --hard`
+itself partially applied and then exited non-zero:
+
+- Recreate `api` using the temporary rollback tag from step 4 -- never
+  the target's own SHA tag
+- Bounded health re-verification (both the direct and nginx paths);
+  require the resulting image ID to match the pre-upgrade image ID
+  exactly
+- Re-prove the direct/no-Tor invariant on the rolled-back container via
+  the same narrow env inspection used everywhere else in this runner
+  (`SEARCH_TRANSPORT` unset/`direct`, `TOR_ENABLED` exactly `false`) --
+  the old (pre-upgrade) 148bd image predates the reviewed
+  SearchTransport abstraction and cannot be trusted to expose
+  `get_search_transport_mode()`, so rollback verification deliberately
+  does not call it
+- If the git checkout had already been advanced to the target SHA
+  before the failure was detected, restore it to
+  `148bd362b37c82c92737382d181fbdeac4d2187b` **after** the API rollback
+  succeeds, never before
+- The original failure still makes the workflow conclude **failure**
+  even when rollback itself succeeds -- a recovered production state is
+  never reported as a successful upgrade
+- If rollback itself fails, the workflow reports a clear fatal
+  diagnostic and stops -- it never retries the candidate, never attempts
+  a second deployment, and never falls back to proxy transport or
+  restarts unrelated services
+
+### Known limitation carried over from Phase 3.4N-A2's rollback analysis
+
+If a future upgrade under this runner is later rolled back to
+`148bd362...`, any `job_search_demand_queue` rows that reached the
+terminal `status='failed'` state while running under the target
+runtime would remain inert: 148bd's own retry logic only ever writes
+`status='pending'` and has no code path that reads or clears
+`'failed'` rows. This is **not** schema corruption (the `status` column
+is plain `TEXT` with no constraint), but it **is** persistent
+behavioral state an operator should be aware of after any rollback --
+those specific queries will not resume automatically and would need a
+manual, explicit status reset if that behavior is undesired.
+
+### Known limitation: remote temp-file cleanup on pre-start failure
+
+The runner SCPs a single RUN_ID-scoped temporary script to
+`/tmp/jobpulse-direct-runtime-upgrade-remote-${RUN_ID}.sh` on the VM,
+then executes it over SSH. The remote script deletes itself in its own
+`EXIT` trap, but only *after that script has actually started running*.
+This means:
+
+- The script contains no secret material (the GHCR token, if any, is
+  piped through the SSH session's stdin -- it is never written into the
+  script file itself)
+- Its path is RUN_ID-scoped, so a leftover file cannot collide with a
+  different run
+- A normal failure *after* the remote script begins executing is
+  cleaned up by its own `EXIT` trap, same as every other cleanup this
+  runner performs
+- If SCP succeeds but the SSH invocation fails *before* the remote
+  script starts (or the GitHub Actions job is forcibly terminated
+  before the remote trap can run), the RUN_ID-scoped file can remain
+  under `/tmp` on the VM. Cleanup is **not** guaranteed in every
+  pre-start or forced-timeout path -- only once the script has begun
+
+This is a narrow, documented limitation, not a security gap (no secret
+ever reaches the file) and not something this phase adds arbitrary
+remote cleanup commands to address.
+
+### Authorization
+
+Implementing and locally testing this workflow (Phase 3.4N-B) is a
+separate, prior step from actually dispatching it against production.
+Dispatching it is a later, separately authorized task -- exactly the
+same discipline already applied to the Phase 3.4M-A/B neutral canary.
+

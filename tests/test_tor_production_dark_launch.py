@@ -949,6 +949,7 @@ _ALLOWED_TOR_ENABLED_SETTERS = {
     ".github/workflows/tor-runtime-monitor.yml",  # Phase 3.4D: single read-only `docker exec ... printenv TOR_ENABLED` evidence check feeding the classify_evidence severity model, invoked only by the workflow_dispatch-only tor-runtime-monitor.yml, never dispatched by this task
     "scripts/search_transport/transport.py",  # Phase 3.4K: docstring/error-message text only, explaining why SEARCH_TRANSPORT=proxy is deliberately NOT gated by TOR_ENABLED (get_tor_enabled() is never called here) -- this file is itself the proof that the invariant this test enforces was upheld, not violated
     ".github/workflows/production-neutral-canary.yml",  # Phase 3.4M: single read-only `docker inspect`-derived pre/post invariant check (must stay 'false'), invoked only by the manual workflow_dispatch-only production-neutral-canary.yml, never dispatched by this task
+    ".github/workflows/production-direct-runtime-upgrade.yml",  # Phase 3.4N-B: read-only pre/candidate/post invariant checks (must stay 'false' throughout), invoked only by the manual workflow_dispatch-only production-direct-runtime-upgrade.yml, never dispatched by this task; never sets TOR_ENABLED=true
 }
 
 
