@@ -1199,8 +1199,13 @@ def test_capture_container_state_includes_all_required_fields(remote_script):
     # next top-level function definition instead.
     after_start = remote_script.split("capture_container_state() {", 1)[1]
     func_body = after_start.split("final_exit_trap() {", 1)[0]
-    for field in (".Id", ".RestartCount", ".State.Running", ".State.Health", ".Image", ".Config.Image"):
+    # Health is looked up via the missing-key-safe `index .State "Health"`
+    # form (see test_capture_container_state_uses_missing_key_safe_health_lookup
+    # below) rather than direct `.State.Health` field access, so it is
+    # checked separately from the other plain-field-access assertions.
+    for field in (".Id", ".RestartCount", ".State.Running", ".Image", ".Config.Image"):
         assert field in func_body, field
+    assert 'index .State "Health"' in func_body
 
 
 def test_db_and_frontend_required_present_and_running_before_mutation():
@@ -2159,7 +2164,159 @@ def test_behavior_reconcile_launchers_no_launchers_uses_default(extracted_functi
 
 
 # =====================================================================
-# 30. Meta: this test file itself is clean
+# 30. Healthless container health-lookup safety (Phase 3.4N regression)
+#
+# Production runtime-upgrade run 34347072679 aborted with a Go template
+# error ("map has no entry for key \"Health\"") while capturing the
+# unrelated db/frontend/tor container state, because the format string
+# used `{{if .State.Health}}`: direct field access on a map that omits
+# the "Health" key entirely (observed against jobpulse-frontend-prod, an
+# nginx:alpine container with no HEALTHCHECK) errors instead of treating
+# the field as absent/falsy. The safe replacement is
+# `{{with (index .State "Health")}}...{{else}}none{{end}}` -- `index`
+# returns the zero value for a missing map key instead of erroring, the
+# same pattern already proven in production-runtime-diagnostic.yml.
+#
+# capture_container_state() is used for db/frontend/tor -- all
+# health-optional -- and DB_HEALTH_BEFORE explicitly accepts "no
+# healthcheck defined". The three jobpulse-api-prod-only health lookups
+# (rollback_api's rb_health, API_HEALTH_BEFORE, and the candidate
+# container-health poll) are deliberately left on the strict
+# `{{if .State.Health}}` form: the api service always carries a compose
+# HEALTHCHECK, and those checks intentionally require "healthy" (a
+# missing Health key there would itself be a real, correctly-surfaced
+# failure, not a false negative to paper over).
+# =====================================================================
+
+
+def _extract_bash_function(script: str, func_name: str) -> str:
+    """Extracts `<func_name>() { ... }` verbatim by tracking brace depth
+    across the whole line (works here because every Go `{{ }}` template
+    pair inside the function body is balanced on its own line)."""
+    lines = script.splitlines()
+    start_idx = next(
+        i
+        for i, line in enumerate(lines)
+        if line.strip().startswith(f"{func_name}()") and line.rstrip().endswith("{")
+    )
+    depth = 0
+    collected = []
+    for line in lines[start_idx:]:
+        collected.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            break
+    return "\n".join(collected)
+
+
+@pytest.fixture(scope="module")
+def capture_container_state_source(remote_script) -> str:
+    return _extract_bash_function(remote_script, "capture_container_state")
+
+
+def _db_health_before_line(remote_script: str) -> str:
+    for line in remote_script.splitlines():
+        if line.strip().startswith("DB_HEALTH_BEFORE="):
+            return line
+    raise AssertionError("DB_HEALTH_BEFORE assignment not found")
+
+
+def test_capture_container_state_uses_missing_key_safe_health_lookup(
+    capture_container_state_source,
+):
+    code_lines = [
+        line
+        for line in capture_container_state_source.splitlines()
+        if not line.strip().startswith("#")
+    ]
+    code_text = "\n".join(code_lines)
+    assert 'index .State "Health"' in code_text
+    assert "{{if .State.Health}}" not in code_text
+    assert ".State.Health.Status" not in code_text
+
+
+def test_db_health_before_uses_missing_key_safe_health_lookup(remote_script):
+    line = _db_health_before_line(remote_script)
+    assert 'index .State "Health"' in line
+    assert "{{if .State.Health}}" not in line
+    assert ".State.Health.Status" not in line
+
+
+def test_api_only_health_lookups_remain_intentionally_strict(remote_script):
+    """The three jobpulse-api-prod-only health checks (rollback, before,
+    candidate) were deliberately left unchanged -- the api service always
+    declares a compose HEALTHCHECK, so requiring the strict `healthy`
+    template there is correct, not a bug."""
+    strict_snippet = "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
+    occurrences = remote_script.count(strict_snippet)
+    assert occurrences == 3, occurrences
+
+
+def _run_capture_container_state(capture_container_state_source, harness_bin, tmp_path, mode: str):
+    fake_docker_bin = tmp_path / "fake_docker_bin"
+    fake_docker_bin.mkdir()
+    if mode == "present_no_healthcheck":
+        docker_body = (
+            'if [ "$1" = "inspect" ]; then\n'
+            '  shift\n'
+            '  if [ "$1" = "-f" ]; then\n'
+            "    echo 'container-id|0|true|none|sha256:image|nginx:alpine'\n"
+            "    exit 0\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n"
+        )
+    elif mode == "absent":
+        docker_body = 'if [ "$1" = "inspect" ]; then\n  exit 1\nfi\nexit 1\n'
+    else:
+        raise ValueError(mode)
+    _write_fake_executable(fake_docker_bin, "docker", docker_body)
+
+    body = 'STATE="$(capture_container_state jobpulse-frontend-prod)"\nprintf \'STATE=%s\\n\' "$STATE"\n'
+    return _run_harness(
+        capture_container_state_source,
+        harness_bin,
+        body,
+        extra_path_dirs=(fake_docker_bin,),
+    )
+
+
+def test_behavior_capture_container_state_healthless_container(
+    capture_container_state_source, harness_bin, tmp_path
+):
+    """Case A: the container exists but has no HEALTHCHECK (Docker omits
+    the "Health" key from .State entirely). Runs the ACTUAL extracted
+    capture_container_state() against a fake docker -- not a Python
+    reimplementation -- and requires it complete successfully with the
+    health field resolved to "none"."""
+    result = _run_capture_container_state(
+        capture_container_state_source, harness_bin, tmp_path, "present_no_healthcheck"
+    )
+    assert result.returncode == 0, result.stderr
+    values = _parse_kv_lines(result.stdout)
+    state = values["STATE"]
+    fields = state.split("|")
+    assert len(fields) == 6, state
+    assert fields[3] == "none", state
+
+
+def test_behavior_capture_container_state_absent_container(
+    capture_container_state_source, harness_bin, tmp_path
+):
+    """Case B: `docker inspect <name>` itself fails (container does not
+    exist) -- capture_container_state must report exactly ABSENT and
+    must not attempt the -f format lookup at all."""
+    result = _run_capture_container_state(
+        capture_container_state_source, harness_bin, tmp_path, "absent"
+    )
+    assert result.returncode == 0, result.stderr
+    values = _parse_kv_lines(result.stdout)
+    assert values["STATE"] == "ABSENT"
+
+
+# =====================================================================
+# 31. Meta: this test file itself is clean
 # =====================================================================
 
 def test_this_test_file_has_no_duplicate_test_function_names():
