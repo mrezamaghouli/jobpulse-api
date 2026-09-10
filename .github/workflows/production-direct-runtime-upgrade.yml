@@ -271,9 +271,15 @@ jobs:
           # runtime (see "checking for launcher-level" and "resolving
           # effective production collection-cycle lock path" below) by
           # checking for a launcher-level (crontab/systemd) override and
-          # then sourcing $ROOT/.collection.env exactly like
-          # scripts/run_collection_cycle_safe.sh does, before flock is
-          # ever invoked.
+          # then parsing $ROOT/.collection.env as data exactly like
+          # scripts/run_collection_cycle_safe.sh's own precedence, before
+          # flock is ever invoked. OUTER_LOCK_PATH is a SEPARATE value --
+          # the scheduler's own outer flock path from a canonical
+          # `cd ... && flock -n ...` cron launcher line, if any -- and is
+          # never derived from or merged into CYCLE_LOCK_PATH. See
+          # resolve_final_lock_path/resolve_final_outer_lock_path and
+          # acquire_outer_lock/acquire_internal_lock below for the full
+          # two-lock model.
           EXPECTED_CURRENT_SHA="148bd362b37c82c92737382d181fbdeac4d2187b"
 
           WORKFLOW_SUCCESS=false
@@ -291,6 +297,7 @@ jobs:
           ROLLBACK_TAG=""
           TMP_DOCKER_CONFIG=""
           CYCLE_LOCK_FD=""
+          OUTER_LOCK_FD=""
 
           rollback_api() {
             echo "ROLLBACK: recreating api with previous image (ID $API_IMAGE_ID_BEFORE) via $ROLLBACK_TAG" >&2
@@ -514,20 +521,62 @@ jobs:
             return 0
           }
 
+          # classify_cron_job_command <command> -- the ONLY place this
+          # resolver recognizes a chained (`&&`) form at all. Matches a
+          # narrowly anchored, fully-literal canonical launcher shape:
+          #   cd <root> && flock -n <outer-lock> ./scripts/run_collection_cycle_safe.sh
+          # with `<root>`/`<outer-lock>` restricted to the same
+          # path-safe allowlist as extract_literal_value and the whole
+          # string anchored start-to-end (no trailing arguments,
+          # redirection, or further chaining permitted). The wrapper
+          # token itself is NOT a generic "any path ending in the right
+          # basename" pattern -- it is pinned to the single known,
+          # reviewed project wrapper invocation
+          # (`./scripts/run_collection_cycle_safe.sh`, relative to
+          # <root>) so that lines like
+          # `.../ /tmp/run_collection_cycle_safe.sh`,
+          # `.../ ../run_collection_cycle_safe.sh`, or
+          # `.../ /opt/other/scripts/run_collection_cycle_safe.sh` --
+          # which merely share the basename but are not the reviewed
+          # wrapper -- fail closed instead of being treated as
+          # canonical. This is the production cron shape. Every other
+          # command -- including any OTHER use of `&&`, `||`, `;`, `|`,
+          # backticks, `$(...)`, `bash/sh -c`, `env`, or `source`/`.` --
+          # falls straight through to classify_wrapper_command's
+          # existing, unmodified rejection logic. Prints
+          # 'WRAPPER_CANONICAL_OUTER_FLOCK|<root>|<outer-lock>' on a
+          # canonical match (never executes/expands either captured
+          # value); otherwise prints classify_wrapper_command's result
+          # unchanged.
+          classify_cron_job_command() {
+            local command="$1"
+            local canonical_re='^[[:space:]]*cd[[:space:]]+(/[A-Za-z0-9/._-]*)[[:space:]]+&&[[:space:]]+flock[[:space:]]+-n[[:space:]]+(/[A-Za-z0-9/._-]*)[[:space:]]+\./scripts/run_collection_cycle_safe\.sh[[:space:]]*$'
+            if [[ "$command" =~ $canonical_re ]]; then
+              printf 'WRAPPER_CANONICAL_OUTER_FLOCK|%s|%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+              return 0
+            fi
+            classify_wrapper_command "$command"
+          }
+
           DISCOVERED_LAUNCHERS=()
 
           # scan_cron_source <label> <mode:user|system> <content> --
           # walks <content> IN ORDER, maintaining the currently-effective
           # values of the two relevant variables as it goes (matching
           # real cron semantics: an assignment only affects JOB LINES
-          # that follow it). Appends "root|lock|label" to the global
-          # DISCOVERED_LAUNCHERS array for every recognized invocation of
-          # run_collection_cycle_safe.sh. Any line that mentions either
-          # relevant variable name or the script name, but does not
-          # cleanly resolve to exactly one well-understood form, fails
-          # the whole script closed immediately -- a line mentioning
-          # neither is skipped without further inspection, since it
-          # cannot affect this resolver's concerns regardless of shape.
+          # that follow it). Appends "root|lock|outer_lock|label" to the
+          # global DISCOVERED_LAUNCHERS array for every recognized
+          # invocation of run_collection_cycle_safe.sh -- "lock" is the
+          # wrapper's INTERNAL cycle-lock env override (if any);
+          # "outer_lock" is the scheduler's own outer flock path (only
+          # ever non-empty for a WRAPPER_CANONICAL_OUTER_FLOCK match) and
+          # is a semantically distinct value that must never be confused
+          # with "lock". Any line that mentions either relevant variable
+          # name or the script name, but does not cleanly resolve to
+          # exactly one well-understood form, fails the whole script
+          # closed immediately -- a line mentioning neither is skipped
+          # without further inspection, since it cannot affect this
+          # resolver's concerns regardless of shape.
           scan_cron_source() {
             local label="$1" mode="$2" content="$3"
             local cur_root="" cur_lock=""
@@ -583,10 +632,19 @@ jobs:
                 exit 1
               fi
               local classification
-              classification="$(classify_wrapper_command "$JOB_COMMAND")"
+              classification="$(classify_cron_job_command "$JOB_COMMAND")"
               case "$classification" in
                 WRAPPER_SIMPLE)
-                  DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}|${label}")
+                  DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}||${label}")
+                  ;;
+                WRAPPER_CANONICAL_OUTER_FLOCK\|*)
+                  local canon_prefix canon_root canon_outer
+                  IFS='|' read -r canon_prefix canon_root canon_outer <<< "$classification"
+                  if [ -n "$cur_root" ] && [ "$cur_root" != "$canon_root" ]; then
+                    echo "ERROR: $label sets JOBPULSE_COLLECTION_ROOT='$cur_root' but its own canonical cron launcher line cd's to '$canon_root' -- refusing to guess which is authoritative, failing closed (${line})" >&2
+                    exit 1
+                  fi
+                  DISCOVERED_LAUNCHERS+=("${canon_root}|${cur_lock}|${canon_outer}|${label}")
                   ;;
                 *)
                   echo "ERROR: $label invokes (or references) run_collection_cycle_safe.sh in an unsupported/unrecognized form -- refusing to guess, failing closed (${line})" >&2
@@ -678,7 +736,12 @@ jobs:
             done <<< "$effective"
 
             if [ "$found_exec" = "true" ]; then
-              DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}|systemd:${unit}")
+              # systemd ExecStart= lines are only ever classified via
+              # classify_wrapper_command (WRAPPER_SIMPLE), never the
+              # canonical `cd ... && flock -n ...` cron grammar -- no
+              # production systemd unit uses that shape, so there is no
+              # outer-lock field to carry here.
+              DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}||systemd:${unit}")
             fi
           }
 
@@ -780,19 +843,30 @@ jobs:
           # reconcile_launchers -- every discovered launcher must agree
           # on the SAME effective ROOT (which must itself be
           # /opt/jobpulse, since every other precondition/mutation in
-          # this workflow is hardcoded to it) and the SAME effective
-          # lock path; multiple launchers producing different values
-          # fail the workflow closed rather than picking one. Sets
-          # EFFECTIVE_COLLECTION_ROOT and LAUNCHER_LOCK_CONSENSUS (empty
-          # if no launcher was found anywhere).
+          # this workflow is hardcoded to it), the SAME effective
+          # INTERNAL wrapper cycle-lock path, and -- independently -- the
+          # SAME non-empty OUTER scheduler flock path if more than one
+          # launcher declares one; multiple launchers producing
+          # different values fail the workflow closed rather than
+          # picking one. A launcher with no outer lock (plain
+          # WRAPPER_SIMPLE form) is compatible with any other launcher's
+          # outer-lock value -- it makes no claim about the outer lock at
+          # all, it does not claim "none" -- since the universal INTERNAL
+          # lock (acquired unconditionally below, regardless of whether
+          # any outer lock exists) already protects every legitimate
+          # wrapper invocation. Sets EFFECTIVE_COLLECTION_ROOT,
+          # LAUNCHER_LOCK_CONSENSUS (empty if no launcher was found
+          # anywhere), and OUTER_LOCK_CONSENSUS (empty if no discovered
+          # launcher declares an outer lock).
           reconcile_launchers() {
             EFFECTIVE_COLLECTION_ROOT="/opt/jobpulse"
             LAUNCHER_LOCK_CONSENSUS=""
+            OUTER_LOCK_CONSENSUS=""
             local first=true
             local entry
             for entry in "${DISCOVERED_LAUNCHERS[@]}"; do
-              local l_root l_lock l_label
-              IFS='|' read -r l_root l_lock l_label <<< "$entry"
+              local l_root l_lock l_outer l_label
+              IFS='|' read -r l_root l_lock l_outer l_label <<< "$entry"
               local effective_root="${l_root:-/opt/jobpulse}"
               if [ "$effective_root" != "/opt/jobpulse" ]; then
                 echo "ERROR: launcher '$l_label' resolves JOBPULSE_COLLECTION_ROOT to '$effective_root', not /opt/jobpulse -- refusing to proceed" >&2
@@ -806,11 +880,18 @@ jobs:
                 echo "ERROR: discovered launchers resolve to different effective lock paths ('$LAUNCHER_LOCK_CONSENSUS' vs '$effective_lock' from '$l_label') -- refusing to guess which is authoritative, failing closed" >&2
                 exit 1
               fi
+              if [ -n "$l_outer" ]; then
+                if [ -n "$OUTER_LOCK_CONSENSUS" ] && [ "$l_outer" != "$OUTER_LOCK_CONSENSUS" ]; then
+                  echo "ERROR: discovered launchers declare different outer scheduler flock paths ('$OUTER_LOCK_CONSENSUS' vs '$l_outer' from '$l_label') -- refusing to guess which is authoritative, failing closed" >&2
+                  exit 1
+                fi
+                OUTER_LOCK_CONSENSUS="$l_outer"
+              fi
             done
             if [ "$first" = "true" ]; then
               echo "No launcher of run_collection_cycle_safe.sh found in any inspected source (this account's crontab, /etc/crontab, /etc/cron.d/*, root's crontab, readable systemd units)."
             else
-              echo "All ${#DISCOVERED_LAUNCHERS[@]} discovered launcher(s) agree: ROOT=/opt/jobpulse, effective lock=$LAUNCHER_LOCK_CONSENSUS"
+              echo "All ${#DISCOVERED_LAUNCHERS[@]} discovered launcher(s) agree: ROOT=/opt/jobpulse, effective internal lock=$LAUNCHER_LOCK_CONSENSUS, outer scheduler lock=${OUTER_LOCK_CONSENSUS:-none declared}"
             fi
           }
 
@@ -887,6 +968,86 @@ jobs:
             echo "Effective collection-cycle lock path resolved: $CYCLE_LOCK_PATH"
           }
 
+          # resolve_final_outer_lock_path -- the OUTER scheduler flock
+          # path is a completely separate value from CYCLE_LOCK_PATH
+          # above: it is never fed through .collection.env or any
+          # wrapper-side override, it comes ONLY from a canonical
+          # `cd ... && flock -n ...` cron launcher line (see
+          # classify_cron_job_command/reconcile_launchers). Empty is a
+          # valid, common outcome -- it means no discovered launcher used
+          # the canonical outer-flock grammar, so only the INTERNAL
+          # wrapper lock protects this operation. Sets OUTER_LOCK_PATH.
+          resolve_final_outer_lock_path() {
+            OUTER_LOCK_PATH="$OUTER_LOCK_CONSENSUS"
+            if [ -n "$OUTER_LOCK_PATH" ]; then
+              case "$OUTER_LOCK_PATH" in
+                /*) : ;;
+                *)
+                  echo "ERROR: resolved outer scheduler lock path '$OUTER_LOCK_PATH' is not an absolute path -- refusing to proceed" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            echo "Effective outer scheduler lock path resolved: ${OUTER_LOCK_PATH:-<none declared>}"
+          }
+
+          # acquire_outer_lock -- non-blocking. A no-op (success) when no
+          # launcher declared an outer lock. When the outer path is
+          # IDENTICAL to the internal wrapper cycle-lock path, this
+          # deliberately does NOT open a second, independent file
+          # descriptor on the same path: flock(2) locks are scoped to
+          # the OPEN FILE DESCRIPTION, not the process, so a single
+          # process non-blocking-flock'ing two different fds against the
+          # same file can itself report EWOULDBLOCK against its own
+          # first lock -- a spurious self-conflict, not real contention.
+          # In that case the single acquisition performed by
+          # acquire_internal_lock below (immediately after this
+          # function returns) already covers both semantic locks.
+          # Returns 1 (never exits directly) so callers control the
+          # actual `exit 1` -- see the main script body -- keeping this
+          # function usable both from the real script and in isolation
+          # from a test harness.
+          acquire_outer_lock() {
+            if [ -z "$OUTER_LOCK_PATH" ]; then
+              echo "No canonical outer scheduler lock declared by any discovered launcher; proceeding to the internal wrapper cycle lock only."
+              return 0
+            fi
+            if [ "$OUTER_LOCK_PATH" = "$CYCLE_LOCK_PATH" ]; then
+              echo "Outer scheduler lock path is identical to the internal wrapper cycle-lock path ($OUTER_LOCK_PATH) -- acquiring it exactly once, not through a second independent file descriptor."
+              return 0
+            fi
+            mkdir -p "$(dirname "$OUTER_LOCK_PATH")"
+            exec {OUTER_LOCK_FD}>"$OUTER_LOCK_PATH" || {
+              echo "ERROR: failed to open outer scheduler lock file $OUTER_LOCK_PATH" >&2
+              return 1
+            }
+            if ! flock -n "$OUTER_LOCK_FD"; then
+              echo "ERROR: outer scheduler lock $OUTER_LOCK_PATH is busy -- a scheduled or manual collection invocation may be starting, refusing to proceed" >&2
+              return 1
+            fi
+            echo "Outer scheduler lock acquired: $OUTER_LOCK_PATH"
+          }
+
+          # acquire_internal_lock -- non-blocking. Always attempted,
+          # regardless of whether an outer lock exists or was already
+          # acquired above -- this is the SAME lock a directly/manually
+          # invoked wrapper (bypassing cron and any outer flock
+          # entirely) also acquires, so it is the one universal
+          # protection this runner can rely on. Returns 1 (never exits
+          # directly), same rationale as acquire_outer_lock.
+          acquire_internal_lock() {
+            mkdir -p "$(dirname "$CYCLE_LOCK_PATH")"
+            exec {CYCLE_LOCK_FD}>"$CYCLE_LOCK_PATH" || {
+              echo "ERROR: failed to open collection-cycle lock file $CYCLE_LOCK_PATH" >&2
+              return 1
+            }
+            if ! flock -n "$CYCLE_LOCK_FD"; then
+              echo "ERROR: collection-cycle lock $CYCLE_LOCK_PATH is busy -- a collection cycle is active, refusing to proceed" >&2
+              return 1
+            fi
+            echo "Internal wrapper collection-cycle lock acquired: $CYCLE_LOCK_PATH"
+          }
+
           final_exit_trap() {
             local ec=$?
             set +e
@@ -919,6 +1080,9 @@ jobs:
             fi
             if [ -n "$CYCLE_LOCK_FD" ]; then
               exec {CYCLE_LOCK_FD}>&- 2>/dev/null || true
+            fi
+            if [ -n "$OUTER_LOCK_FD" ]; then
+              exec {OUTER_LOCK_FD}>&- 2>/dev/null || true
             fi
             rm -f "$REMOTE_SCRIPT_SELF"
 
@@ -1111,18 +1275,17 @@ jobs:
           # fails closed rather than being silently ignored.
           resolve_collection_env_lock_override
           resolve_final_lock_path
+          resolve_final_outer_lock_path
 
-          echo "--- acquiring non-blocking top-level collection-cycle lock (held for the entire operation) ---"
-          mkdir -p "$(dirname "$CYCLE_LOCK_PATH")"
-          exec {CYCLE_LOCK_FD}>"$CYCLE_LOCK_PATH" || {
-            echo "ERROR: failed to open collection-cycle lock file $CYCLE_LOCK_PATH" >&2
-            exit 1
-          }
-          if ! flock -n "$CYCLE_LOCK_FD"; then
-            echo "ERROR: collection-cycle lock $CYCLE_LOCK_PATH is busy -- a collection cycle is active, refusing to proceed" >&2
+          echo "--- acquiring non-blocking outer scheduler lock, if any launcher declares one (must precede the internal lock) ---"
+          if ! acquire_outer_lock; then
             exit 1
           fi
-          echo "Collection-cycle lock acquired: $CYCLE_LOCK_PATH"
+
+          echo "--- acquiring non-blocking internal wrapper collection-cycle lock (held for the entire operation) ---"
+          if ! acquire_internal_lock; then
+            exit 1
+          fi
 
           echo "--- active-collector process check (read-only, no kill) ---"
           # Enumerated from the actual production wrapper

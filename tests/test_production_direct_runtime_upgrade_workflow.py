@@ -737,9 +737,16 @@ def test_resolved_lock_path_relative_fails_closed(remote_script):
 
 
 def test_lock_path_resolved_before_flock(remote_script):
+    """The literal `flock -n "$CYCLE_LOCK_FD"` now lives inside the
+    acquire_internal_lock() function DEFINITION, which (like every other
+    helper function) is textually defined near the top of the script --
+    before the main body's lock-path resolution echo. What must actually
+    precede the resolution step is the DEFINITION, and what must actually
+    FOLLOW it is the CALL SITE -- so this checks the call site
+    specifically, not a raw text search for the flock invocation."""
     resolve_index = remote_script.index("resolving effective production collection-cycle lock path")
-    flock_index = remote_script.index('flock -n "$CYCLE_LOCK_FD"')
-    assert resolve_index < flock_index
+    acquire_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    assert resolve_index < acquire_call_index
 
 
 def test_flock_uses_resolved_lock_path(remote_script):
@@ -795,7 +802,7 @@ def test_scan_cron_source_is_order_aware_not_a_global_collector(remote_script):
     assert "while IFS= read -r line" in func_body
     assert "cur_root=" in func_body
     assert "cur_lock=" in func_body
-    assert 'DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}|${label}")' in func_body
+    assert 'DISCOVERED_LAUNCHERS+=("${cur_root}|${cur_lock}||${label}")' in func_body
 
 
 def test_scan_cron_source_fails_closed_on_ambiguous_relevant_line(remote_script):
@@ -1225,8 +1232,11 @@ def test_db_and_frontend_required_present_and_running_before_mutation():
 
 
 def test_db_precondition_checked_before_lock_and_mutation(remote_script):
+    """See test_lock_path_resolved_before_flock: the acquisition code
+    now lives in a function definition that textually precedes the main
+    body, so this checks the CALL SITE, not the exec/flock text."""
     db_check_index = remote_script.index('"$DB_STATE_BEFORE" = "ABSENT"')
-    lock_index = remote_script.index('exec {CYCLE_LOCK_FD}>"$CYCLE_LOCK_PATH"')
+    lock_index = remote_script.index("if ! acquire_internal_lock; then")
     mutation_index = remote_script.index("API_MUTATION_STARTED=true")
     assert db_check_index < lock_index < mutation_index
 
@@ -1604,6 +1614,38 @@ def test_runbook_documents_root_cron_privilege_requirement_honestly():
     assert "fail-closed outcome, not a defect" in section or "not a defect" in section
 
 
+def test_runbook_has_phase_3_4o_section_documenting_two_lock_model():
+    runbook = (REPO_ROOT / "docs" / "PRODUCTION_RUNBOOK.md").read_text()
+    assert "Phase 3.4O" in runbook
+    section = runbook.split("Phase 3.4O", 1)[1]
+    assert "/tmp/jobpulse_collection_cycle.lock" in section
+    assert "/opt/jobpulse/state/run_collection_cycle.lock" in section
+    assert "34479326097" in section
+
+
+def test_runbook_phase_3_4o_states_generic_and_remains_unsupported():
+    runbook = (REPO_ROOT / "docs" / "PRODUCTION_RUNBOOK.md").read_text()
+    section = runbook.split("Phase 3.4O", 1)[1]
+    assert "remains categorically unsupported" in section or "unsupported" in section
+    assert "classify_cron_job_command" in section
+
+
+def test_runbook_phase_3_4o_does_not_overclaim_live_internal_lock_state():
+    """Run 34479326097 aborted during scheduler-provenance parsing,
+    BEFORE resolve_collection_env_lock_override ever ran -- it never
+    proved whether production's .collection.env currently overrides the
+    internal lock path. The runbook must distinguish the wrapper's
+    SOURCE DEFAULT (a fact about the code) from the LIVE EFFECTIVE VALUE
+    (resolved at runtime), and must not claim the default is what
+    production has configured today."""
+    runbook = (REPO_ROOT / "docs" / "PRODUCTION_RUNBOOK.md").read_text()
+    section = runbook.split("Phase 3.4O", 1)[1]
+    assert "no override configured" not in section
+    assert "in production today" not in section
+    assert "before" in section and "resolve_collection_env_lock_override" in section
+    assert "does not assume" in section or "does not prove" in section
+
+
 # =====================================================================
 # 29. TOR_ENABLED allowlist narrowness
 # =====================================================================
@@ -1649,6 +1691,25 @@ def extracted_functions_script(remote_script) -> str:
     `final_exit_trap() {` begins. No reimplementation."""
     start = remote_script.index("parse_assignment_line() {")
     end = remote_script.index("final_exit_trap() {")
+    return remote_script[start:end]
+
+
+@pytest.fixture(scope="module")
+def extracted_functions_and_trap_script(remote_script) -> str:
+    """Same real function definitions as extracted_functions_script, PLUS
+    the ACTUAL final_exit_trap() body and its real `trap final_exit_trap
+    EXIT` registration, verbatim -- stops immediately after the trap is
+    registered, before any of the real upgrade steps (checkout,
+    docker pull, mutation) that follow it. This lets a test drive a real
+    lock-acquisition failure through to the REAL EXIT trap firing (no
+    reimplementation of cleanup semantics in Python), while never
+    reaching rollback_api/rollback_git (which are intentionally NOT
+    extracted here and are unreachable anyway whenever the caller keeps
+    API_MUTATION_STARTED=false, matching every lock-acquisition-failure
+    codepath in the real script -- those always occur before
+    API_MUTATION_STARTED is ever set true)."""
+    start = remote_script.index("parse_assignment_line() {")
+    end = remote_script.index("trap final_exit_trap EXIT") + len("trap final_exit_trap EXIT")
     return remote_script[start:end]
 
 
@@ -1739,7 +1800,7 @@ def test_behavior_case_a_assignment_before_job_applies(extracted_functions_scrip
     assert result.returncode == 0, result.stderr
     _assert_mutation_sentinels_untouched(result)
     entries = [line.split("=", 1)[1] for line in result.stdout.splitlines() if line.startswith("ENTRY=")]
-    assert entries == ["|/a.lock|fixture-source"]
+    assert entries == ["|/a.lock||fixture-source"]
 
 
 def test_behavior_case_b_assignment_after_job_does_not_retroactively_apply(
@@ -1759,7 +1820,7 @@ def test_behavior_case_b_assignment_after_job_does_not_retroactively_apply(
     entries = [line.split("=", 1)[1] for line in result.stdout.splitlines() if line.startswith("ENTRY=")]
     # empty root, empty lock: the job was recorded with whatever was in
     # scope AT THAT LINE, which was nothing yet -- /b.lock must not appear
-    assert entries == ["||fixture-source"]
+    assert entries == ["|||fixture-source"]
     assert "/b.lock" not in result.stdout
 
 
@@ -1912,7 +1973,7 @@ def test_behavior_systemd_drop_in_environment_override_is_observed(
     result = _run_harness(extracted_functions_script, harness_bin, body, extra_path_dirs=(fixture_bin,))
     assert result.returncode == 0, result.stderr
     _assert_mutation_sentinels_untouched(result)
-    assert "ENTRY=|/override.lock|systemd:jobpulse-collection.service" in result.stdout
+    assert "ENTRY=|/override.lock||systemd:jobpulse-collection.service" in result.stdout
 
 
 def test_behavior_systemd_environment_file_fails_closed(extracted_functions_script, harness_bin, tmp_path):
@@ -2107,7 +2168,7 @@ def test_behavior_root_reference_in_lock_value_is_unsupported_ambiguity(
 
 def test_behavior_reconcile_launchers_same_root_and_lock_succeeds(extracted_functions_script, harness_bin):
     body = (
-        'DISCOVERED_LAUNCHERS=("|/a.lock|src1" "|/a.lock|src2")\n'
+        'DISCOVERED_LAUNCHERS=("|/a.lock||src1" "|/a.lock||src2")\n'
         "reconcile_launchers\n"
         "printf 'RECONCILE_SUCCEEDED\\n'\n"
         "printf 'CONSENSUS=%s\\n' \"$LAUNCHER_LOCK_CONSENSUS\"\n"
@@ -2121,7 +2182,7 @@ def test_behavior_reconcile_launchers_same_root_and_lock_succeeds(extracted_func
 
 def test_behavior_reconcile_launchers_different_lock_fails(extracted_functions_script, harness_bin):
     body = (
-        'DISCOVERED_LAUNCHERS=("|/a.lock|src1" "|/b.lock|src2")\n'
+        'DISCOVERED_LAUNCHERS=("|/a.lock||src1" "|/b.lock||src2")\n'
         "reconcile_launchers\n"
         "printf 'RECONCILE_SUCCEEDED\\n'\n"
     )
@@ -2134,7 +2195,7 @@ def test_behavior_reconcile_launchers_different_lock_fails(extracted_functions_s
 
 def test_behavior_reconcile_launchers_different_root_fails(extracted_functions_script, harness_bin):
     body = (
-        'DISCOVERED_LAUNCHERS=("/opt/jobpulse|/a.lock|src1" "/some/other/root|/a.lock|src2")\n'
+        'DISCOVERED_LAUNCHERS=("/opt/jobpulse|/a.lock||src1" "/some/other/root|/a.lock||src2")\n'
         "reconcile_launchers\n"
         "printf 'RECONCILE_SUCCEEDED\\n'\n"
     )
@@ -2316,7 +2377,582 @@ def test_behavior_capture_container_state_absent_container(
 
 
 # =====================================================================
-# 31. Meta: this test file itself is clean
+# 31. Phase 3.4O: canonical cron/flock launcher provenance
+#
+# Production Direct Runtime Upgrade run 34479326097 (a SAFE
+# PRE-MUTATION ABORT, dispatched after PR #29's healthless-container fix
+# had already been proven working against real production containers)
+# failed at the scheduler-provenance step against production's REAL
+# crontab line:
+#
+#   */30 * * * * cd /opt/jobpulse && flock -n /tmp/jobpulse_collection_cycle.lock ./scripts/run_collection_cycle_safe.sh
+#
+# classify_wrapper_command rejected it outright because it contains
+# "&&" -- correctly so, since generic "&&" chaining could hide arbitrary
+# commands. The fix adds classify_cron_job_command(), which recognizes
+# ONLY this one narrowly anchored canonical grammar (`cd <root> &&
+# flock -n <outer-lock> <wrapper>`, with a literal `-n`, absolute
+# path-safe root/lock, and nothing else on the line) before falling
+# through to classify_wrapper_command's UNCHANGED generic rejection for
+# every other shape. The outer scheduler flock path this grammar
+# reveals is a value SEPARATE from the wrapper's own INTERNAL
+# CYCLE_LOCK_PATH -- both are now modeled independently and both are
+# acquired (non-blocking, outer-then-internal) before any pull/mutation.
+# =====================================================================
+
+PRODUCTION_CRON_LINE = (
+    "*/30 * * * * cd /opt/jobpulse && flock -n /tmp/jobpulse_collection_cycle.lock "
+    "./scripts/run_collection_cycle_safe.sh"
+)
+
+PHASE_3_4O_NEGATIVE_LAUNCHER_FORMS = [
+    "cd /opt/jobpulse && echo bad && flock -n /tmp/x ./scripts/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse; flock -n /tmp/x ./scripts/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock /tmp/x ./scripts/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -w 5 /tmp/x ./scripts/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -n relative.lock ./scripts/run_collection_cycle_safe.sh",
+    "cd '$ROOT' && flock -n /tmp/x ./scripts/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -n /tmp/x bash -c './scripts/run_collection_cycle_safe.sh'",
+    "cd /opt/jobpulse && flock -n /tmp/x ./scripts/run_collection_cycle_safe.sh && echo done",
+    "cd /opt/jobpulse && flock -n /tmp/x ./scripts/run_collection_cycle_safe.sh | cat",
+    "env FOO=bar ./scripts/run_collection_cycle_safe.sh",
+    "./scripts/run_collection_cycle_safe.sh && echo done",
+    # Wrapper-path hardening: the canonical grammar's wrapper token is
+    # pinned to the literal `./scripts/run_collection_cycle_safe.sh`
+    # (relative to the matched root) -- any OTHER path that merely ends
+    # in the right basename (arbitrary absolute path, `../` traversal,
+    # or a different project subdirectory) must still fail closed, even
+    # though the `cd ... && flock -n ...` shape is otherwise canonical.
+    "cd /opt/jobpulse && flock -n /tmp/x /tmp/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -n /tmp/x ../run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -n /tmp/x ../../other/run_collection_cycle_safe.sh",
+    "cd /opt/jobpulse && flock -n /tmp/x /opt/other/scripts/run_collection_cycle_safe.sh",
+]
+
+
+# ---------------------------------------------------------------------
+# 31a. classify_cron_job_command -- structural
+# ---------------------------------------------------------------------
+
+def test_classify_cron_job_command_exists_and_falls_through_to_classify_wrapper_command(remote_script):
+    func_body = remote_script.split("classify_cron_job_command() {")[1].split("\n          }")[0]
+    assert "classify_wrapper_command" in func_body
+    assert "WRAPPER_CANONICAL_OUTER_FLOCK" in func_body
+
+
+def test_classify_cron_job_command_requires_literal_n_flag(remote_script):
+    func_body = remote_script.split("classify_cron_job_command() {")[1].split("\n          }")[0]
+    assert "flock[[:space:]]+-n[[:space:]]+" in func_body
+
+
+def test_classify_cron_job_command_anchored_start_to_end(remote_script):
+    func_body = remote_script.split("classify_cron_job_command() {")[1].split("\n          }")[0]
+    pattern_line = next(line for line in func_body.splitlines() if "canonical_re=" in line)
+    assert pattern_line.strip().startswith("local canonical_re='^")
+    assert pattern_line.rstrip().endswith("$'")
+
+
+def test_scan_cron_source_uses_classify_cron_job_command_not_classify_wrapper_command_directly(remote_script):
+    """scan_cron_source must route through the new canonical-aware
+    classifier -- calling classify_wrapper_command directly would regress
+    straight back to rejecting the real production cron line."""
+    func_body = remote_script.split("scan_cron_source() {")[1].split("\n          }")[0]
+    assert "classify_cron_job_command" in func_body
+
+
+# ---------------------------------------------------------------------
+# 31b. Section 18: exact production cron line regression
+# ---------------------------------------------------------------------
+
+def test_behavior_production_exact_cron_line_discovers_canonical_outer_lock_launcher(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """The EXACT current production crontab line must scan_cron_source
+    successfully, discover exactly one launcher, and resolve
+    root=/opt/jobpulse and outer=/tmp/jobpulse_collection_cycle.lock --
+    with no internal env override (none configured in this fixture)."""
+    content_file = tmp_path / "prod_cron.txt"
+    content_file.write_text(PRODUCTION_CRON_LINE + "\n")
+    body = _scan_cron_source_body(content_file, label="this account's crontab")
+    result = _run_harness(extracted_functions_script, harness_bin, body)
+    assert result.returncode == 0, result.stderr
+    _assert_mutation_sentinels_untouched(result)
+    assert "COUNT=1" in result.stdout
+    entries = [line.split("=", 1)[1] for line in result.stdout.splitlines() if line.startswith("ENTRY=")]
+    assert entries == ["/opt/jobpulse||/tmp/jobpulse_collection_cycle.lock|this account's crontab"]
+
+
+def test_behavior_production_exact_cron_line_reconciles_and_resolves_both_locks(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """End-to-end scan -> reconcile -> resolve for BOTH lock paths using
+    the real production crontab content and no .collection.env override.
+    The internal wrapper lock must remain the wrapper's own default
+    (/opt/jobpulse/state/run_collection_cycle.lock) -- NOT the outer cron
+    flock path."""
+    content_file = tmp_path / "prod_cron.txt"
+    content_file.write_text(PRODUCTION_CRON_LINE + "\n")
+    body = (
+        _scan_cron_source_body(content_file, label="this account's crontab")
+        + "\nreconcile_launchers\n"
+        "resolve_collection_env_lock_override\n"
+        "resolve_final_lock_path\n"
+        "resolve_final_outer_lock_path\n"
+        "printf 'INTERNAL=%s\\n' \"$CYCLE_LOCK_PATH\"\n"
+        "printf 'OUTER=%s\\n' \"$OUTER_LOCK_PATH\"\n"
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, body)
+    assert result.returncode == 0, result.stderr
+    _assert_mutation_sentinels_untouched(result)
+    assert "INTERNAL=/opt/jobpulse/state/run_collection_cycle.lock" in result.stdout
+    assert "OUTER=/tmp/jobpulse_collection_cycle.lock" in result.stdout
+
+
+# ---------------------------------------------------------------------
+# 31c. Section 19: negative near-miss grammar forms
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("launcher_command", PHASE_3_4O_NEGATIVE_LAUNCHER_FORMS)
+def test_behavior_canonical_grammar_rejects_near_miss_forms(
+    extracted_functions_script, harness_bin, tmp_path, launcher_command
+):
+    """Every one of these near-miss forms must still fail closed through
+    the ACTUAL extracted scan_cron_source -- proving the new canonical
+    grammar is narrowly anchored to the one production shape and does
+    not accidentally widen `&&` (or any other shell metacharacter)
+    support beyond it."""
+    content_file = tmp_path / "cron_negative.txt"
+    content_file.write_text(f"*/5 * * * * {launcher_command}\n")
+    result = _run_harness(extracted_functions_script, harness_bin, _scan_cron_source_body(content_file))
+    assert result.returncode != 0, result.stdout
+    _assert_mutation_sentinels_untouched(result)
+    assert "refusing to guess, failing closed" in result.stderr
+
+
+def test_behavior_generic_double_ampersand_chain_through_wrapper_still_unsupported(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """Explicit regression guard, independent of the parametrized list
+    above: a wrapper wrapped in a DIFFERENT (non-canonical) `&&` chain
+    must still be WRAPPER_UNSUPPORTED via classify_wrapper_command's
+    unchanged generic rejection."""
+    content_file = tmp_path / "cron_generic_and.txt"
+    content_file.write_text("*/5 * * * * echo start && ./scripts/run_collection_cycle_safe.sh\n")
+    result = _run_harness(extracted_functions_script, harness_bin, _scan_cron_source_body(content_file))
+    assert result.returncode != 0
+    _assert_mutation_sentinels_untouched(result)
+    assert "refusing to guess, failing closed" in result.stderr
+
+
+# ---------------------------------------------------------------------
+# 31d. Section 20/21: internal vs outer lock independence
+# ---------------------------------------------------------------------
+
+def test_behavior_collection_env_override_stays_independent_of_outer_lock(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """Outer cron lock (/tmp/jobpulse_collection_cycle.lock) plus a safe
+    .collection.env JOBPULSE_COLLECTION_CYCLE_LOCK_PATH override must
+    resolve to an internal lock that reflects ONLY the .collection.env
+    override, while the outer lock stays exactly what the canonical cron
+    grammar declared -- the two must never merge."""
+    root_dir = tmp_path / "collection_root"
+    root_dir.mkdir()
+    (root_dir / ".collection.env").write_text(
+        "JOBPULSE_COLLECTION_CYCLE_LOCK_PATH=/opt/jobpulse/state/custom.lock\n"
+    )
+    content_file = tmp_path / "prod_cron.txt"
+    content_file.write_text(PRODUCTION_CRON_LINE + "\n")
+    body = (
+        _scan_cron_source_body(content_file, label="this account's crontab")
+        + "\nreconcile_launchers\n"
+        f"EFFECTIVE_COLLECTION_ROOT={shlex.quote(str(root_dir))}\n"
+        "resolve_collection_env_lock_override\n"
+        "resolve_final_lock_path\n"
+        "resolve_final_outer_lock_path\n"
+        "printf 'INTERNAL=%s\\n' \"$CYCLE_LOCK_PATH\"\n"
+        "printf 'OUTER=%s\\n' \"$OUTER_LOCK_PATH\"\n"
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, body)
+    assert result.returncode == 0, result.stderr
+    _assert_mutation_sentinels_untouched(result)
+    assert "INTERNAL=/opt/jobpulse/state/custom.lock" in result.stdout
+    assert "OUTER=/tmp/jobpulse_collection_cycle.lock" in result.stdout
+
+
+def test_behavior_root_consistency_conflicting_root_assignment_fails_closed(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """Section 9: if a cron environment assignment sets
+    JOBPULSE_COLLECTION_ROOT to something that DISAGREES with a
+    canonical launcher's own `cd` root on the same source, this must
+    fail closed rather than guess which is authoritative."""
+    content_file = tmp_path / "cron_root_conflict.txt"
+    content_file.write_text(
+        "JOBPULSE_COLLECTION_ROOT=/some/other/root\n" + PRODUCTION_CRON_LINE + "\n"
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, _scan_cron_source_body(content_file))
+    assert result.returncode != 0
+    _assert_mutation_sentinels_untouched(result)
+    assert "refusing to guess which is authoritative" in result.stderr
+
+
+def test_behavior_multiple_launchers_different_outer_locks_fail_reconciliation(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """Section 11: two canonical launchers declaring DIFFERENT outer
+    flock paths must fail reconciliation closed rather than arbitrarily
+    picking one."""
+    content_file = tmp_path / "cron_two_outer.txt"
+    content_file.write_text(
+        "*/5 * * * * cd /opt/jobpulse && flock -n /tmp/a.lock ./scripts/run_collection_cycle_safe.sh\n"
+        "*/10 * * * * cd /opt/jobpulse && flock -n /tmp/b.lock ./scripts/run_collection_cycle_safe.sh\n"
+    )
+    body = _scan_cron_source_body(content_file) + "\nreconcile_launchers\nprintf 'RECONCILE_SUCCEEDED\\n'\n"
+    result = _run_harness(extracted_functions_script, harness_bin, body)
+    assert result.returncode != 0
+    _assert_mutation_sentinels_untouched(result)
+    assert "COUNT=2" in result.stdout
+    assert "RECONCILE_SUCCEEDED" not in result.stdout
+    assert "different outer scheduler flock paths" in result.stderr
+
+
+def test_behavior_mixed_plain_and_canonical_launcher_same_outer_lock_reconciles(
+    extracted_functions_script, harness_bin, tmp_path
+):
+    """Section 11: a mixture of a plain (no outer lock claim) launcher
+    and a canonical outer-flock launcher is fine as long as they agree
+    on root/internal-lock -- the plain launcher makes no competing claim
+    about the outer lock at all."""
+    content_file = tmp_path / "cron_mixed.txt"
+    content_file.write_text(
+        "*/5 * * * * /opt/jobpulse/scripts/run_collection_cycle_safe.sh\n"
+        + PRODUCTION_CRON_LINE
+        + "\n"
+    )
+    body = (
+        _scan_cron_source_body(content_file)
+        + "\nreconcile_launchers\nprintf 'RECONCILE_SUCCEEDED\\n'\n"
+        "printf 'OUTER_CONSENSUS=%s\\n' \"$OUTER_LOCK_CONSENSUS\"\n"
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, body)
+    assert result.returncode == 0, result.stderr
+    _assert_mutation_sentinels_untouched(result)
+    assert "COUNT=2" in result.stdout
+    assert "RECONCILE_SUCCEEDED" in result.stdout
+    assert "OUTER_CONSENSUS=/tmp/jobpulse_collection_cycle.lock" in result.stdout
+
+
+# ---------------------------------------------------------------------
+# 31e. Section 22: dual-lock acquisition -- structural
+# ---------------------------------------------------------------------
+
+def test_outer_lock_acquired_before_internal_lock(remote_script):
+    outer_call_index = remote_script.index("if ! acquire_outer_lock; then")
+    internal_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    assert outer_call_index < internal_call_index
+
+
+def test_internal_lock_acquired_before_docker_pull(remote_script):
+    internal_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    pull_index = remote_script.index('docker pull "$TARGET_IMAGE"')
+    assert internal_call_index < pull_index
+
+
+def test_both_locks_acquired_before_api_mutation_started(remote_script):
+    outer_call_index = remote_script.index("if ! acquire_outer_lock; then")
+    internal_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    mutation_index = remote_script.index("API_MUTATION_STARTED=true")
+    assert outer_call_index < mutation_index
+    assert internal_call_index < mutation_index
+
+
+def test_both_locks_held_through_candidate_validation_and_git_reset(remote_script):
+    internal_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    git_reset_index = remote_script.index('git reset --hard "$TARGET_SHA"')
+    trap_release_index = remote_script.index("final_exit_trap() {")
+    # neither lock's release code appears between acquisition and the
+    # git reset -- the only release site is inside final_exit_trap,
+    # which is defined (not invoked) earlier in the script and only
+    # actually runs via the EXIT trap at process end.
+    assert internal_call_index < git_reset_index
+    between = remote_script[internal_call_index:git_reset_index]
+    assert "exec {CYCLE_LOCK_FD}>&-" not in between
+    assert "exec {OUTER_LOCK_FD}>&-" not in between
+    assert trap_release_index < internal_call_index, "trap is DEFINED before the acquisition call site, but only fires at EXIT"
+
+
+def test_both_lock_fds_released_only_in_exit_trap(remote_script):
+    trap_body = remote_script.split("final_exit_trap() {")[1]
+    assert "exec {CYCLE_LOCK_FD}>&-" in trap_body
+    assert "exec {OUTER_LOCK_FD}>&-" in trap_body
+    assert remote_script.count("exec {CYCLE_LOCK_FD}>&-") == 1
+    assert remote_script.count("exec {OUTER_LOCK_FD}>&-") == 1
+
+
+def test_outer_lock_fd_initialized_before_use_under_set_u(remote_script):
+    """set -u is active for the whole remote script -- OUTER_LOCK_FD
+    must be pre-initialized (like CYCLE_LOCK_FD already is) so the exit
+    trap can safely check it even if the script dies before
+    acquire_outer_lock ever runs -- exactly what happened in run
+    34479326097, which failed during launcher scanning, well before any
+    lock was ever touched."""
+    assert 'OUTER_LOCK_FD=""' in remote_script
+    init_index = remote_script.index('OUTER_LOCK_FD=""')
+    trap_index = remote_script.index("final_exit_trap() {")
+    assert init_index < trap_index
+
+
+def test_outer_internal_same_path_does_not_double_lock(remote_script):
+    func_body = remote_script.split("acquire_outer_lock() {")[1].split("\n          }")[0]
+    assert '"$OUTER_LOCK_PATH" = "$CYCLE_LOCK_PATH"' in func_body
+    assert "exactly once" in func_body
+
+
+def test_outer_lock_non_blocking_and_fails_closed(remote_script):
+    func_body = remote_script.split("acquire_outer_lock() {")[1].split("\n          }")[0]
+    assert 'flock -n "$OUTER_LOCK_FD"' in func_body
+    assert "is busy" in func_body
+
+
+def test_internal_lock_still_non_blocking_and_fails_closed(remote_script):
+    func_body = remote_script.split("acquire_internal_lock() {")[1].split("\n          }")[0]
+    assert 'flock -n "$CYCLE_LOCK_FD"' in func_body
+    assert "is busy" in func_body
+
+
+def test_active_collector_check_still_follows_dual_lock_acquisition(remote_script):
+    """Section 14: the active-collector docker-top check must remain,
+    unweakened, and must still run AFTER both locks are acquired --
+    dual-lock acquisition complements it, never replaces it."""
+    internal_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    collector_check_index = remote_script.index("active-collector process check")
+    pull_index = remote_script.index('docker pull "$TARGET_IMAGE"')
+    assert internal_call_index < collector_check_index < pull_index
+
+
+# ---------------------------------------------------------------------
+# 31f. Section 23: dual-lock acquisition -- real-flock behavior (A/B/C/D)
+#
+# These use a THIN WRAPPER around the real system `flock` binary (never
+# a production path -- only tmp_path fixture files), because flock's
+# busy/free/self-conflict semantics are kernel behavior that a sentinel
+# or Python reimplementation cannot faithfully reproduce. No network, no
+# Docker, no production contact.
+# ---------------------------------------------------------------------
+
+@pytest.fixture()
+def real_flock_bin(tmp_path):
+    import shutil
+
+    real_flock = shutil.which("flock")
+    assert real_flock, "system flock binary required for dual-lock behavior tests"
+    bin_dir = tmp_path / "real_flock_bin"
+    bin_dir.mkdir()
+    _write_fake_executable(bin_dir, "flock", f'exec {shlex.quote(real_flock)} "$@"\n')
+    return bin_dir
+
+
+def test_behavior_dual_lock_case_a_both_free_both_succeed(
+    extracted_functions_script, harness_bin, real_flock_bin, tmp_path
+):
+    body = (
+        f'OUTER_LOCK_PATH={shlex.quote(str(tmp_path / "outer.lock"))}\n'
+        f'CYCLE_LOCK_PATH={shlex.quote(str(tmp_path / "internal.lock"))}\n'
+        'OUTER_LOCK_FD=""\nCYCLE_LOCK_FD=""\n'
+        "acquire_outer_lock && printf 'OUTER=OK\\n'\n"
+        "acquire_internal_lock && printf 'INTERNAL=OK\\n'\n"
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, body, extra_path_dirs=(real_flock_bin,))
+    assert result.returncode == 0, result.stderr
+    assert "OUTER=OK" in result.stdout
+    assert "INTERNAL=OK" in result.stdout
+
+
+def test_behavior_dual_lock_case_b_outer_busy_aborts_before_internal(
+    extracted_functions_script, harness_bin, real_flock_bin, tmp_path
+):
+    outer_path = tmp_path / "outer.lock"
+    holder = sp.Popen(
+        ["bash", "-c", f'exec {{fd}}>{shlex.quote(str(outer_path))}; flock -n "$fd" || exit 2; sleep 5'],
+        stdout=sp.DEVNULL,
+        stderr=sp.DEVNULL,
+    )
+    try:
+        import time
+
+        time.sleep(0.3)
+        body = (
+            f"OUTER_LOCK_PATH={shlex.quote(str(outer_path))}\n"
+            f'CYCLE_LOCK_PATH={shlex.quote(str(tmp_path / "internal.lock"))}\n'
+            'OUTER_LOCK_FD=""\nCYCLE_LOCK_FD=""\n'
+            "if acquire_outer_lock; then printf 'OUTER=UNEXPECTEDLY_OK\\n'; else printf 'OUTER=BUSY\\n'; fi\n"
+        )
+        result = _run_harness(extracted_functions_script, harness_bin, body, extra_path_dirs=(real_flock_bin,))
+        assert "OUTER=BUSY" in result.stdout, result.stdout
+        assert "OUTER=UNEXPECTEDLY_OK" not in result.stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    # No FD leak on the outer-busy path either: once the holder has
+    # released the outer lock and the failed harness process has fully
+    # terminated, a brand-new, independent process must be able to
+    # acquire it immediately.
+    reacquire = sp.run(
+        ["bash", "-c", f'exec {{fd}}>{shlex.quote(str(outer_path))}; flock -n "$fd" && echo REACQUIRED || echo STILL_BUSY'],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert "REACQUIRED" in reacquire.stdout, reacquire.stdout
+
+
+def test_behavior_dual_lock_case_c_internal_busy_aborts_after_outer_acquired(
+    extracted_functions_script, harness_bin, real_flock_bin, tmp_path
+):
+    """Outer free, internal busy: acquire_outer_lock must succeed but
+    acquire_internal_lock must then fail -- proving the ordering leaves
+    the runner able to detect internal contention even after the outer
+    lock was already taken. (This isolated function-level test does not
+    itself invoke final_exit_trap; the behavioral proof that the outer
+    lock is actually RELEASED on this failure path -- not merely that
+    release code exists -- is
+    test_behavior_internal_busy_exit_trap_releases_outer_lock below,
+    which drives the real EXIT trap.)"""
+    internal_path = tmp_path / "internal.lock"
+    holder = sp.Popen(
+        ["bash", "-c", f'exec {{fd}}>{shlex.quote(str(internal_path))}; flock -n "$fd" || exit 2; sleep 5'],
+        stdout=sp.DEVNULL,
+        stderr=sp.DEVNULL,
+    )
+    try:
+        import time
+
+        time.sleep(0.3)
+        body = (
+            f'OUTER_LOCK_PATH={shlex.quote(str(tmp_path / "outer.lock"))}\n'
+            f"CYCLE_LOCK_PATH={shlex.quote(str(internal_path))}\n"
+            'OUTER_LOCK_FD=""\nCYCLE_LOCK_FD=""\n'
+            "acquire_outer_lock && printf 'OUTER=OK\\n'\n"
+            "if acquire_internal_lock; then printf 'INTERNAL=UNEXPECTEDLY_OK\\n'; else printf 'INTERNAL=BUSY\\n'; fi\n"
+        )
+        result = _run_harness(extracted_functions_script, harness_bin, body, extra_path_dirs=(real_flock_bin,))
+        assert "OUTER=OK" in result.stdout, result.stdout
+        assert "INTERNAL=BUSY" in result.stdout, result.stdout
+        assert "INTERNAL=UNEXPECTEDLY_OK" not in result.stdout
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_behavior_internal_busy_exit_trap_releases_outer_lock(
+    extracted_functions_and_trap_script, harness_bin, real_flock_bin, tmp_path
+):
+    """Behavioral (not merely structural) proof of the Phase 3.4O
+    exit-cleanup requirement: outer free + internal busy => abort AND
+    the REAL final_exit_trap releases the outer lock, proven by a
+    separate process immediately reacquiring it afterward.
+
+    Drives the ACTUAL acquire_outer_lock / acquire_internal_lock /
+    final_exit_trap functions and the real `trap final_exit_trap EXIT`
+    registration (extracted_functions_and_trap_script) -- never a Python
+    reimplementation of cleanup semantics. Only temporary fixture lock
+    paths are used; no production paths, no Docker daemon, no network,
+    no SSH. API_MUTATION_STARTED is initialized false (as it always is
+    on every real lock-acquisition-failure codepath, which occurs before
+    any mutation begins) so final_exit_trap follows its real
+    no-rollback branch without needing rollback_api/rollback_git, which
+    this fixture intentionally does not extract."""
+    outer_path = tmp_path / "outer.lock"
+    internal_path = tmp_path / "internal.lock"
+    holder = sp.Popen(
+        ["bash", "-c", f'exec {{fd}}>{shlex.quote(str(internal_path))}; flock -n "$fd" || exit 2; sleep 5'],
+        stdout=sp.DEVNULL,
+        stderr=sp.DEVNULL,
+    )
+    try:
+        import time
+
+        time.sleep(0.3)
+        body = (
+            f"OUTER_LOCK_PATH={shlex.quote(str(outer_path))}\n"
+            f"CYCLE_LOCK_PATH={shlex.quote(str(internal_path))}\n"
+            'OUTER_LOCK_FD=""\nCYCLE_LOCK_FD=""\n'
+            'WORKFLOW_SUCCESS=false\n'
+            'API_MUTATION_STARTED=false\nGIT_MUTATION_STARTED=false\n'
+            'ROLLBACK_TAG=""\nTMP_DOCKER_CONFIG=""\nREMOTE_SCRIPT_SELF=""\n'
+            "acquire_outer_lock && printf 'OUTER=OK\\n'\n"
+            "if ! acquire_internal_lock; then\n"
+            "  printf 'INTERNAL=BUSY\\n'\n"
+            "  exit 1\n"
+            "fi\n"
+            "printf 'INTERNAL=UNEXPECTEDLY_OK\\n'\n"
+        )
+        # 1-2-3-4-5: outer starts free, internal held by `holder`, the
+        # harness acquires outer then fails internal. sp.run() inside
+        # _run_harness blocks until the subprocess fully exits, so by
+        # the time it returns here the real EXIT trap has already run.
+        result = _run_harness(
+            extracted_functions_and_trap_script, harness_bin, body, extra_path_dirs=(real_flock_bin,)
+        )
+        _assert_mutation_sentinels_untouched(result)
+        assert "OUTER=OK" in result.stdout, result.stdout
+        assert "INTERNAL=BUSY" in result.stdout, result.stdout
+        assert "INTERNAL=UNEXPECTEDLY_OK" not in result.stdout
+        # 6: the process exited with the code from the explicit `exit 1`
+        # on the internal-busy path, captured and re-raised by
+        # final_exit_trap's `local ec=$?` / `exit "$ec"`.
+        assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+        # 5 (cleanup ran): the real trap's no-mutation-to-roll-back
+        # branch actually executed.
+        assert "No candidate API mutation had started -- nothing to roll back." in result.stderr, result.stderr
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    # 7: a separate, brand-new process can immediately non-blocking
+    # flock the outer path -- proving the outer lock was ACTUALLY
+    # released on the internal-lock-failure path, not merely that the
+    # release code exists.
+    reacquire = sp.run(
+        ["bash", "-c", f'exec {{fd}}>{shlex.quote(str(outer_path))}; flock -n "$fd" && echo REACQUIRED || echo STILL_BUSY'],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert "REACQUIRED" in reacquire.stdout, reacquire.stdout
+
+
+def test_behavior_dual_lock_case_d_same_path_single_effective_acquisition(
+    extracted_functions_script, harness_bin, real_flock_bin, tmp_path
+):
+    """Outer path == internal path: acquire_outer_lock must recognize the
+    identical path and skip opening a second file descriptor, so the
+    SAME process's own subsequent acquire_internal_lock call does not
+    spuriously self-conflict (a real risk: flock(2) locks are scoped to
+    the open file description, not the process, so two independent
+    non-blocking opens by the same process against the same file can
+    otherwise report EWOULDBLOCK against the process's own first lock)."""
+    same_path = tmp_path / "same.lock"
+    body = (
+        f"OUTER_LOCK_PATH={shlex.quote(str(same_path))}\n"
+        f"CYCLE_LOCK_PATH={shlex.quote(str(same_path))}\n"
+        'OUTER_LOCK_FD=""\nCYCLE_LOCK_FD=""\n'
+        "acquire_outer_lock && printf 'OUTER=OK\\n'\n"
+        "acquire_internal_lock && printf 'INTERNAL=OK\\n'\n"
+        'printf \'OUTER_FD_OPENED=%s\\n\' "${OUTER_LOCK_FD:-<empty>}"\n'
+    )
+    result = _run_harness(extracted_functions_script, harness_bin, body, extra_path_dirs=(real_flock_bin,))
+    assert result.returncode == 0, result.stderr
+    assert "OUTER=OK" in result.stdout
+    assert "INTERNAL=OK" in result.stdout
+    # the same-path branch returns before ever opening a second fd
+    assert "OUTER_FD_OPENED=<empty>" in result.stdout
+
+
+# =====================================================================
+# 32. Meta: this test file itself is clean
 # =====================================================================
 
 def test_this_test_file_has_no_duplicate_test_function_names():
