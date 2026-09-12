@@ -4,7 +4,7 @@ import re
 import time
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import psycopg2
 from playwright.sync_api import sync_playwright
@@ -87,6 +87,63 @@ def assert_linkedin_authenticated(page, stage="linkedin"):
             f"stage={stage} url={url!r} title={title!r}. "
             "Refresh /app/.auth/linkedin_storage_state.json before running the collector."
         )
+
+
+LINKEDIN_PROFILE_PATH_RE = re.compile(r"^/in/([A-Za-z0-9\-_%.]+)/?$")
+LINKEDIN_PROFILE_HOSTS = ("linkedin.com", "www.linkedin.com")
+
+
+def normalize_linkedin_profile_url(url):
+    """Validate and normalize a candidate LinkedIn member-profile URL.
+
+    Accepts only a bare `/in/<slug>` LinkedIn member-profile path, either
+    as an absolute `https://www.linkedin.com/in/<slug>/` URL or a
+    site-relative `/in/<slug>/` link -- the only two forms this scraper
+    ever encounters directly in already-loaded page DOM. Everything else
+    (company/jobs/feed/learning/school paths, any non-LinkedIn domain, a
+    deeper sub-page such as .../in/<slug>/recent-activity/, or a
+    malformed value) returns None rather than being guessed at. Query
+    strings and fragments are dropped as an incidental side effect of
+    only ever reconstructing the URL from the captured slug -- the slug
+    itself is never altered, and this function never infers or
+    constructs a profile URL that was not actually present in the
+    extracted page data.
+    """
+    if not url or not isinstance(url, str):
+        return None
+
+    candidate = url.strip()
+
+    if not candidate:
+        return None
+
+    try:
+        if candidate.startswith("/"):
+            path = candidate
+        elif candidate.startswith("https://"):
+            parsed = urlparse(candidate)
+
+            if (parsed.netloc or "").lower() not in LINKEDIN_PROFILE_HOSTS:
+                return None
+
+            path = parsed.path
+        else:
+            # Absolute URLs must be HTTPS -- a plain "http://" (or any
+            # other scheme) candidate is rejected rather than upgraded,
+            # since this function never rewrites a captured value, only
+            # validates it.
+            return None
+
+        match = LINKEDIN_PROFILE_PATH_RE.match(urlparse(path).path)
+    except Exception:
+        return None
+
+    if not match:
+        return None
+
+    slug = match.group(1)
+
+    return f"https://www.linkedin.com/in/{slug}/"
 
 
 class LinkedInBrowserProvider:
@@ -978,6 +1035,8 @@ class LinkedInBrowserProvider:
             job_url=job.get("job_url", ""),
         )
 
+        poster_info = self.extract_poster_info_from_detail_page(page=page)
+
         return {
             "title": detail_data.get("detail_title") or job.get("title", ""),
             "company": detail_data.get("detail_company") or job.get("company", ""),
@@ -998,6 +1057,9 @@ class LinkedInBrowserProvider:
             "apply_type": apply_info.get("apply_type") or "unknown",
             "apply_url": apply_info.get("apply_url"),
             "apply_label": apply_info.get("apply_label"),
+            "poster_name": poster_info.get("poster_name"),
+            "poster_title": poster_info.get("poster_title"),
+            "poster_profile_url": poster_info.get("poster_profile_url"),
         }
 
     def extract_apply_info_from_detail_page(self, page, job_url: str) -> dict:
@@ -1150,6 +1212,290 @@ class LinkedInBrowserProvider:
             "apply_label": None,
         }
 
+    def extract_poster_info_from_detail_page(self, page) -> dict:
+        """Extract the job poster/hiring-contact's name, title, and LinkedIn
+        profile URL from the ALREADY-LOADED job detail page DOM only -- no
+        additional navigation, no profile click, no extra page/HTTP request.
+
+        Fail-closed by design: for this field, a false negative (missing
+        poster data on a job that does have one) is acceptable, but a
+        false positive (attributing an unrelated person's profile to a
+        job as its poster) is not. The in-page evaluation below:
+
+          - Matches a "hiring team" heading by EXACT normalized text
+            ("meet the hiring team" / "hiring team" only) -- never by
+            substring, so "How our hiring team works" or "Message from
+            the hiring team" can never qualify.
+          - Only ever looks inside a small, FIXED set of local-structure
+            candidates relative to that exact heading (its direct parent,
+            its direct next sibling, or its parent's direct next
+            sibling) -- never an arbitrary/looping ancestor climb, never
+            document/body/main, and never a page-wide `/in/` search. The
+            first candidate (in that fixed priority order) that contains
+            at least one visible, well-formed `/in/<slug>` profile link
+            is used; scope selection stops there and is never expanded
+            further while hunting for an unambiguous result.
+          - Requires exactly one DISTINCT valid profile link inside that
+            local scope. Zero, or more than one, is reported not-found --
+            never a guess at which one is "the" poster.
+          - Derives poster_name only from text/attributes directly on the
+            validated profile anchor itself (never by climbing a fixed
+            number of parents and grabbing arbitrary lines), and
+            poster_title only from a single, unambiguous residual text
+            line immediately alongside that anchor.
+
+        The validated profile URL is the TRUST ANCHOR for all poster
+        data: poster_name/poster_title are only ever returned alongside
+        a poster_profile_url that has independently passed
+        normalize_linkedin_profile_url(). If that validation fails, this
+        method returns all three fields as None together -- a name/title
+        must never survive on their own once their associated URL has
+        been rejected.
+
+        Absence of a hiring contact is a normal condition, not an error:
+        any failure here (missing section, unexpected DOM shape, or an
+        exception from the page evaluation itself) is swallowed and
+        reported as all-None so it can never fail the collection of an
+        otherwise-valid job.
+        """
+        try:
+            poster_info = page.evaluate(
+                """
+                () => {
+                    const HIRING_TEAM_LABELS = new Set(['meet the hiring team', 'hiring team']);
+                    const PROFILE_PATH_RE = /^\\/in\\/[A-Za-z0-9\\-_%.]+\\/?$/;
+
+                    const normalizeHeadingText = (text) => {
+                        return (text || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    };
+
+                    const clean = (text) => {
+                        return (text || '').replace(/\\s+/g, ' ').trim();
+                    };
+
+                    const isVisible = (el) => {
+                        if (!el) {
+                            return false;
+                        }
+
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+
+                        return (
+                            style &&
+                            style.visibility !== 'hidden' &&
+                            style.display !== 'none' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    };
+
+                    // The only place a raw href is turned into a
+                    // dedup/identity key -- never into a guessed or
+                    // reconstructed URL. A non-matching or unparsable
+                    // href simply yields null (not a candidate).
+                    const LINKEDIN_HOSTS = new Set(['linkedin.com', 'www.linkedin.com']);
+
+                    // A pre-filter only -- the Python side
+                    // (normalize_linkedin_profile_url()) remains the
+                    // final authority and re-validates independently.
+                    // Still, an obviously invalid absolute candidate
+                    // (wrong scheme, non-LinkedIn host) must never even
+                    // be counted as "a candidate" here: letting it
+                    // through only to be rejected later would still let
+                    // it silently absorb an ambiguity slot or, worse,
+                    // be the sole "found" candidate for scopes that
+                    // otherwise have none.
+                    const candidateKeyForAnchor = (anchor) => {
+                        const rawHref = (anchor.getAttribute('href') || '').trim();
+
+                        if (!rawHref) {
+                            return null;
+                        }
+
+                        const isAbsolute = /^https?:\\/\\//i.test(rawHref);
+                        const isRelative = rawHref.startsWith('/');
+
+                        if (!isAbsolute && !isRelative) {
+                            return null;
+                        }
+
+                        let parsed;
+
+                        try {
+                            parsed = new URL(rawHref, 'https://www.linkedin.com/');
+                        } catch (error) {
+                            return null;
+                        }
+
+                        if (isAbsolute) {
+                            if (parsed.protocol !== 'https:') {
+                                return null;
+                            }
+
+                            if (!LINKEDIN_HOSTS.has(parsed.hostname.toLowerCase())) {
+                                return null;
+                            }
+                        }
+
+                        if (!PROFILE_PATH_RE.test(parsed.pathname)) {
+                            return null;
+                        }
+
+                        const host = isAbsolute ? parsed.hostname.toLowerCase() : 'www.linkedin.com';
+
+                        const slug = parsed.pathname
+                            .replace(/^\\/in\\//, '')
+                            .replace(/\\/$/, '')
+                            .toLowerCase();
+
+                        return `${host}|${slug}`;
+                    };
+
+                    const findValidProfileAnchors = (scope) => {
+                        if (!scope || !scope.querySelectorAll) {
+                            return [];
+                        }
+
+                        return Array.from(scope.querySelectorAll('a[href]'))
+                            .filter(isVisible)
+                            .filter((anchor) => candidateKeyForAnchor(anchor) !== null);
+                    };
+
+                    // Fixed, non-looping set of local-structure candidates.
+                    // No depth counter, no walking document/body/main --
+                    // scope is never expanded beyond these three slots.
+                    const getLocalScopeCandidates = (heading) => {
+                        const candidates = [];
+
+                        if (heading.parentElement) {
+                            candidates.push(heading.parentElement);
+                        }
+
+                        if (heading.nextElementSibling) {
+                            candidates.push(heading.nextElementSibling);
+                        }
+
+                        if (heading.parentElement && heading.parentElement.nextElementSibling) {
+                            candidates.push(heading.parentElement.nextElementSibling);
+                        }
+
+                        return candidates;
+                    };
+
+                    const headingCandidates = Array.from(
+                        document.querySelectorAll('h1, h2, h3, h4, h5, h6, span, strong')
+                    );
+
+                    let chosenAnchors = null;
+
+                    for (const heading of headingCandidates) {
+                        const text = normalizeHeadingText(heading.innerText);
+
+                        if (!HIRING_TEAM_LABELS.has(text)) {
+                            continue;
+                        }
+
+                        let anchorsInScope = null;
+
+                        for (const scope of getLocalScopeCandidates(heading)) {
+                            const found = findValidProfileAnchors(scope);
+
+                            if (found.length > 0) {
+                                anchorsInScope = found;
+                                break;
+                            }
+                        }
+
+                        if (anchorsInScope) {
+                            chosenAnchors = anchorsInScope;
+                            break;
+                        }
+                    }
+
+                    if (!chosenAnchors) {
+                        return {
+                            found: false,
+                            poster_name: null,
+                            poster_title: null,
+                            poster_profile_url: null
+                        };
+                    }
+
+                    const distinctKeys = new Set(chosenAnchors.map(candidateKeyForAnchor));
+
+                    if (distinctKeys.size !== 1) {
+                        return {
+                            found: false,
+                            poster_name: null,
+                            poster_title: null,
+                            poster_profile_url: null
+                        };
+                    }
+
+                    const posterAnchor = chosenAnchors[0];
+                    const posterHref = posterAnchor.getAttribute('href') || '';
+
+                    const posterName = (
+                        clean(posterAnchor.innerText) ||
+                        clean(posterAnchor.getAttribute('aria-label')) ||
+                        null
+                    );
+
+                    let posterTitle = null;
+                    const anchorParent = posterAnchor.parentElement;
+
+                    if (anchorParent) {
+                        const nameTextLower = posterName ? posterName.toLowerCase() : null;
+
+                        const residualLines = Array.from(
+                            new Set(
+                                (anchorParent.innerText || '')
+                                    .split('\\n')
+                                    .map((line) => clean(line))
+                                    .filter(Boolean)
+                                    .filter((line) => line.toLowerCase() !== nameTextLower)
+                                    .filter((line) => !HIRING_TEAM_LABELS.has(line.toLowerCase()))
+                            )
+                        );
+
+                        if (residualLines.length === 1) {
+                            posterTitle = residualLines[0];
+                        }
+                    }
+
+                    return {
+                        found: true,
+                        poster_name: posterName,
+                        poster_title: posterTitle,
+                        poster_profile_url: posterHref || null
+                    };
+                }
+                """
+            )
+        except Exception:
+            return {"poster_name": None, "poster_title": None, "poster_profile_url": None}
+
+        if not poster_info or not poster_info.get("found"):
+            return {"poster_name": None, "poster_title": None, "poster_profile_url": None}
+
+        # The validated profile URL is the trust anchor for ALL poster
+        # data -- if it fails validation, name/title must never survive
+        # on their own. Validate it FIRST and short-circuit before
+        # touching name/title at all.
+        poster_profile_url = normalize_linkedin_profile_url(
+            poster_info.get("poster_profile_url")
+        )
+
+        if poster_profile_url is None:
+            return {"poster_name": None, "poster_title": None, "poster_profile_url": None}
+
+        return {
+            "poster_name": self.clean_text(poster_info.get("poster_name")) or None,
+            "poster_title": self.clean_text(poster_info.get("poster_title")) or None,
+            "poster_profile_url": poster_profile_url,
+        }
+
     def try_capture_external_apply_url(self, page) -> str | None:
         original_url = page.url
 
@@ -1296,6 +1642,23 @@ class LinkedInBrowserProvider:
         if apply_type == "easy_apply" and not apply_url:
             apply_url = job_url
 
+        # Defense in depth: the validated profile URL is the trust
+        # anchor for ALL poster data, independent of whatever the
+        # caller passed in for name/title. If the URL doesn't validate,
+        # the whole poster_* trio is dropped together -- this must hold
+        # even if a future caller feeds normalize_job() poster metadata
+        # that never went through extract_poster_info_from_detail_page().
+        poster_profile_url = normalize_linkedin_profile_url(
+            raw_job.get("poster_profile_url")
+        )
+
+        if poster_profile_url is None:
+            poster_name = None
+            poster_title = None
+        else:
+            poster_name = self.clean_text(raw_job.get("poster_name")) or None
+            poster_title = self.clean_text(raw_job.get("poster_title")) or None
+
         return {
             "linkedin_job_id": linkedin_job_id,
             "title": title,
@@ -1327,9 +1690,9 @@ class LinkedInBrowserProvider:
             "apply_url": apply_url,
             "apply_label": apply_label,
 
-            "poster_name": None,
-            "poster_title": None,
-            "poster_profile_url": None,
+            "poster_name": poster_name,
+            "poster_title": poster_title,
+            "poster_profile_url": poster_profile_url,
 
             "date_posted": str(date.today()),
         }
