@@ -27,9 +27,11 @@ TOR_IMAGE_BUILD_PATH = REPO_ROOT / ".github" / "workflows" / "tor-image-build.ym
 DEPLOY_PATH = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-EXPECTED_PRODUCTION_SHA = "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
-EXPECTED_API_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+EXPECTED_PRODUCTION_SHA = "f4765f857355c6543f68cea0e481b7f20a917147"
+EXPECTED_API_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
 EXPECTED_TOR_IMAGE = "ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
+
+STALE_PHASE_3_3A_PRODUCTION_SHA = "0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
 
 PHASE_3_1A_CHANGED_FILES = [
     ".github/workflows/production-runtime-diagnostic.yml",
@@ -366,6 +368,36 @@ def test_expected_production_sha_is_not_a_workflow_dispatch_input():
     data = _load_workflow(WORKFLOW_PATH)
     on_block = _on_block(data)
     assert on_block == {"workflow_dispatch": None}
+
+
+def test_stale_phase_3_3a_baseline_no_longer_present():
+    """Phase 3.4P: the diagnostic previously compared the VM's actual
+    checkout/image against the stale Phase 3.3A baseline
+    (0b0290d5...), which production had long since moved past -- this
+    produced a false-negative production_sha_match/api_image_match on
+    every run since the Phase 3.4O direct runtime upgrade. That stale
+    SHA must not remain anywhere in the workflow."""
+    source = WORKFLOW_PATH.read_text()
+    assert STALE_PHASE_3_3A_PRODUCTION_SHA not in source
+
+
+def test_expected_production_sha_not_derived_from_github_context_or_remote_state():
+    """The reviewed baseline is an explicit, hardcoded literal so any
+    change goes through normal PR review -- never github.sha,
+    github.event, a workflow_dispatch input, or anything read back from
+    the remote VM itself."""
+    code = _code_only(WORKFLOW_PATH.read_text())
+    for forbidden in ("github.sha", "github.event", "inputs."):
+        assert forbidden not in code, forbidden
+
+
+def test_api_image_sha_component_matches_expected_production_sha():
+    """Baseline consistency guard: EXPECTED_API_IMAGE's trailing SHA tag
+    must always equal EXPECTED_PRODUCTION_SHA, so a future refresh can't
+    accidentally update one constant and forget the other. Tor is
+    intentionally versioned independently and is exempt (see
+    test_api_and_tor_image_pins_are_independently_asserted_and_differ)."""
+    assert EXPECTED_API_IMAGE.endswith(f":{EXPECTED_PRODUCTION_SHA}")
 
 
 def test_actual_production_sha_obtained_only_via_git_rev_parse_head():
