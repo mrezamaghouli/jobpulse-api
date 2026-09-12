@@ -86,11 +86,13 @@ jobs:
           cd /opt/jobpulse || { echo "DIAG_ERROR: cannot cd to /opt/jobpulse"; exit 1; }
 
           COMPOSE_FILE="docker-compose.prod.yml"
-          # Not a secret -- the currently expected deployed Phase 3.3A SHA,
-          # for evidence-only comparison against the VM's actual checkout.
-          # Never used to fetch/reset/checkout/pull; a mismatch is reported,
-          # not corrected.
-          EXPECTED_PRODUCTION_SHA="0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          # Not a secret -- the reviewed, independently verified current
+          # production runtime baseline (established by the successful
+          # immutable direct runtime upgrade and its post-upgrade
+          # diagnostic), for evidence-only comparison against the VM's
+          # actual checkout. Never used to fetch/reset/checkout/pull; a
+          # mismatch is reported, not corrected.
+          EXPECTED_PRODUCTION_SHA="f4765f857355c6543f68cea0e481b7f20a917147"
 
           # Non-secret, fixed, evidence-only comparison constants -- never
           # derived from github.sha, never workflow_dispatch inputs (same
@@ -100,7 +102,7 @@ jobs:
           # whichever commit production/API is pinned to. A mismatch against
           # either is reported only -- it never triggers a pull, restart,
           # recreate, or deploy.
-          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:0b0290d5dedc9bfc9fba83a1a97f782a10890b06"
+          EXPECTED_API_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
           EXPECTED_TOR_IMAGE="ghcr.io/mrezamaghouli/jobpulse-tor:5dffbd669eec52f5283503bb6409a430509175a0"
 
           echo "===DIAGNOSTIC_START==="
