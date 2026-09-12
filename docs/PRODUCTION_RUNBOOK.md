@@ -2243,12 +2243,14 @@ jobpulse-production-direct-runtime-upgrade`,
   acceptable starting snapshot to compare against later. Tor stays
   optional for this direct-mode upgrade: if present, its state must
   remain unchanged, but its absence is not itself an error
-- The non-blocking top-level collection-cycle lock is acquired and held
-  for the entire operation; busy means refuse, not wait. The lock path
-  is **proven from actual scheduler configuration, in two stages, both
-  completing before any image pull or API mutation, and both treating
-  every configuration source strictly as DATA -- nothing is ever
-  sourced or `eval`'d**:
+- **Two semantically distinct, non-blocking locks are acquired (outer,
+  then internal) and held for the entire operation; busy on either one
+  means refuse, not wait.** See "Phase 3.4O: Canonical Cron/Flock
+  Launcher Provenance" below for the full two-lock model and why they
+  are never merged. Both lock paths are **proven from actual scheduler
+  configuration, in two stages, both completing before any image pull
+  or API mutation, and both treating every configuration source
+  strictly as DATA -- nothing is ever sourced or `eval`'d**:
   1. **Scheduler-provenance scan (bounded, read-only, order-aware).**
      `scripts/run_collection_cycle_safe.sh`'s own `ROOT` and
      `CYCLE_LOCK_PATH` expressions read `JOBPULSE_COLLECTION_ROOT` /
@@ -2351,7 +2353,9 @@ jobpulse-production-direct-runtime-upgrade`,
 
 ### Sequence (candidate validated fully before git checkout moves)
 
-1. Acquire the collection-cycle lock; verify no active collector process
+1. Acquire the outer scheduler lock, if any discovered launcher declares
+   one, then the internal wrapper collection-cycle lock (see "Phase
+   3.4O" below); verify no active collector process
 2. Verify current compose SHA-256 == target compose SHA-256; verify the
    effective (resolved) candidate Compose environment cannot be proxy
 3. Pull the exact immutable target image
@@ -2466,4 +2470,136 @@ Implementing and locally testing this workflow (Phase 3.4N-B) is a
 separate, prior step from actually dispatching it against production.
 Dispatching it is a later, separately authorized task -- exactly the
 same discipline already applied to the Phase 3.4M-A/B neutral canary.
+
+## Phase 3.4O: Canonical Cron/Flock Launcher Provenance
+
+The first live dispatch of the Phase 3.4N-B runner (run `34347072679`)
+was a **safe pre-mutation abort**: it failed while snapshotting an
+unrelated, healthless container (`{{if .State.Health}}` erroring on a
+missing `Health` map key), before `API_MUTATION_STARTED` was ever set.
+That bug was fixed (the `{{with (index .State "Health")}}...{{else}}
+none{{end}}` missing-key-safe lookup, used by `capture_container_state`
+and `DB_HEALTH_BEFORE`; see the health-lookup regression tests above).
+
+The retry dispatch (run `34479326097`), after the healthless-container
+fix was confirmed working against real production containers
+(DB=healthy, frontend=none, tor=healthy -- no template error), advanced
+further and hit a **second, unrelated** safe pre-mutation abort at the
+scheduler-provenance stage, against production's real crontab line:
+
+```cron
+*/30 * * * * cd /opt/jobpulse && flock -n /tmp/jobpulse_collection_cycle.lock ./scripts/run_collection_cycle_safe.sh
+```
+
+`classify_wrapper_command` rejected this outright because it contains
+`&&` -- correctly, on its own terms: generic `&&`/`;`/`|`/backtick/
+`$(...)`/`bash -c`/`sh -c`/`env`/`source` support would let a launcher
+line hide arbitrary commands behind the wrapper name, which this
+resolver must never guess at. But the rejected line is not arbitrary --
+it is production's actual, intentional scheduling shape: an **outer**
+cron-level `flock -n` around the whole `cd && wrapper` invocation, layered
+on top of the wrapper's own **internal** lock.
+
+### The two-lock model
+
+These are two semantically distinct locks and must never be merged:
+
+- **Outer scheduler lock** -- `/tmp/jobpulse_collection_cycle.lock` in
+  production today. Declared entirely by *whatever invokes the
+  wrapper* (here, the cron line's own `flock -n <path>` around the
+  invocation) -- never read by `scripts/run_collection_cycle_safe.sh`
+  itself, and never configurable via `.collection.env`.
+- **Internal wrapper lock** -- `CYCLE_LOCK_PATH` inside
+  `scripts/run_collection_cycle_safe.sh`:
+  `${JOBPULSE_COLLECTION_CYCLE_LOCK_PATH:-$ROOT/state/run_collection_cycle.lock}`.
+  **Source default vs. live effective value:** with no launcher/
+  `.collection.env` override, the wrapper's own default resolves to
+  `/opt/jobpulse/state/run_collection_cycle.lock` -- that is what the
+  *code* says, not a claim about what production is running today. Run
+  `34479326097` aborted during scheduler-provenance parsing, **before**
+  `resolve_collection_env_lock_override` ever ran, so that failed run
+  does not prove anything about whether production's `.collection.env`
+  currently overrides this path -- it simply never got far enough to
+  read it. The upgrade runner does not assume the source default is the
+  live effective value; it parses the actual production launcher(s) and
+  `.collection.env` and resolves `CYCLE_LOCK_PATH` at runtime, before
+  acquiring anything. This is the lock a **manual** wrapper invocation
+  also acquires, entirely independent of cron.
+
+Because a manual invocation bypasses the outer cron lock completely,
+the internal lock is the only universal protection -- so this runner
+acquires **both**, never substituting one for the other:
+
+1. Parse the canonical cron launcher line (if present) and extract, as
+   DATA ONLY (never executed): the effective working root, the outer
+   `flock -n` path, and confirmation the invocation targets the known
+   wrapper.
+2. Independently resolve the wrapper's own internal `CYCLE_LOCK_PATH`
+   using the pre-existing, unmodified precedence: launcher-level
+   environment override, then `.collection.env` (parsed as data), then
+   the wrapper's hardcoded default.
+3. Before any target-image pull or API mutation: acquire the outer lock
+   non-blocking (if one was discovered), then the internal lock
+   non-blocking; hold both through candidate validation, the production
+   git checkout advance, and rollback if rollback is required; release
+   both only via the final `EXIT` trap. If the outer and internal paths
+   resolve to the exact same file, only **one** actual acquisition
+   happens -- `flock(2)` locks are scoped to the *open file
+   description*, not the process, so a single process non-blocking
+   `flock`-ing two independent file descriptors against the same file
+   can otherwise report the lock busy against its own first hold, a
+   spurious self-conflict this runner deliberately avoids.
+
+`docker top jobpulse-api-prod` collector-process detection is
+unchanged and still runs after both locks are held, before any pull or
+mutation -- dual-lock acquisition complements that check, it does not
+replace it.
+
+### The grammar: one narrow exception, not a general `&&` allowance
+
+`classify_wrapper_command`'s existing rejection logic is **unchanged**.
+A new, separate classifier, `classify_cron_job_command`, is tried
+*first* and recognizes **exactly one** fully-anchored literal shape:
+
+```
+cd <absolute-path-safe-root> && flock -n <absolute-path-safe-lock> [<path>/]run_collection_cycle_safe.sh
+```
+
+with a literal `-n` (no other `flock` options), both paths restricted
+to the same path-safe allowlist used everywhere else in this parser (no
+`$`, backticks, quotes, or expansion of any kind), and the wrapper name
+anchored to the end of the line (no trailing arguments, redirection, or
+further chaining). Anything that does not match this one shape --
+including *any other* use of `&&`, or `-w`, or a relative lock path, or
+`bash -c`/`env`/a second `&&`/a pipe *after* an otherwise-canonical
+line -- falls straight through to `classify_wrapper_command`'s
+unmodified, still-strict rejection. **Generic shell chaining remains
+categorically unsupported**; only this one production shape is
+understood, as data, never executed.
+
+If a cron environment assignment (`JOBPULSE_COLLECTION_ROOT=...`) also
+appears in scope for a canonical launcher line and disagrees with that
+line's own `cd` root, the workflow fails closed rather than guessing
+which is authoritative -- same principle as the existing internal-lock
+disagreement check. Multiple discovered launchers must agree on root,
+internal lock, and (if more than one declares one) outer lock; a
+launcher with no outer-lock claim is compatible with any other
+launcher's outer lock, since it makes no competing claim about it at
+all (the universal internal lock already covers it).
+
+### Zero-change boundaries
+
+This phase touches only
+`.github/workflows/production-direct-runtime-upgrade.yml`,
+`tests/test_production_direct_runtime_upgrade_workflow.py`, and this
+document. It does not change `REVIEWED_TARGET_SHA`,
+`EXPECTED_CURRENT_SHA`, the `workflow_dispatch`-only trigger, the
+confirmation token, VM target, GHCR behavior, the target image,
+`SEARCH_TRANSPORT`/`TOR_ENABLED` rules, API-only candidate recreation,
+rollback behavior, the compose/target-invariant gates, the
+healthless-container fix, or `API_MUTATION_STARTED`/
+`GIT_MUTATION_STARTED` placement. Production's actual crontab is not
+modified by this change -- this is a workflow-side parser fix that
+makes the runner correctly recognize the scheduling shape production
+already runs.
 
