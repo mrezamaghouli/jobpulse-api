@@ -1252,6 +1252,24 @@ function renderTags(job) {
           ` : ''}
         </div>
 
+        ${job.poster_profile_url ? `
+          <div class="detail-block">
+            <h3>Job Poster</h3>
+
+            ${job.poster_name ? `<div class="v">${escapeHtml(job.poster_name)}</div>` : ''}
+            ${job.poster_title ? `<div class="v">${escapeHtml(job.poster_title)}</div>` : ''}
+
+            <a
+              class="link-btn"
+              href="${escapeHtml(job.poster_profile_url)}"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Poster Profile
+            </a>
+          </div>
+        ` : ''}
+
         <div class="detail-block">
           <h3>Metadata</h3>
 
