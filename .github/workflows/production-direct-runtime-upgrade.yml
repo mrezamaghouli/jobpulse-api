@@ -25,13 +25,13 @@ on:
       image_sha:
         description: >-
           Must be exactly the reviewed direct-mode target commit/merge
-          SHA f4765f857355c6543f68cea0e481b7f20a917147 -- this runner
-          version only trusts that one specific, already-reviewed commit
-          as a real production runtime-upgrade target (being merely an
-          ancestor of main is not the same as having been specifically
-          reviewed for this). A future reviewed workflow change may
-          update the accepted SHA once a newer commit has been through
-          its own review.
+          SHA bccbbd997ee83ee9219d6051a808dae17f5cc933 (Phase 4B: LinkedIn
+          job poster profile) -- this runner version only trusts that one
+          specific, already-reviewed commit as a real production
+          runtime-upgrade target (being merely an ancestor of main is not
+          the same as having been specifically reviewed for this). A
+          future reviewed workflow change may update the accepted SHA
+          once a newer commit has been through its own review.
         required: true
         type: string
       confirmation:
@@ -60,11 +60,17 @@ env:
   VM_PORT: "22"
   # The one specific commit this runner version trusts as a direct-mode
   # runtime-upgrade target -- see the image_sha input description above.
-  REVIEWED_TARGET_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  # Phase 4D: bumped to the reviewed Phase 4B target (PR #32, "capture
+  # LinkedIn job poster profile") now that it has been through its own
+  # review and its image has been built (see docs/PRODUCTION_RUNBOOK.md).
+  REVIEWED_TARGET_SHA: "bccbbd997ee83ee9219d6051a808dae17f5cc933"
   # The exact commit this runner version requires production to already
   # be running before it will touch anything -- refuses to guess/adapt
-  # to a different live runtime.
-  EXPECTED_CURRENT_SHA: "148bd362b37c82c92737382d181fbdeac4d2187b"
+  # to a different live runtime. Phase 4D: bumped to f4765f8...917147,
+  # the runtime this exact runner previously, successfully upgraded
+  # production to (Phase 3.4N-B) and which the Phase 4C pre-rollout
+  # diagnostic (run 34831537574) re-confirmed production is still on.
+  EXPECTED_CURRENT_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
   IMAGE_SHA: ${{ inputs.image_sha }}
   CONFIRMATION: ${{ inputs.confirmation }}
 
@@ -88,7 +94,12 @@ jobs:
     # git reset + final bounded health re-verification (another ~120s
     # worst case) totals to roughly 7-8 minutes in the typical worst
     # case; 15 minutes leaves comfortable margin without leaving an
-    # effectively-unbounded job hanging indefinitely.
+    # effectively-unbounded job hanging indefinitely. Phase 4D adds a
+    # handful of additional bounded checks (frontend/provider SHA-256
+    # comparisons, an in-container zero-network provider import, and up
+    # to two more 30s-bounded localhost curl loops for live frontend
+    # validation) that add well under a minute in the typical case, so
+    # the existing 15-minute ceiling still leaves comfortable margin.
     timeout-minutes: 15
     steps:
       # Must run before anything that prepares SSH or contacts
@@ -151,6 +162,9 @@ jobs:
           git show "${IMAGE_SHA}:scripts/search_transport/executor.py" > /dev/null
           git show "${IMAGE_SHA}:scripts/providers/linkedin_browser_provider.py" > /dev/null
           git show "${IMAGE_SHA}:scripts/repair_jobpulse_schema.py" > /dev/null
+          # Phase 4D: the Phase 4B target additionally requires the
+          # user-visible frontend file this release changes.
+          git show "${IMAGE_SHA}:frontend/index.html" > /dev/null
 
           # The candidate compose file MUST come from the target commit
           # itself, never from this workflow branch's own working tree,
@@ -164,6 +178,57 @@ jobs:
           git show "${IMAGE_SHA}:docker-compose.prod.yml" > /tmp/target-compose.yml
 
           echo "Target compose SHA-256: $(sha256sum /tmp/target-compose.yml | awk '{print $1}')"
+
+          # Phase 4D: same rationale, for the two Phase 4B release
+          # artifacts whose provenance this runner now also proves --
+          # extracted from the immutable target commit, never from any
+          # local working-tree or production copy.
+          git show "${IMAGE_SHA}:frontend/index.html" > /tmp/target-frontend-index.html
+          git show "${IMAGE_SHA}:scripts/providers/linkedin_browser_provider.py" > /tmp/target-provider.py
+
+          echo "Target frontend SHA-256: $(sha256sum /tmp/target-frontend-index.html | awk '{print $1}')"
+          echo "Target provider SHA-256: $(sha256sum /tmp/target-provider.py | awk '{print $1}')"
+
+      - name: Derive expected current (pre-upgrade) frontend/provider hashes from EXPECTED_CURRENT_SHA
+        run: |
+          set -euo pipefail
+
+          # Same immutable-git-object provenance discipline as the
+          # target extraction above, applied to the commit production is
+          # currently expected to be running -- used only to VERIFY the
+          # pre-mutation production checkout and to VERIFY a rollback
+          # restores the old files, never to derive an expected value
+          # from a local filesystem copy.
+          git cat-file -e "${EXPECTED_CURRENT_SHA}^{commit}"
+          git show "${EXPECTED_CURRENT_SHA}:frontend/index.html" > /tmp/current-frontend-index.html
+          git show "${EXPECTED_CURRENT_SHA}:scripts/providers/linkedin_browser_provider.py" > /tmp/current-provider.py
+
+          echo "Expected current frontend SHA-256: $(sha256sum /tmp/current-frontend-index.html | awk '{print $1}')"
+          echo "Expected current provider SHA-256: $(sha256sum /tmp/current-provider.py | awk '{print $1}')"
+
+      - name: Verify Phase 4B target release-intent markers (frontend/provider)
+        run: |
+          set -euo pipefail
+
+          # Release-intent assertions, distinct from and in addition to
+          # the SHA-256 provenance proof above: these confirm the target
+          # commit is actually the Phase 4B change this runner is being
+          # dispatched for, not merely some commit that happens to match
+          # a hash typo'd into the pinned constants. Checked before any
+          # SSH connection or production mutation.
+          if ! grep -qF 'Open Poster Profile' /tmp/target-frontend-index.html; then
+            echo "ERROR: target frontend/index.html is missing the Phase 4B marker 'Open Poster Profile'" >&2
+            exit 1
+          fi
+          if ! grep -qF 'normalize_linkedin_profile_url' /tmp/target-provider.py; then
+            echo "ERROR: target provider file is missing the Phase 4B symbol normalize_linkedin_profile_url" >&2
+            exit 1
+          fi
+          if ! grep -qF 'extract_poster_info_from_detail_page' /tmp/target-provider.py; then
+            echo "ERROR: target provider file is missing the Phase 4B symbol extract_poster_info_from_detail_page" >&2
+            exit 1
+          fi
+          echo "Target release-intent markers verified (frontend + provider)."
 
       - name: Verify target compose invariants (api stays direct, no Tor wiring)
         run: |
@@ -236,6 +301,13 @@ jobs:
 
           TARGET_COMPOSE_SHA256="$(sha256sum /tmp/target-compose.yml | awk '{print $1}')"
           TARGET_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"
+          # Phase 4D: Phase 4B artifact-provenance hashes, all derived
+          # from immutable git objects extracted in earlier steps --
+          # never from a local filesystem copy or from production.
+          TARGET_FRONTEND_SHA256="$(sha256sum /tmp/target-frontend-index.html | awk '{print $1}')"
+          TARGET_PROVIDER_SHA256="$(sha256sum /tmp/target-provider.py | awk '{print $1}')"
+          EXPECTED_CURRENT_FRONTEND_SHA256="$(sha256sum /tmp/current-frontend-index.html | awk '{print $1}')"
+          EXPECTED_CURRENT_PROVIDER_SHA256="$(sha256sum /tmp/current-provider.py | awk '{print $1}')"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -263,6 +335,15 @@ jobs:
           TARGET_IMAGE="$2"
           TARGET_SHA="$3"
           HAS_TOKEN="$4"
+          # Phase 4D: Phase 4B artifact-provenance hashes, computed on
+          # the GitHub runner from immutable git objects (never from a
+          # local filesystem copy) and passed through as plain
+          # non-secret positional arguments, same mechanism as the
+          # existing compose/image/SHA arguments above.
+          TARGET_FRONTEND_SHA256="$5"
+          TARGET_PROVIDER_SHA256="$6"
+          EXPECTED_CURRENT_FRONTEND_SHA256="$7"
+          EXPECTED_CURRENT_PROVIDER_SHA256="$8"
           REMOTE_SCRIPT_SELF="$0"
 
           PRODUCTION_PROJECT="jobpulse"
@@ -280,7 +361,11 @@ jobs:
           # resolve_final_lock_path/resolve_final_outer_lock_path and
           # acquire_outer_lock/acquire_internal_lock below for the full
           # two-lock model.
-          EXPECTED_CURRENT_SHA="148bd362b37c82c92737382d181fbdeac4d2187b"
+          # Phase 4D: bumped to the production baseline this runner
+          # previously, successfully upgraded to (Phase 3.4N-B) and which
+          # the Phase 4C pre-rollout diagnostic re-confirmed is still
+          # live -- same value as the workflow-level env pin above.
+          EXPECTED_CURRENT_SHA="f4765f857355c6543f68cea0e481b7f20a917147"
 
           WORKFLOW_SUCCESS=false
           # *_MUTATION_STARTED is set IMMEDIATELY BEFORE its mutating
@@ -368,7 +453,47 @@ jobs:
               return 1
             fi
 
-            echo "ROLLBACK: production git checkout restored to $EXPECTED_CURRENT_SHA" >&2
+            # Phase 4D: proves the rollback restored the old CONTENTS,
+            # not merely a commit label -- a git object corruption or an
+            # unexpected history rewrite could otherwise land on the
+            # right SHA with the wrong tree. Compared against the hashes
+            # this run itself derived from EXPECTED_CURRENT_SHA on the
+            # GitHub runner (never a locally-hardcoded value).
+            local rb_frontend_sha256 rb_provider_sha256
+            rb_frontend_sha256="$(sha256sum frontend/index.html | awk '{print $1}')"
+            rb_provider_sha256="$(sha256sum scripts/providers/linkedin_browser_provider.py | awk '{print $1}')"
+            if [ "$rb_frontend_sha256" != "$EXPECTED_CURRENT_FRONTEND_SHA256" ]; then
+              echo "FATAL: post-rollback frontend/index.html SHA-256 '$rb_frontend_sha256' != expected old '$EXPECTED_CURRENT_FRONTEND_SHA256'" >&2
+              return 1
+            fi
+            if [ "$rb_provider_sha256" != "$EXPECTED_CURRENT_PROVIDER_SHA256" ]; then
+              echo "FATAL: post-rollback provider file SHA-256 '$rb_provider_sha256' != expected old '$EXPECTED_CURRENT_PROVIDER_SHA256'" >&2
+              return 1
+            fi
+
+            # Bind-mount semantics (docker-compose.prod.yml:
+            # ./frontend:/usr/share/nginx/html:ro) mean the restored old
+            # file is served live without any frontend container
+            # recreate/restart -- this bounded localhost probe proves
+            # nginx is actually serving it, not just that the file on
+            # disk is correct. A file-hash mismatch above is the primary
+            # rollback proof; this is defense in depth confirming the
+            # live serving path, not a replacement for it.
+            local rb_frontend_http_ok=false
+            local attempt
+            for attempt in $(seq 1 15); do
+              if curl --connect-timeout 3 --max-time 5 -fsS -o /dev/null http://127.0.0.1/ 2>/dev/null; then
+                rb_frontend_http_ok=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$rb_frontend_http_ok" != "true" ]; then
+              echo "FATAL: post-rollback localhost frontend HTTP probe never succeeded" >&2
+              return 1
+            fi
+
+            echo "ROLLBACK: production git checkout restored to $EXPECTED_CURRENT_SHA, frontend/provider file provenance verified, frontend serving live" >&2
             return 0
           }
 
@@ -1109,6 +1234,27 @@ jobs:
             exit 1
           fi
 
+          echo "--- verifying pre-mutation frontend/provider file provenance against EXPECTED_CURRENT_SHA ---"
+          # Phase 4D: proves the production checkout's CONTENTS for these
+          # two Phase 4B-relevant files match the exact old commit this
+          # runner expects -- not merely that HEAD's label matches (git
+          # HEAD is already checked above). A mismatch here means the
+          # tracked worktree check above is insufficient (e.g. a file
+          # replaced by something outside git's view) or EXPECTED_CURRENT_SHA
+          # no longer accurately describes what is live; either way this
+          # runner must not proceed on a stale assumption.
+          CURRENT_FRONTEND_SHA256="$(sha256sum frontend/index.html | awk '{print $1}')"
+          CURRENT_PROVIDER_SHA256="$(sha256sum scripts/providers/linkedin_browser_provider.py | awk '{print $1}')"
+          if [ "$CURRENT_FRONTEND_SHA256" != "$EXPECTED_CURRENT_FRONTEND_SHA256" ]; then
+            echo "ERROR: current frontend/index.html SHA-256 '$CURRENT_FRONTEND_SHA256' != expected '$EXPECTED_CURRENT_FRONTEND_SHA256' (derived from EXPECTED_CURRENT_SHA) -- refusing to proceed" >&2
+            exit 1
+          fi
+          if [ "$CURRENT_PROVIDER_SHA256" != "$EXPECTED_CURRENT_PROVIDER_SHA256" ]; then
+            echo "ERROR: current provider file SHA-256 '$CURRENT_PROVIDER_SHA256' != expected '$EXPECTED_CURRENT_PROVIDER_SHA256' (derived from EXPECTED_CURRENT_SHA) -- refusing to proceed" >&2
+            exit 1
+          fi
+          echo "Pre-mutation frontend/provider provenance verified: matches EXPECTED_CURRENT_SHA exactly."
+
           # Existence-only snapshot (never reads secret contents) of the
           # known untracked artifacts, taken before any mutation. This is
           # compared against an after-reset snapshot later -- an
@@ -1521,6 +1667,63 @@ jobs:
           fi
           echo "Untracked production artifact existence unchanged (.tor_control_password=$TOR_SECRET_PATH_EXISTS_AFTER state=$STATE_PATH_EXISTS_AFTER)."
 
+          echo "--- verifying post-reset frontend/provider file provenance against the immutable target commit ---"
+          # Host-checkout provenance only: proves the git reset actually
+          # landed the exact Phase 4B file contents this run reviewed at
+          # preflight, extracted from the immutable target commit. This
+          # is NOT a claim that host Python executes the provider --
+          # the runtime collector/provider implementation is inside the
+          # immutable API image (already validated above); this is the
+          # frontend/provider CHECKOUT provenance that backs the
+          # bind-mounted frontend and keeps the host tree consistent
+          # with what was reviewed.
+          POST_RESET_FRONTEND_SHA256="$(sha256sum frontend/index.html | awk '{print $1}')"
+          if [ "$POST_RESET_FRONTEND_SHA256" != "$TARGET_FRONTEND_SHA256" ]; then
+            echo "ERROR: post-reset frontend/index.html SHA-256 '$POST_RESET_FRONTEND_SHA256' != target '$TARGET_FRONTEND_SHA256'" >&2
+            exit 1
+          fi
+          POST_RESET_PROVIDER_SHA256="$(sha256sum scripts/providers/linkedin_browser_provider.py | awk '{print $1}')"
+          if [ "$POST_RESET_PROVIDER_SHA256" != "$TARGET_PROVIDER_SHA256" ]; then
+            echo "ERROR: post-reset provider file SHA-256 '$POST_RESET_PROVIDER_SHA256' != target '$TARGET_PROVIDER_SHA256'" >&2
+            exit 1
+          fi
+          echo "Post-reset frontend/provider provenance verified: matches target commit exactly."
+
+          echo "--- live frontend validation (bounded localhost GET, no external network) ---"
+          # Proves the bind-mounted static frontend (docker-compose.prod.yml:
+          # ./frontend:/usr/share/nginx/html:ro) is actually serving the
+          # target checkout's content -- the file-hash check above proves
+          # what's on disk, this proves nginx is serving it. Uses the
+          # existing public localhost nginx path only; contacts no
+          # external domain; does not require any job row to contain
+          # poster data.
+          LIVE_FRONTEND_OK=false
+          LIVE_FRONTEND_BODY=""
+          for attempt in $(seq 1 15); do
+            if LIVE_FRONTEND_BODY="$(curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ 2>/dev/null)"; then
+              LIVE_FRONTEND_OK=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$LIVE_FRONTEND_OK" != "true" ]; then
+            echo "ERROR: live frontend localhost GET never succeeded" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$LIVE_FRONTEND_BODY" | grep -qF 'Open Poster Profile'; then
+            echo "ERROR: live frontend response does not contain the Phase 4B marker 'Open Poster Profile'" >&2
+            exit 1
+          fi
+          echo "Live frontend validated: serving target content (Phase 4B marker present)."
+
+          echo "--- frontend container invariant (must still be untouched after git reset) ---"
+          FRONTEND_STATE_AFTER_RESET="$(capture_container_state jobpulse-frontend-prod)"
+          if [ "$FRONTEND_STATE_AFTER_RESET" != "$FRONTEND_STATE_BEFORE" ]; then
+            echo "ERROR: jobpulse-frontend-prod state changed across git reset (no frontend recreation is ever performed by this runner)" >&2
+            exit 1
+          fi
+          echo "Frontend container invariant holds: same id/image/restart-count/running state as before this run."
+
           echo "--- verifying final compose hash still matches the reviewed target ---"
           FINAL_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
           if [ "$FINAL_COMPOSE_SHA256" != "$TARGET_COMPOSE_SHA256" ]; then
@@ -1574,7 +1777,37 @@ jobs:
             exit 1
           fi
 
-          echo "Direct runtime upgrade succeeded: production API is now $TARGET_IMAGE, git checkout $HEAD_AFTER_RESET, transport=direct, TOR_ENABLED=false, db/frontend/tor unchanged."
+          echo "--- final provider runtime proof (in-container import/assertion, zero network) ---"
+          # Proves the Phase 4B symbol is actually importable and behaves
+          # deterministically INSIDE the running candidate container --
+          # i.e. baked into the immutable target image itself, which is
+          # what the production collector actually executes (it always
+          # runs via `docker compose exec api python -m scripts...`,
+          # never host Python directly -- see docs/PRODUCTION_RUNBOOK.md).
+          # This makes exactly zero network requests: no LinkedIn
+          # contact, no browser/collector instantiation, just a pure
+          # string-normalization call already covered by
+          # tests/test_linkedin_job_poster_profile.py. Deliberately
+          # exercises the REJECTION path (an external lookalike domain
+          # must normalize to None) rather than an accepted profile URL:
+          # this still proves the symbol is present/callable/correct
+          # inside the candidate image, while never requiring this
+          # workflow's own text to reference the real target site's
+          # domain at all (a separate, pre-existing structural test
+          # enforces exactly that, and this stays consistent with it).
+          FINAL_PROVIDER_CHECK="$(docker exec jobpulse-api-prod python -c '
+          from scripts.providers.linkedin_browser_provider import normalize_linkedin_profile_url
+          result = normalize_linkedin_profile_url("https://example.com/in/not-linkedin")
+          assert result is None, result
+          print("PROVIDER_RUNTIME_PROOF_OK")
+          ')"
+          if [ "$FINAL_PROVIDER_CHECK" != "PROVIDER_RUNTIME_PROOF_OK" ]; then
+            echo "ERROR: final provider runtime proof failed: $FINAL_PROVIDER_CHECK" >&2
+            exit 1
+          fi
+          echo "Provider runtime proof OK: normalize_linkedin_profile_url is present and correct inside the candidate image, zero network requests made."
+
+          echo "Direct runtime upgrade succeeded: production API is now $TARGET_IMAGE, git checkout $HEAD_AFTER_RESET, transport=direct, TOR_ENABLED=false, db/frontend/tor unchanged, frontend/provider provenance verified, live frontend serves Phase 4B content."
           WORKFLOW_SUCCESS=true
           REMOTE_SCRIPT
 
@@ -1610,4 +1843,4 @@ jobs:
           # (never the production user's default config), so no
           # credential persists in ~/.docker/config.json.
           printf '%s' "${GHCR_TOKEN:-}" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            "bash '$REMOTE_SCRIPT_PATH' '$TARGET_COMPOSE_SHA256' '$TARGET_IMAGE' '$IMAGE_SHA' '$HAS_TOKEN'"
+            "bash '$REMOTE_SCRIPT_PATH' '$TARGET_COMPOSE_SHA256' '$TARGET_IMAGE' '$IMAGE_SHA' '$HAS_TOKEN' '$TARGET_FRONTEND_SHA256' '$TARGET_PROVIDER_SHA256' '$EXPECTED_CURRENT_FRONTEND_SHA256' '$EXPECTED_CURRENT_PROVIDER_SHA256'"
