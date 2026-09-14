@@ -2211,6 +2211,11 @@ change to `REVIEWED_TARGET_SHA` -- the `image_sha` input is validated
 against that one hard-pinned constant, not accepted as an arbitrary
 value.
 
+**This pair of SHAs is the historical record of the upgrade this
+runner actually performed.** The pins have since been bumped again --
+see "Phase 4D: Controlled Phase 4B Production Rollout Runner" below for
+the currently active `REVIEWED_TARGET_SHA` / `EXPECTED_CURRENT_SHA`.
+
 ### Trigger and inputs
 
 `workflow_dispatch` only, gated first on `github.ref ==
@@ -2602,4 +2607,174 @@ healthless-container fix, or `API_MUTATION_STARTED`/
 modified by this change -- this is a workflow-side parser fix that
 makes the runner correctly recognize the scheduling shape production
 already runs.
+
+## Phase 4D: Controlled Phase 4B Production Rollout Runner
+
+### Purpose
+
+Phase 4B (PR #32, merged as `bccbbd997ee83ee9219d6051a808dae17f5cc933`)
+added the LinkedIn job-poster-profile extractor
+(`scripts/providers/linkedin_browser_provider.py`) and the frontend
+block that renders it (`frontend/index.html`). Its image built
+successfully (`Build JobPulse API Image` run `34755044904`) and the
+Phase 4C pre-rollout audit (`docs/PRODUCTION_RUNBOOK.md`'s own
+diagnostic trail, run `34831537574`) re-confirmed production was still
+on the previously verified baseline. This phase does **not** introduce
+a new workflow or repair the generic `deploy.yml` path -- it narrowly
+extends the already-reviewed, already-tested Phase 3.4N-B direct
+runtime upgrade runner (`.github/workflows/production-direct-runtime-upgrade.yml`)
+to accept this as its next reviewed target, plus adds the coordinated
+frontend/provider artifact-provenance checks this specific release
+needs (Phase 4B is the first upgrade through this runner that changes
+a user-visible frontend file, not just backend/API code).
+
+**Why extend this runner instead of building a new one or repairing
+`deploy.yml`:** `deploy.yml`'s automatic/manual deploy path resolves to
+the floating `:main` tag with no SHA pinning, and its failure rollback
+(`scripts/deploy_prod_from_ghcr.sh`) only ever rolls back the `api`
+image/container -- it never reverts the `git reset --hard` that
+`deploy.yml` itself performs unconditionally *before* attempting the
+deploy. A failed deploy through that path would leave the git checkout
+(and therefore the bind-mounted live frontend) on the new commit while
+`api` rolls back to the old image: an inconsistent, half-rolled-back
+state. That gap is why Phase 3.4N-B exists as a separate runner in the
+first place, and it is why this release also goes through it rather
+than through `deploy.yml` -- **the generic Deploy Production path is
+not used for this release.**
+
+### Current -> target (active pins)
+
+- **`EXPECTED_CURRENT_SHA` (required precondition):**
+  `f4765f857355c6543f68cea0e481b7f20a917147` -- the runtime this exact
+  runner previously, successfully upgraded production to (the target of
+  the Phase 3.4N-B section above), and which the Phase 4C diagnostic
+  re-confirmed is still live.
+- **`REVIEWED_TARGET_SHA` (hard-pinned in the workflow):**
+  `bccbbd997ee83ee9219d6051a808dae17f5cc933` -- Phase 4B, "capture
+  LinkedIn job poster profile."
+
+As before, a future different target requires a separately reviewed
+bump to both constants -- `image_sha` is validated against the one
+hard-pinned `REVIEWED_TARGET_SHA`, never accepted as an arbitrary
+ancestor of `main`.
+
+### What is new in this phase (additive only -- nothing removed)
+
+Every invariant from Phase 3.4N-B/3.4O above is unchanged: the
+`workflow_dispatch`-only trigger, the exact confirmation token,
+`contents: read`, the concurrency group, bounded SSH/SCP with strict
+host-key checking, immutable image-SHA pinning, target-compose
+extraction/invariant checks, the two-lock scheduler model (outer before
+internal, held for the entire operation), the active-collector-process
+check, API-only candidate recreation (no db/frontend/Tor recreation),
+direct-transport and `TOR_ENABLED=false` verification, rollback-trap
+semantics, `*_MUTATION_STARTED` flags set immediately before their
+mutating command, the untracked-artifact (`.tor_control_password`,
+`state/`) checks, and the final health re-verification. Phase 4D adds,
+on top of that, entirely new checks -- none of them replace an existing
+guard:
+
+1. **Target file requirements** extended to also require
+   `frontend/index.html` exists at the target commit (the existing
+   `app/config.py` / `scripts/search_transport/*` /
+   `scripts/providers/linkedin_browser_provider.py` /
+   `scripts/repair_jobpulse_schema.py` requirements are unchanged).
+2. **Target/current artifact hashes**, computed on the GitHub runner
+   from immutable git objects only (`git show
+   "${IMAGE_SHA}:frontend/index.html"`, `git show
+   "${IMAGE_SHA}:scripts/providers/linkedin_browser_provider.py"`, and
+   the same two paths at `${EXPECTED_CURRENT_SHA}`) -- never derived
+   from a local filesystem copy or from production itself. Passed to
+   the remote script as four additional plain (non-secret) positional
+   arguments, the same mechanism already used for
+   `TARGET_COMPOSE_SHA256`/`TARGET_IMAGE`/`IMAGE_SHA`/`HAS_TOKEN`.
+3. **Release-intent markers**, checked before any SSH connection or
+   mutation: the target `frontend/index.html` must contain the literal
+   Phase 4B marker `Open Poster Profile`, and the target provider file
+   must contain `normalize_linkedin_profile_url` and
+   `extract_poster_info_from_detail_page`. These are intent assertions,
+   distinct from and in addition to the SHA-256 provenance proof --
+   never a replacement for it.
+4. **Pre-mutation baseline check**: production's current
+   `frontend/index.html` and provider file contents must hash-match the
+   files derived from `EXPECTED_CURRENT_SHA`, checked before either lock
+   is acquired and before any mutation.
+5. **Post-git-reset provenance**: after `git reset --hard
+   "$TARGET_SHA"`, production's `frontend/index.html` and provider file
+   must hash-match the target-derived hashes. This is **host-checkout
+   provenance only** -- it does not claim host Python executes the
+   provider. The runtime collector/provider implementation lives inside
+   the immutable API image (`Dockerfile`: `COPY scripts ./scripts`);
+   `scripts/run_collection_cycle_safe.sh` always executes collector
+   steps via `docker compose exec api python -m scripts...`, never host
+   Python directly, so the host checkout's copy of the provider file is
+   inert at runtime. What the host checkout's copy *does* affect is the
+   frontend: `docker-compose.prod.yml`'s `frontend` service bind-mounts
+   `./frontend:/usr/share/nginx/html:ro`, so advancing the git checkout
+   is what makes nginx serve the new `frontend/index.html` -- no
+   frontend container recreation is ever needed or performed.
+6. **Live frontend validation**: a bounded (`seq 1 15`, 2s apart)
+   `curl` of `http://127.0.0.1/` after the git reset, requiring the
+   response body contains `Open Poster Profile`. Localhost only; no
+   external domain is ever contacted.
+7. **Frontend container invariant re-check**: `jobpulse-frontend-prod`'s
+   captured state (id/image/restart-count/running) must still equal its
+   pre-run snapshot after the git reset -- proving the content change
+   came only from the bind mount, never a recreation.
+8. **Final in-container provider runtime proof**: `docker exec
+   jobpulse-api-prod python -c '...'` imports
+   `normalize_linkedin_profile_url` from the candidate image and calls
+   it against an external lookalike domain, asserting the result is
+   `None` (the rejection path). This proves the symbol is present and
+   behaves correctly **inside the image actually running production**,
+   makes zero network requests, and -- deliberately -- never requires
+   this workflow to reference an actual `linkedin.com` URL anywhere in
+   its own text (a separate, pre-existing structural test enforces that
+   this workflow never mentions `linkedin.com` at all).
+9. **Rollback strengthened**: `rollback_git()` now additionally verifies
+   the restored `frontend/index.html` and provider file hash-match the
+   `EXPECTED_CURRENT_SHA`-derived hashes (proving the rollback restored
+   the old *contents*, not merely a commit label), and performs a
+   bounded localhost `curl` of `/` proving the old frontend is actually
+   being served again -- bind-mount semantics mean this requires no
+   frontend container action, only the git rollback itself.
+
+Every one of the new checks in steps 4-9 above sits strictly between
+`GIT_MUTATION_STARTED=true`/`API_MUTATION_STARTED=true` and
+`WORKFLOW_SUCCESS=true` (or, for the pre-mutation check, strictly before
+either), so a failure at any of them is caught by the existing
+`final_exit_trap` under the same `*_MUTATION_STARTED`-keyed rollback
+eligibility as every other failure mode in this runner -- no new
+rollback code path was introduced; the existing one was extended.
+
+### Service mutation matrix (unchanged)
+
+| Service | Recreated by this runner? |
+| --- | --- |
+| `api` | Yes -- exactly one candidate recreation (`--no-build --no-deps`) |
+| Postgres | No |
+| frontend | No -- content changes via the bind-mounted git checkout only |
+| Tor | No |
+
+### Not authorized by this phase
+
+This phase is code/test/docs only. It does not dispatch Production
+Direct Runtime Upgrade, Deploy Production, Production Runtime
+Diagnostic, Production Neutral Canary, or Build JobPulse API Image, and
+it does not SSH to or mutate production. Production remains on
+`f4765f857355c6543f68cea0e481b7f20a917147` until a separately
+authorized dispatch of this runner is made.
+
+### Zero-change boundaries
+
+This phase touches only
+`.github/workflows/production-direct-runtime-upgrade.yml`,
+`tests/test_production_direct_runtime_upgrade_workflow.py`, and this
+document. It does not modify `.github/workflows/deploy.yml`,
+`scripts/deploy_prod_from_ghcr.sh`, `docker-compose.prod.yml`,
+`Dockerfile`, application/provider code, frontend code,
+database/schema code, Tor code, search-transport code, or the
+collection wrapper. The two-lock scheduler model, API-only candidate
+recreation, and every Phase 3.4N-B/3.4O rollback/ordering guarantee are
+carried forward unmodified.
 

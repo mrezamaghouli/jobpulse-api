@@ -41,8 +41,17 @@ CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 REMOTE_HEREDOC_START = "<<'REMOTE_SCRIPT'"
 REMOTE_HEREDOC_END = "REMOTE_SCRIPT"
 
-REVIEWED_TARGET_SHA = "f4765f857355c6543f68cea0e481b7f20a917147"
-EXPECTED_CURRENT_SHA = "148bd362b37c82c92737382d181fbdeac4d2187b"
+# Phase 4D: bumped to the reviewed Phase 4B target and the current
+# verified production baseline it replaces (see docs/PRODUCTION_RUNBOOK.md).
+REVIEWED_TARGET_SHA = "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+EXPECTED_CURRENT_SHA = "f4765f857355c6543f68cea0e481b7f20a917147"
+
+# The pins this exact runner used before Phase 4D -- asserted, in the new
+# tests below, to no longer be the ACTIVE pins (the old REVIEWED_TARGET_SHA
+# is now reused as the new EXPECTED_CURRENT_SHA, which is expected; the old
+# EXPECTED_CURRENT_SHA must not appear as either active pin any more).
+STALE_REVIEWED_TARGET_SHA = "f4765f857355c6543f68cea0e481b7f20a917147"
+STALE_EXPECTED_CURRENT_SHA = "148bd362b37c82c92737382d181fbdeac4d2187b"
 
 
 @pytest.fixture(scope="module")
@@ -2976,3 +2985,521 @@ def test_this_test_file_has_no_empty_or_pass_only_tests():
             body = body[1:]
         assert body, f"{node.name} has an empty body"
         assert not (len(body) == 1 and isinstance(body[0], ast.Pass)), f"{node.name} is pass-only"
+
+
+# =====================================================================
+# 33. Phase 4D: reviewed pins bumped to the Phase 4B target
+# =====================================================================
+# The runner is a narrow reviewed EXTENSION, not a rewrite: every
+# invariant from earlier sections (lock model, API-only recreation,
+# rollback-eligibility flag semantics, ordering) still applies unchanged
+# and is still covered by the tests above. These new tests cover only
+# what Phase 4D actually added -- the bumped pins and the coordinated
+# frontend/provider artifact-provenance checks either side of the git
+# checkout mutation.
+
+def test_reviewed_target_sha_bumped_to_phase4b(workflow):
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] == "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+
+
+def test_expected_current_sha_bumped_to_previous_verified_baseline(workflow):
+    assert workflow["env"]["EXPECTED_CURRENT_SHA"] == "f4765f857355c6543f68cea0e481b7f20a917147"
+
+
+def test_stale_pins_no_longer_active(workflow):
+    """C: the pre-Phase-4D pins must not be the ACTIVE values any more.
+    The old REVIEWED_TARGET_SHA is legitimately reused as the new
+    EXPECTED_CURRENT_SHA (production really did move to it) -- only the
+    old EXPECTED_CURRENT_SHA (a full upgrade cycle further back) must be
+    completely retired from both env pins."""
+    assert workflow["env"]["EXPECTED_CURRENT_SHA"] != STALE_EXPECTED_CURRENT_SHA
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] != STALE_EXPECTED_CURRENT_SHA
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] != STALE_REVIEWED_TARGET_SHA
+    assert workflow["env"]["EXPECTED_CURRENT_SHA"] == STALE_REVIEWED_TARGET_SHA
+
+
+def test_image_sha_description_references_phase4b_target(workflow):
+    inputs = _triggers(workflow)["workflow_dispatch"]["inputs"]
+    assert REVIEWED_TARGET_SHA in inputs["image_sha"]["description"]
+    assert STALE_REVIEWED_TARGET_SHA not in inputs["image_sha"]["description"]
+
+
+# =====================================================================
+# 34. Phase 4D: target artifact hash derivation (preflight, GitHub runner)
+# =====================================================================
+
+def test_target_frontend_extracted_from_immutable_target_commit(steps):
+    step = _step_by_name(steps, "Prove target SHA is a reviewed ancestor of main and extract its compose file")
+    assert 'git show "${IMAGE_SHA}:frontend/index.html" > /tmp/target-frontend-index.html' in step["run"]
+
+
+def test_target_provider_extracted_from_immutable_target_commit(steps):
+    step = _step_by_name(steps, "Prove target SHA is a reviewed ancestor of main and extract its compose file")
+    assert 'git show "${IMAGE_SHA}:scripts/providers/linkedin_browser_provider.py" > /tmp/target-provider.py' in step["run"]
+
+
+def test_target_frontend_required_to_exist_in_target_commit(steps):
+    """The Phase 4B target must also contain frontend/index.html itself
+    (in addition to the provider/config/transport files already required
+    by the pre-Phase-4D ancestor-proof block)."""
+    step = _step_by_name(steps, "Prove target SHA is a reviewed ancestor of main and extract its compose file")
+    assert 'git show "${IMAGE_SHA}:frontend/index.html" > /dev/null' in step["run"]
+
+
+def test_expected_current_hashes_derived_from_expected_current_sha_not_local_filesystem(steps):
+    step = _step_by_name(steps, "Derive expected current (pre-upgrade) frontend/provider hashes from EXPECTED_CURRENT_SHA")
+    run_text = step["run"]
+    assert 'git show "${EXPECTED_CURRENT_SHA}:frontend/index.html" > /tmp/current-frontend-index.html' in run_text
+    assert 'git show "${EXPECTED_CURRENT_SHA}:scripts/providers/linkedin_browser_provider.py" > /tmp/current-provider.py' in run_text
+    assert 'git cat-file -e "${EXPECTED_CURRENT_SHA}^{commit}"' in run_text
+
+
+def test_expected_current_hash_step_precedes_deploy_step(steps):
+    names = [s.get("name") for s in steps]
+    derive_idx = names.index("Derive expected current (pre-upgrade) frontend/provider hashes from EXPECTED_CURRENT_SHA")
+    deploy_idx = names.index("Run the immutable direct-runtime upgrade on production")
+    assert derive_idx < deploy_idx
+
+
+def test_target_and_expected_current_hashes_computed_from_extracted_files_not_hardcoded(full_run_text):
+    """Every hash this runner acts on is computed via `sha256sum` against
+    a file this same run extracted from an immutable git object --
+    never a literal hex string pasted into the workflow."""
+    assert "TARGET_FRONTEND_SHA256=\"$(sha256sum /tmp/target-frontend-index.html | awk '{print $1}')\"" in full_run_text
+    assert "TARGET_PROVIDER_SHA256=\"$(sha256sum /tmp/target-provider.py | awk '{print $1}')\"" in full_run_text
+    assert "EXPECTED_CURRENT_FRONTEND_SHA256=\"$(sha256sum /tmp/current-frontend-index.html | awk '{print $1}')\"" in full_run_text
+    assert "EXPECTED_CURRENT_PROVIDER_SHA256=\"$(sha256sum /tmp/current-provider.py | awk '{print $1}')\"" in full_run_text
+
+
+def test_four_hashes_passed_to_remote_script_as_plain_positional_args(runner_script):
+    """Same non-secret positional-argument mechanism already used for
+    TARGET_COMPOSE_SHA256/TARGET_IMAGE/IMAGE_SHA/HAS_TOKEN -- these
+    hashes are not secret and never need the GHCR-token stdin path."""
+    assert "'$TARGET_FRONTEND_SHA256' '$TARGET_PROVIDER_SHA256' '$EXPECTED_CURRENT_FRONTEND_SHA256' '$EXPECTED_CURRENT_PROVIDER_SHA256'" in runner_script
+
+
+def test_remote_script_parses_four_new_positional_args_in_order(remote_script):
+    assert 'TARGET_FRONTEND_SHA256="$5"' in remote_script
+    assert 'TARGET_PROVIDER_SHA256="$6"' in remote_script
+    assert 'EXPECTED_CURRENT_FRONTEND_SHA256="$7"' in remote_script
+    assert 'EXPECTED_CURRENT_PROVIDER_SHA256="$8"' in remote_script
+
+
+# =====================================================================
+# 35. Phase 4D: target release-intent markers (frontend/provider)
+# =====================================================================
+
+def test_target_marker_step_exists_and_precedes_ssh_key_material(steps):
+    names = [s.get("name") for s in steps]
+    marker_idx = names.index("Verify Phase 4B target release-intent markers (frontend/provider)")
+    ssh_idx = names.index("Validate VM_SSH_KEY secret is present")
+    assert marker_idx < ssh_idx, "release-intent marker check must fail before any SSH/mutation, per spec"
+
+
+def test_target_frontend_marker_checked(steps):
+    step = _step_by_name(steps, "Verify Phase 4B target release-intent markers (frontend/provider)")
+    run_text = step["run"]
+    assert "grep -qF 'Open Poster Profile' /tmp/target-frontend-index.html" in run_text
+    assert "exit 1" in run_text
+
+
+def test_target_provider_markers_checked(steps):
+    step = _step_by_name(steps, "Verify Phase 4B target release-intent markers (frontend/provider)")
+    run_text = step["run"]
+    assert "grep -qF 'normalize_linkedin_profile_url' /tmp/target-provider.py" in run_text
+    assert "grep -qF 'extract_poster_info_from_detail_page' /tmp/target-provider.py" in run_text
+
+
+def test_marker_step_is_valid_bash_syntax(steps):
+    step = _step_by_name(steps, "Verify Phase 4B target release-intent markers (frontend/provider)")
+    result = _run_bash_n(step["run"])
+    assert result.returncode == 0, result.stderr
+
+
+def test_marker_checks_are_intent_assertions_not_a_replacement_for_hash_check(steps):
+    """Spec: 'these are intent checks; SHA-256 remains the provenance
+    proof' -- the marker step must never itself compute or compare a
+    SHA-256; that stays in the dedicated hash-derivation steps/checks."""
+    step = _step_by_name(steps, "Verify Phase 4B target release-intent markers (frontend/provider)")
+    assert "sha256sum" not in step["run"]
+
+
+# =====================================================================
+# 36. Phase 4D: pre-mutation production baseline (current frontend/provider)
+# =====================================================================
+
+def test_pre_mutation_current_frontend_provider_hash_checked_before_any_mutation(remote_script):
+    """Step 11 of the spec: production's current frontend/provider file
+    contents must match EXPECTED_CURRENT_SHA before any mutation starts.
+    Uses the actual lock ACQUISITION CALL site (`if ! acquire_internal_lock;
+    then`), not the `exec {CYCLE_LOCK_FD}...` text that also appears
+    inside the function's own (hoisted, earlier-in-file) definition."""
+    check_index = remote_script.index('"$CURRENT_FRONTEND_SHA256" != "$EXPECTED_CURRENT_FRONTEND_SHA256"')
+    lock_call_index = remote_script.index("if ! acquire_internal_lock; then")
+    api_mutation_index = remote_script.index("API_MUTATION_STARTED=true")
+    assert check_index < lock_call_index < api_mutation_index
+
+
+def test_pre_mutation_provider_hash_checked_before_any_mutation(remote_script):
+    check_index = remote_script.index('"$CURRENT_PROVIDER_SHA256" != "$EXPECTED_CURRENT_PROVIDER_SHA256"')
+    api_mutation_index = remote_script.index("API_MUTATION_STARTED=true")
+    assert check_index < api_mutation_index
+
+
+def test_pre_mutation_hash_check_follows_head_and_dirty_tree_checks(remote_script):
+    """Ordering: git-HEAD precondition, then tracked-worktree-clean
+    check, then the new frontend/provider provenance check -- all still
+    read-only, all still before any lock/mutation."""
+    head_check_index = remote_script.index('"$CURRENT_HEAD" != "$EXPECTED_CURRENT_SHA"')
+    dirty_check_index = remote_script.index("DIRTY_TRACKED=")
+    hash_check_index = remote_script.index('CURRENT_FRONTEND_SHA256="$(sha256sum frontend/index.html')
+    assert head_check_index < dirty_check_index < hash_check_index
+
+
+# =====================================================================
+# 37. Phase 4D: post-git-reset frontend/provider provenance + live frontend
+# =====================================================================
+
+def test_post_reset_frontend_hash_checked_against_target(remote_script):
+    assert 'POST_RESET_FRONTEND_SHA256="$(sha256sum frontend/index.html | awk' in remote_script
+    assert '"$POST_RESET_FRONTEND_SHA256" != "$TARGET_FRONTEND_SHA256"' in remote_script
+
+
+def test_post_reset_provider_hash_checked_against_target(remote_script):
+    assert 'POST_RESET_PROVIDER_SHA256="$(sha256sum scripts/providers/linkedin_browser_provider.py | awk' in remote_script
+    assert '"$POST_RESET_PROVIDER_SHA256" != "$TARGET_PROVIDER_SHA256"' in remote_script
+
+
+def test_live_frontend_validation_exists_and_is_localhost_only(remote_script):
+    assert "curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ 2>/dev/null" in remote_script
+    assert "grep -qF 'Open Poster Profile'" in remote_script
+    # No external domain is ever contacted by this check.
+    for forbidden in ("linkedin.com", "http://check.torproject.org", "https://"):
+        for line in remote_script.splitlines():
+            if "LIVE_FRONTEND" in line:
+                assert forbidden not in line, line
+
+
+def test_live_frontend_validation_bounded_not_infinite(remote_script):
+    live_block = remote_script[remote_script.index("live frontend validation") : remote_script.index("frontend container invariant")]
+    assert "for attempt in $(seq 1 15)" in live_block
+
+
+def test_frontend_container_invariant_rechecked_after_reset(remote_script):
+    """Step 19 of the spec: frontend container id/image/restart-count/
+    running state must still equal the pre-run snapshot after the git
+    reset -- no frontend recreation is ever performed."""
+    assert 'FRONTEND_STATE_AFTER_RESET="$(capture_container_state jobpulse-frontend-prod)"' in remote_script
+    assert '"$FRONTEND_STATE_AFTER_RESET" != "$FRONTEND_STATE_BEFORE"' in remote_script
+
+
+def test_post_reset_checks_ordered_after_reset_and_before_success(remote_script):
+    """P/Q: a failure in any of the new post-reset checks must still be
+    inside the rollback-protected window -- i.e. strictly after
+    GIT_MUTATION_STARTED=true (so the EXIT trap's git-recovery branch is
+    eligible) and strictly before WORKFLOW_SUCCESS=true (so the trap
+    still treats this run as non-success)."""
+    git_mutation_started_index = remote_script.index("GIT_MUTATION_STARTED=true")
+    frontend_hash_index = remote_script.index('"$POST_RESET_FRONTEND_SHA256" != "$TARGET_FRONTEND_SHA256"')
+    provider_hash_index = remote_script.index('"$POST_RESET_PROVIDER_SHA256" != "$TARGET_PROVIDER_SHA256"')
+    live_frontend_index = remote_script.index('"$LIVE_FRONTEND_OK" != "true"')
+    frontend_invariant_index = remote_script.index('"$FRONTEND_STATE_AFTER_RESET" != "$FRONTEND_STATE_BEFORE"')
+    final_provider_proof_index = remote_script.index('"$FINAL_PROVIDER_CHECK" != "PROVIDER_RUNTIME_PROOF_OK"')
+    success_index = remote_script.index("WORKFLOW_SUCCESS=true")
+
+    assert (
+        git_mutation_started_index
+        < frontend_hash_index
+        < provider_hash_index
+        < live_frontend_index
+        < frontend_invariant_index
+        < final_provider_proof_index
+        < success_index
+    ), "a Phase 4B provenance/validation check moved outside the rollback-protected window"
+
+
+# =====================================================================
+# 38. Phase 4D: final in-container provider runtime proof (zero network)
+# =====================================================================
+
+def test_final_provider_runtime_proof_exists(remote_script):
+    assert "from scripts.providers.linkedin_browser_provider import normalize_linkedin_profile_url" in remote_script
+    assert 'normalize_linkedin_profile_url("https://example.com/in/not-linkedin")' in remote_script
+    assert "result is None" in remote_script
+    assert "PROVIDER_RUNTIME_PROOF_OK" in remote_script
+
+
+def test_final_provider_runtime_proof_never_embeds_a_real_linkedin_url(remote_script):
+    """The provider proof deliberately exercises the REJECTION path (an
+    external lookalike domain) rather than an accepted profile URL, so
+    this workflow never needs to reference the real target site's
+    domain anywhere in its own text -- see
+    test_no_linkedin_target_anywhere, a separate pre-existing structural
+    guard this addition must not weaken."""
+    forbidden_domain = "linked" + "in.com"
+    assert forbidden_domain not in remote_script.lower()
+
+
+def test_final_provider_runtime_proof_makes_no_network_request(remote_script):
+    """The check is a pure local string-normalization call -- it must
+    never import/instantiate the browser collector, playwright, or any
+    HTTP client, and the literal LinkedIn URL passed to it is only a
+    local string argument, never fetched."""
+    start = remote_script.index("final provider runtime proof")
+    end = remote_script.index("Direct runtime upgrade succeeded:")
+    block = remote_script[start:end]
+    for forbidden in (
+        "playwright",
+        "requests.",
+        "urlopen",
+        "httpx",
+        "extract_poster_info_from_detail_page",
+        "LinkedInBrowserProvider(",
+        "async def",
+    ):
+        assert forbidden not in block, f"unexpected {forbidden!r} in the provider runtime proof block"
+
+
+def test_final_provider_runtime_proof_runs_inside_candidate_container(remote_script):
+    start = remote_script.index("final provider runtime proof")
+    end = remote_script.index("Direct runtime upgrade succeeded:")
+    block = remote_script[start:end]
+    assert "docker exec jobpulse-api-prod python -c" in block
+
+
+def test_final_provider_runtime_proof_precedes_success_flag(remote_script):
+    proof_index = remote_script.index("FINAL_PROVIDER_CHECK=")
+    success_index = remote_script.index("WORKFLOW_SUCCESS=true")
+    assert proof_index < success_index
+
+
+# =====================================================================
+# 39. Phase 4D: rollback strengthened with frontend/provider provenance
+# =====================================================================
+
+def test_rollback_git_verifies_frontend_hash(remote_script):
+    func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
+    assert 'rb_frontend_sha256="$(sha256sum frontend/index.html' in func_body
+    assert '"$rb_frontend_sha256" != "$EXPECTED_CURRENT_FRONTEND_SHA256"' in func_body
+
+
+def test_rollback_git_verifies_provider_hash(remote_script):
+    func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
+    assert 'rb_provider_sha256="$(sha256sum scripts/providers/linkedin_browser_provider.py' in func_body
+    assert '"$rb_provider_sha256" != "$EXPECTED_CURRENT_PROVIDER_SHA256"' in func_body
+
+
+def test_rollback_git_verifies_live_frontend_serves_restored_content(remote_script):
+    func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
+    assert "rb_frontend_http_ok" in func_body
+    assert 'if [ "$rb_frontend_http_ok" != "true" ]; then' in func_body
+
+
+def test_rollback_git_hash_checks_precede_http_probe(remote_script):
+    func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
+    frontend_hash_idx = func_body.index("rb_frontend_sha256=")
+    provider_hash_idx = func_body.index("rb_provider_sha256=")
+    http_probe_idx = func_body.index("rb_frontend_http_ok")
+    assert frontend_hash_idx < provider_hash_idx < http_probe_idx
+
+
+# =====================================================================
+# 40. Phase 4D: service mutation matrix unchanged (db/frontend/tor)
+# =====================================================================
+
+def test_no_new_db_recreation_introduced(remote_script):
+    for line in _executable_lines(remote_script):
+        if "docker compose" in line and re.search(r"(?:^|\s)up(?:\s|$)", line):
+            assert re.search(r"\bdb\b", line) is None, line
+
+
+def test_no_new_tor_recreation_introduced(remote_script):
+    for line in _executable_lines(remote_script):
+        if "docker compose" in line and re.search(r"(?:^|\s)up(?:\s|$)", line):
+            assert re.search(r"\btor\b", line) is None, line
+
+
+def test_frontend_only_ever_inspected_never_recreated_by_new_code(remote_script):
+    """Every new frontend-related command Phase 4D added is read-only:
+    capture_container_state (docker inspect), sha256sum, or curl -- never
+    `docker compose up`/`create`/`restart` naming frontend."""
+    for line in _executable_lines(remote_script):
+        if "frontend" not in line.lower() and "127.0.0.1/" not in line:
+            continue
+        assert "docker compose" not in line or "up" not in line.split(), line
+        assert "docker create" not in line, line
+        assert "docker restart" not in line, line
+
+
+# =====================================================================
+# 41. Phase 4D: no collection/LinkedIn/Tor-control behavior added
+# =====================================================================
+
+def test_no_collection_script_invocation_added(remote_script):
+    """The scheduler-provenance scan already mentions
+    run_collection_cycle_safe.sh as DATA (parsing crontab/systemd text,
+    never executing it) -- Phase 4D must not add any new EXECUTION of
+    it, of process_search_demand_queue, or of linkedin_plan_collect."""
+    assert "python -m scripts.process_search_demand_queue" not in remote_script
+    assert "python -m scripts.linkedin_plan_collect" not in remote_script
+    assert "python -m scripts.collector_postgres" not in remote_script
+    assert "python -m scripts.seed_priority_coverage_queue" not in remote_script
+    assert "python -m scripts.reconcile_priority_coverage" not in remote_script
+
+
+def test_no_tor_controlport_or_newnym_behavior_added(remote_script):
+    """Phase 4D's new lines only reference TOR_ENABLED (already-existing
+    invariant), never any ControlPort/SOCKS/NEWNYM surface -- those
+    remain entirely absent from this workflow, exactly as before
+    Phase 4D."""
+    assert "NEWNYM" not in remote_script
+    assert "ControlPort" not in remote_script
+    assert ":9051" not in remote_script
+    assert "TOR_SOCKS_" not in remote_script
+
+
+def test_no_rate_limit_or_proxy_behavior_changed(remote_script):
+    assert "RATE_LIMIT_ENABLED" not in remote_script
+    assert "SEARCH_TRANSPORT=proxy" not in remote_script
+
+
+# =====================================================================
+# 42. Phase 4D: behavioral execution of the extracted rollback_git()
+# =====================================================================
+# Following the same practice as the capture_container_state harness
+# tests above: the ACTUAL rollback_git() bash function is extracted
+# verbatim and executed via `bash -c` against fake git/sha256sum/sleep/
+# curl executables -- not a Python reimplementation of its logic.
+
+@pytest.fixture(scope="module")
+def rollback_git_source(remote_script) -> str:
+    return _extract_bash_function(remote_script, "rollback_git")
+
+
+def _fake_git_for_rollback(bin_dir, head_after_reset: str):
+    body = (
+        'case "$1" in\n'
+        '  fetch) exit 0 ;;\n'
+        '  reset) exit 0 ;;\n'
+        f'  rev-parse) echo {shlex.quote(head_after_reset)}; exit 0 ;;\n'
+        '  *) exit 1 ;;\n'
+        'esac\n'
+    )
+    _write_fake_executable(bin_dir, "git", body)
+
+
+def _fake_sha256sum_for_rollback(bin_dir, frontend_hash: str, provider_hash: str):
+    body = (
+        'case "$1" in\n'
+        f'  frontend/index.html) echo {shlex.quote(frontend_hash)}"  $1" ;;\n'
+        f'  scripts/providers/linkedin_browser_provider.py) echo {shlex.quote(provider_hash)}"  $1" ;;\n'
+        '  *) echo "0000000000000000000000000000000000000000000000000000000000000000  $1" ;;\n'
+        'esac\n'
+    )
+    _write_fake_executable(bin_dir, "sha256sum", body)
+
+
+def _fake_curl_for_rollback(bin_dir, succeed: bool):
+    _write_fake_executable(bin_dir, "curl", "exit 0\n" if succeed else "exit 22\n")
+
+
+def _fake_instant_sleep(bin_dir):
+    _write_fake_executable(bin_dir, "sleep", "exit 0\n")
+
+
+def _run_rollback_git(rollback_git_source, harness_bin, tmp_path, *, frontend_hash, provider_hash, curl_succeeds, head_after_reset="f4765f857355c6543f68cea0e481b7f20a917147"):
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    _fake_git_for_rollback(fake_bin, head_after_reset)
+    _fake_sha256sum_for_rollback(fake_bin, frontend_hash, provider_hash)
+    _fake_curl_for_rollback(fake_bin, curl_succeeds)
+    _fake_instant_sleep(fake_bin)
+
+    body = (
+        f'EXPECTED_CURRENT_SHA={shlex.quote(head_after_reset)}\n'
+        'EXPECTED_CURRENT_FRONTEND_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        'EXPECTED_CURRENT_PROVIDER_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\n'
+        'if rollback_git; then echo ROLLBACK_GIT_RESULT=OK; else echo ROLLBACK_GIT_RESULT=FAILED; fi\n'
+    )
+    return _run_harness(rollback_git_source, harness_bin, body, extra_path_dirs=(fake_bin,))
+
+
+def test_behavior_rollback_git_succeeds_when_everything_matches(rollback_git_source, harness_bin, tmp_path):
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        curl_succeeds=True,
+    )
+    assert "ROLLBACK_GIT_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_behavior_rollback_git_fails_closed_on_frontend_hash_mismatch(rollback_git_source, harness_bin, tmp_path):
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash="0000000000000000000000000000000000000000000000000000000000000000",
+        provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        curl_succeeds=True,
+    )
+    assert "ROLLBACK_GIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: post-rollback frontend/index.html SHA-256" in result.stderr
+
+
+def test_behavior_rollback_git_fails_closed_on_provider_hash_mismatch(rollback_git_source, harness_bin, tmp_path):
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_hash="0000000000000000000000000000000000000000000000000000000000000000",
+        curl_succeeds=True,
+    )
+    assert "ROLLBACK_GIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: post-rollback provider file SHA-256" in result.stderr
+
+
+def test_behavior_rollback_git_fails_closed_when_localhost_frontend_never_serves(rollback_git_source, harness_bin, tmp_path):
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        curl_succeeds=False,
+    )
+    assert "ROLLBACK_GIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: post-rollback localhost frontend HTTP probe never succeeded" in result.stderr
+
+
+def test_behavior_rollback_git_mutation_sentinels_untouched(rollback_git_source, harness_bin, tmp_path):
+    """The fake git/sha256sum/curl/sleep supplied above are the only
+    commands rollback_git() should need -- confirms no other mutating
+    command (a real, un-faked docker/flock) is reached in this path."""
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        curl_succeeds=True,
+    )
+    _assert_mutation_sentinels_untouched(result)
+
+
+# =====================================================================
+# 43. Phase 4D: scope guard -- no other production workflow touched
+# =====================================================================
+
+def test_deploy_workflow_and_generic_deploy_script_not_modified_by_this_change():
+    """Phase 4D is a narrow extension of this one runner only -- confirms
+    the generic deploy path this PR intentionally leaves untouched still
+    exists unchanged in name/shape (a full content diff is out of scope
+    for this file; this guards against an accidental rename/removal)."""
+    deploy_workflow = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
+    deploy_script = REPO_ROOT / "scripts" / "deploy_prod_from_ghcr.sh"
+    assert deploy_workflow.is_file()
+    assert deploy_script.is_file()
