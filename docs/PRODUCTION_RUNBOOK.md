@@ -2778,3 +2778,233 @@ collection wrapper. The two-lock scheduler model, API-only candidate
 recreation, and every Phase 3.4N-B/3.4O rollback/ordering guarantee are
 carried forward unmodified.
 
+## Phase 4E-4H: Split-release incident and recovery runner
+
+**Phase 4E (incident).** Production Direct Runtime Upgrade run
+`35247979950` (head `4a0ab603419ebf97c6b6afe7c1b2d633d871d829`,
+`conclusion=failure`, `run_attempt=1`) attempted to move production from
+`f4765f857355c6543f68cea0e481b7f20a917147` (f476) to
+`bccbbd997ee83ee9219d6051a808dae17f5cc933` (bccbbd, Phase 4B: LinkedIn
+job poster profile). Sequence observed: candidate API validated ->
+production git advanced to bccbbd -> frontend/provider hashes matched
+target -> the live frontend HTTP response did not contain the expected
+`Open Poster Profile` marker -> the runner attempted to recreate the API
+on the old (f476) image as a rollback -> its own rollback-verification
+step reported failure -> `rollback_git()` therefore never ran, leaving
+git checked out at bccbbd while the API container was recreated on the
+old image.
+
+**Phase 4F/4G (read-only investigation).** A read-only SSH inspection
+and a dispatch of the existing Production Runtime Diagnostic workflow
+(run `35442611756`, `conclusion=success`) measured the ACTUAL post-
+incident state rather than assuming it from the failure log:
+
+- Production git: `bccbbd997ee83ee9219d6051a808dae17f5cc933` (target,
+  not rolled back).
+- API container `jobpulse-api-prod`
+  (`ac66a4acef51c8ac3dc27b38a5559c5aa056ec033ceef43c9f8a0e4a8cbd3682`,
+  a DIFFERENT container ID than the pre-rollout
+  `ea554d12cf576d56d18a60f48d5a3ab71cf48c52011a9cb57d25cf3de3b7f26c`,
+  confirming it WAS recreated): `Config.Image` is the local rollback
+  alias `jobpulse-api-rollback:bccbbd997ee8-1427495`, but its underlying
+  image ID is exactly
+  `sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`
+  -- the known-good OLD (f476) image. Running, healthy, `restart_count=0`,
+  both `/health` endpoints OK, `TOR_ENABLED=false`.
+- DB (`98f20abb...`), frontend (`fb949b779e80...`), and Tor
+  (`e2210c3c47f7...`) containers all unchanged from their pre-rollout
+  IDs -- none were touched by the failed rollout or its rollback
+  attempt.
+
+**Conclusion: the API rollback actually succeeded.** The runner's
+own rollback-verification step almost certainly raced the Docker
+healthcheck's 20-second interval (the runner recreated the API at
+`16:42:15Z` and declared rollback failure at `16:42:20Z`, only 5 seconds
+later -- not enough time for the healthcheck to report `healthy` even
+once) and reported a false negative. This is a health-verification
+timing bug in the existing runner, not evidence the old image failed to
+restore. Current release classification: **`CASE_B_GIT_TARGET_API_OLD`**
+-- git at bccbbd, API runtime at f476, a genuine split release (exactly
+matching "rollback_git was NOT executed" from the incident log).
+
+**Phase 4H (recovery runner, this phase).** Added a new, dedicated,
+one-time workflow,
+`.github/workflows/production-split-release-recovery.yml`
+(`workflow_dispatch` only, confirmation token
+`RECOVER_PHASE4E_SPLIT_RELEASE`), to close the split without touching
+any container:
+
+- Every pin (incident/recovery commit SHAs, expected API image ID,
+  expected API `Config.Image` alias, and the exact API/DB/frontend/Tor
+  container IDs proven by diagnostic run `35442611756`) is hardcoded.
+  Any drift from this exact observed state fails closed before SSH ever
+  connects.
+- Frontend/provider/compose file hashes for both commits are derived
+  from immutable git objects (`git show <sha>:<path> | sha256sum`) on
+  the GitHub runner, never from a local working tree or from production;
+  a compose-file mismatch between the two commits fails the job before
+  it ever connects to production.
+- The **only** production mutation this runner performs is a single
+  `git reset --hard` from the incident SHA to the recovery target SHA.
+  It never recreates, restarts, or stops the api/db/frontend/tor
+  containers -- the API is already healthy on the correct f476 image
+  bytes and is deliberately left alone; the frontend's restored content
+  comes entirely from the existing read-only bind mount
+  (`./frontend:/usr/share/nginx/html:ro`), which serves the reset files
+  live with no frontend action needed.
+- Preconditions (git HEAD/worktree state, host file provenance, full
+  API/DB/frontend/Tor identity and health, direct/no-Tor transport, the
+  frontend bind-mount source, a re-proven scheduler launcher (see
+  "Scheduler provenance correction" below), and an active-collector
+  check acquiring the exact known outer
+  (`/tmp/jobpulse_collection_cycle.lock`) and inner
+  (`/opt/jobpulse/state/run_collection_cycle.lock`) locks non-blocking,
+  outer-then-inner) must all pass before the reset runs. This is a
+  one-time incident runner pinned to the already-verified canonical
+  lock/launcher structure -- it deliberately does not carry the full
+  cron/systemd scheduler-provenance scanner (`scan_launchers`,
+  `classify_cron_job_command`, `reconcile_launchers`) that
+  `production-direct-runtime-upgrade.yml` uses for its general-purpose
+  case; it re-proves the one historically-authoritative source exactly
+  and treats every other source as an absence-only drift check.
+- **This recovery is monotonic and has no rollback-to-incident path.**
+  If any post-reset validation fails (file provenance, the frontend
+  bind-mounted or live-HTTP hash, or any API/DB/frontend/Tor invariant),
+  the runner does NOT reset git back to the incident SHA -- doing so
+  would silently recreate the exact split-release incident this runner
+  exists to fix. It leaves the checkout at whatever state the single
+  `git reset --hard` produced, preserves all captured evidence in the
+  job log/summary, and exits non-zero for a human to investigate.
+- On success it reports
+  `FUNCTIONAL_F476_BASELINE_RESTORED_API_REFERENCE_ALIAS_REMAINS` --
+  the API's `Config.Image` alias (`jobpulse-api-rollback:bccbbd997ee8-
+  1427495`) is deliberately left as-is; normalizing that reference back
+  to the standard `ghcr.io/mrezamaghouli/jobpulse-api:<sha>` form is an
+  explicitly separate, later change, not part of this emergency
+  recovery.
+
+### Scheduler provenance correction (blocker found in independent review)
+
+An independent review of the initial Phase 4H recovery runner found
+that it hardcoded and acquired the outer
+(`/tmp/jobpulse_collection_cycle.lock`) and internal
+(`/opt/jobpulse/state/run_collection_cycle.lock`) locks WITHOUT
+verifying the production scheduler still uses the launcher those paths
+were pinned from -- if the scheduler had drifted to a different
+launcher/lock configuration since Phase 3.4O, this runner could acquire
+the wrong (now-unused) locks while a real scheduled collection cycle
+started under a different lock entirely, defeating the whole point of
+lock acquisition before the git reset.
+
+**This is fixed by re-proving the exact historically-authoritative
+launcher before taking either lock, using real, independently-verified,
+historical LIVE PRODUCTION Actions log evidence -- not repository
+configuration (no cron/systemd schedule for this script is installed by
+this repository) and not an inference from `VM_USER`:**
+
+- Production Direct Runtime Upgrade run `34479326097` (a safe
+  pre-mutation abort) failed at its own scheduler-provenance stage with
+  the exact live output:
+  ```
+  ERROR: this account's crontab invokes (or references)
+  run_collection_cycle_safe.sh in an unsupported/unrecognized form --
+  refusing to guess, failing closed (*/30 * * * * cd /opt/jobpulse &&
+  flock -n /tmp/jobpulse_collection_cycle.lock
+  ./scripts/run_collection_cycle_safe.sh)
+  ```
+  proving the canonical launcher lives in **this SSH-authenticated
+  account's own crontab** (the label `scan_cron_source` uses for a bare
+  `crontab -l` read) -- not `/etc/crontab`, not root's crontab, not a
+  systemd unit.
+- The later successful run `34679402811` completed the full
+  scheduler-provenance scan and reported:
+  ```
+  All 1 discovered launcher(s) agree: ROOT=/opt/jobpulse, effective
+  internal lock=/opt/jobpulse/state/run_collection_cycle.lock, outer
+  scheduler lock=/tmp/jobpulse_collection_cycle.lock
+  ```
+  proving exactly ONE launcher exists anywhere (no other source
+  declared one) and confirming both lock paths.
+
+The Phase 4H recovery runner now, before acquiring either lock:
+
+1. **Re-proves the exact canonical launcher in this account's own
+   crontab.** Bounded (`timeout 5 crontab -l`), read-only, never
+   `crontab -e`/install/delete. The crontab output is required to
+   contain the historically proven canonical line
+   (`*/30 * * * * cd /opt/jobpulse && flock -n
+   /tmp/jobpulse_collection_cycle.lock
+   ./scripts/run_collection_cycle_safe.sh`) using exact fixed-string,
+   whole-line matching (`grep -Fx`) exactly once, and the wrapper name
+   must appear on exactly one line total. Because historical evidence
+   proves this account HAS a scheduled launcher, an unreadable crontab
+   or "no crontab for this account" is now treated as a FAILURE, not an
+   acceptable empty state -- the inverse of how the root-crontab check
+   below treats the same message. Any reference to
+   `JOBPULSE_COLLECTION_ROOT` or `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH`
+   in this crontab also fails closed, since historical evidence never
+   proved an environment-variable override, only the literal launcher
+   line.
+2. **Proves no alternate scheduler source has since started declaring a
+   launcher.** Run `34679402811` proved exactly one launcher exists
+   anywhere, so `/etc/crontab`, every regular file directly under
+   `/etc/cron.d`, root's crontab (`timeout 5 sudo -n crontab -u root
+   -l` -- non-interactive, never prompts, never installs a sudo rule;
+   `sudo -n`'s own "no crontab for root" is the accepted default state
+   here, since root having no crontab was never expected to change),
+   and every systemd unit whose fragment/drop-in files mention the
+   wrapper (via the same narrow `systemctl show`/`cat` discovery
+   `production-direct-runtime-upgrade.yml` already uses) are each
+   checked, read-only and bounded, for ANY mention of
+   `run_collection_cycle_safe.sh`, `JOBPULSE_COLLECTION_ROOT`, or
+   `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH`. This is deliberately an
+   absence-only check -- it never parses launcher grammar from these
+   other sources (that full parser lives only in the general-purpose
+   upgrade runner) -- any match at all is treated as unexpected drift
+   and fails closed. Only bounded status/labels are ever printed; full
+   file contents are never dumped.
+3. **Proves the effective internal lock path.** `/opt/jobpulse/.collection.env`
+   is read as DATA ONLY (never sourced/`eval`'d/`bash -c`'d). Absence of
+   a `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH` assignment is accepted (the
+   wrapper's own source default already resolves to
+   `/opt/jobpulse/state/run_collection_cycle.lock`, and run
+   `34679402811` proved that is the live effective value); an assignment
+   present must equal that exact literal path, using the same restricted
+   literal-value grammar principles as the upgrade runner's parser
+   (quoted-or-bare literals only, no `$`/backtick/expansion, no
+   duplicate conflicting assignments) but scoped narrowly to this one
+   variable.
+
+Required order, all before the one authorized mutation: prove the
+own-crontab launcher -> prove no alternate-source drift -> prove the
+effective internal lock path -> acquire the outer lock -> acquire the
+internal lock -> `docker top` active-collector check -> `git reset
+--hard`. None of these checks execute, source, or otherwise run the
+wrapper script, and none of them can mutate cron/systemd state (no
+`crontab -e`, no `systemctl start/stop/restart/enable/disable`, no
+`/etc/cron*` writes).
+
+### Deferred to a separate, later PR
+
+Phase 4H is a recovery-only change. It does NOT modify
+`.github/workflows/production-direct-runtime-upgrade.yml`. Three known
+issues in that runner are intentionally left for a follow-up PR after
+the production baseline is confirmed recovered:
+
+1. The rollback Docker-health verification race identified above
+   (recreate-then-verify happens faster than one healthcheck interval).
+2. The live-frontend activation/provenance validation behavior that
+   produced the Phase 4E marker-check failure in the first place.
+3. Safely normalizing a rollback `Config.Image` alias back to a
+   standard GHCR reference when a future rollback leaves one behind.
+
+### Not authorized by Phase 4H
+
+Phase 4H is code/test/docs only -- it does not dispatch the new
+recovery runner, does not dispatch Production Direct Runtime Upgrade,
+Production Runtime Diagnostic, Production Neutral Canary, Deploy
+Production, or Build JobPulse API Image, and it does not SSH to or
+mutate production. Production remains in the `CASE_B_GIT_TARGET_API_OLD`
+split state described above until a separately authorized dispatch of
+`production-split-release-recovery.yml` is made.
+
