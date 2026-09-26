@@ -3451,3 +3451,309 @@ above, with the API `Config.Image` rollback alias intentionally left
 unnormalized, until a separately authorized dispatch or operation is
 made.
 
+## Phase 4M: API reference normalization runner
+
+By this point the chain of prior phases has left production in a
+well-understood, purely cosmetic state of debt:
+
+- **Phase 4K** (Production Split-Release Recovery run `36238209271`)
+  restored the functional f476 baseline: production git is
+  `f4765f857355c6543f68cea0e481b7f20a917147`, the API is running the
+  correct old (f476) image bytes, healthy, `restart_count=0`.
+- **Phase 4L** repaired the general-purpose
+  `production-direct-runtime-upgrade.yml` rollback path (real
+  wall-clock bounds, git-rollback eligibility matrix, exact-SHA
+  frontend convergence) so the *next* upgrade/rollback on that runner
+  behaves correctly -- it did not touch production itself.
+- The **only** remaining debt is that the API container's
+  `Config.Image` is still the temporary local rollback alias
+  `jobpulse-api-rollback:bccbbd997ee8-1427495` that Phase 4E's rollback
+  left behind. The underlying image bytes are already exactly correct
+  (`sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`)
+  -- this is a reference-labeling problem, not a code or data problem.
+
+`.github/workflows/production-api-reference-normalization.yml` is a
+dedicated, one-time, incident-cleanup runner (`workflow_dispatch` only,
+confirmation token `NORMALIZE_F476_API_REFERENCE`) that closes this gap
+by recreating **only** the api container so Docker records its
+`Config.Image` as the canonical
+`ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147`
+reference -- while requiring the underlying image ID to remain **the
+exact same bytes** as before. There is no code/image upgrade and no git
+change; the container itself must still be recreated with
+`--force-recreate` because Docker stores `Config.Image` on the
+container's own configuration, not something editable in place. This
+PR adds and tests the runner only -- **it does not execute it**;
+production remains exactly on the Phase 4K/4L baseline, `Config.Image`
+alias included, until a separately authorized dispatch.
+
+### Design
+
+- **Shares** `production-direct-runtime-upgrade.yml`'s concurrency
+  group (`jobpulse-production-direct-runtime-upgrade`) since both
+  mutate the same production API runtime -- the two runners can never
+  overlap.
+- **Pinned one-time constants**: `EXPECTED_PRODUCTION_SHA` (f476),
+  `EXPECTED_CURRENT_CONFIG_IMAGE` (the rollback alias),
+  `CANONICAL_IMAGE` (the target GHCR reference),
+  `EXPECTED_IMAGE_ID`, and the exact API/DB/frontend/Tor container IDs
+  Phase 4K proved. Any drift from these exact values fails closed
+  before mutation.
+- **Canonical image provenance**: the remote host pulls
+  `CANONICAL_IMAGE` (isolated temporary `DOCKER_CONFIG`, optional
+  bounded non-interactive GHCR login via the same stdin-only token
+  model as `production-direct-runtime-upgrade.yml` -- anonymous public
+  pull is also accepted) and requires
+  `docker image inspect "$CANONICAL_IMAGE" --format '{{.Id}}'` to equal
+  `EXPECTED_IMAGE_ID` **exactly**, before the running container is ever
+  touched. If the registry ever resolves that tag to different bytes,
+  the run fails closed pre-mutation -- this is the runner's central
+  safety property, since a canonical-reference push that silently
+  moved would otherwise turn a "reference-only" operation into a real
+  byte upgrade.
+- **Scheduler provenance is reused, not reinvented**: the crontab/
+  systemd discovery section (own-crontab exact-line proof, `/etc/
+  crontab` and `/etc/cron.d` absence-only drift checks, bounded root-
+  crontab check, the Phase 4J semantic `*@.service` template-vs-
+  concrete-vs-loaded-unit systemd model, and the `.collection.env`
+  data-only internal-lock provenance) is copied as literally as
+  practical from the already-reviewed
+  `production-split-release-recovery.yml` version -- see
+  `tests/test_production_api_reference_normalization_workflow.py`'s
+  parity test, which diffs the two sections (modulo blank lines) and
+  fails if they ever drift apart. The same two collection-cycle locks
+  (outer then internal, both non-blocking) are acquired after
+  provenance passes and held across mutation, validation, and any
+  rollback, released only in the `EXIT` trap.
+- **The running container's direct/no-Tor state is not enough on its
+  own**: the pre-mutation preconditions above check the *currently
+  running* API container's `SEARCH_TRANSPORT`/`TOR_ENABLED`, but the
+  candidate api container is recreated by `docker compose ... up
+  --force-recreate`, which reads the **Compose file + `.env`/
+  `.api_keys.env`/`.admin.env` on the host**, not the old running
+  container's own environment. Those two sources can silently diverge
+  -- the running API could be direct today while `.env` on disk
+  already carries `SEARCH_TRANSPORT=proxy` -- and `--force-recreate`
+  would then create the candidate api container with the drifted
+  value. The prior version of this runner only checked the candidate's
+  effective Compose **image** and `TOR_ENABLED`, not
+  `SEARCH_TRANSPORT`, so this exact drift would have been caught only
+  *after* mutation, by `wait_for_api_convergence()` -- too late to
+  avoid the unintended recreation. This runner therefore separately
+  renders and inspects **both** effective Compose configurations
+  before ever touching the running container:
+  - **Effective CURRENT config**
+    (`JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker
+    compose ... config`) must resolve the api service's image to
+    exactly the pinned rollback alias, and its `SEARCH_TRANSPORT` must
+    be unset or `direct` (never `proxy` or any other value). This
+    matters because `rollback_api()` recreates the api service from
+    these SAME Compose/env inputs -- if they were already unsafe, a
+    rollback would silently reproduce the drift.
+  - **Effective CANDIDATE config**
+    (`JOBPULSE_API_IMAGE="$CANONICAL_IMAGE" docker compose ...
+    config`) must resolve the api service's image to exactly the
+    canonical GHCR reference, and its `SEARCH_TRANSPORT` must likewise
+    be unset or `direct` -- this is the primary blocker correction:
+    the candidate's effective `SEARCH_TRANSPORT` is now checked
+    *before* `--force-recreate`, not only after.
+  - Both effective configs must additionally have `TOR_ENABLED=false`
+    -- checking both (not candidate-only) demonstrates that changing
+    `JOBPULSE_API_IMAGE` never alters the direct/no-Tor safety state.
+  - **Reference-only Compose parity**: the current and candidate
+    effective configs are each normalized (the api service's `image:`
+    line only is replaced with a deterministic placeholder,
+    api-block-aware, never a blind/global string replace) and hashed;
+    the two SHA-256 values must be equal. This is the concrete proof
+    that the only semantic difference between the two configurations
+    is the api image reference -- preventing `.env` drift from turning
+    a reference-only recreation into an unintended transport or other
+    configuration change, and proving that rollback's recreation
+    (which reuses the current config's inputs) cannot unexpectedly
+    inherit a newly-drifted value that only the candidate side would
+    otherwise have carried. Only narrow evidence (the two image
+    fields, the two `SEARCH_TRANSPORT`/`TOR_ENABLED` classifications,
+    and the two normalized SHA-256 values) is ever printed -- never
+    the full rendered Compose config.
+  - **Base Compose service-set proof**: a read-only
+    `docker compose ... config --services` must resolve to exactly
+    `api`, `db`, `frontend` before mutation. Tor is deliberately not
+    asserted here -- it is managed by a separate overlay and already
+    proven independently via the pinned running Tor container
+    invariant elsewhere in this runner.
+  - **Runtime-vs-effective-CURRENT environment equivalence (the final
+    independent-review blocker correction)**: CURRENT-vs-CANDIDATE
+    Compose parity, by itself, is **not** enough. The production `api`
+    service consumes three `env_file` inputs (`.api_keys.env`,
+    `/opt/jobpulse/.admin.env`, `.env`), and the *running* container
+    may have been created earlier from older resolved values than
+    what Compose would produce today. If both the effective CURRENT
+    and effective CANDIDATE configs already agree on a value that
+    differs from what the running container actually has,
+    current-vs-candidate parity passes while `--force-recreate` still
+    silently changes that variable -- a real configuration change,
+    not a reference-only one. This runner therefore also proves the
+    *running* container's actual environment against what Compose
+    would produce for CURRENT, **including the immutable f476 image's
+    own default `Env`** (read via
+    `docker image inspect "$EXPECTED_IMAGE_ID" --format
+    '{{json .Config.Env}}'` -- Compose values win where both define a
+    key), never comparing runtime `.Config.Env` directly against
+    `services.api.environment` alone. The comparison renders the
+    effective CURRENT config as JSON
+    (`docker compose ... config --format json`, which fails closed if
+    unsupported -- it never falls back to an unsafe YAML-value parser
+    for this specific proof) and reads both Envs as JSON via Python
+    stdlib (`json`+`hashlib` only, no PyYAML): each side is
+    canonicalized as a `sort_keys=True`, compact-separator JSON object
+    and SHA-256-hashed, and only the two hashes (plus key counts) are
+    ever compared or logged -- **no environment value, from either
+    side, is ever printed**. This is deliberately never based on
+    `docker compose config --hash`/the `com.docker.compose.config-hash`
+    label, which has had version-specific mismatch behavior with
+    `env_file`. See
+    `tests/test_production_api_reference_normalization_workflow.py`'s
+    N25-N29 regressions for the exact failure shapes this catches
+    (env_file drift agreed by both current and candidate but not yet
+    applied to the running container; missing/extra runtime
+    variables; a value-only drift that must never leak through
+    stderr).
+- **Final pre-mutation revalidation**: immediately before mutation, the
+  ENTIRE reference-only-inputs proof above -- not merely a narrower
+  candidate-only recheck -- is consolidated into one reusable function,
+  `prove_reference_only_inputs()`, and called a **second time**,
+  immediately adjacent to the mutation marker: effective CURRENT/
+  CANDIDATE image identity, `SEARCH_TRANSPORT`, `TOR_ENABLED`,
+  normalized current/candidate Compose parity, the base service-set
+  proof, and the runtime-vs-effective-CURRENT environment equivalence
+  proof are all freshly re-rendered and re-checked, never only relying
+  on the earlier preflight render. (The original, separately-reviewed
+  `REVALIDATE_*` re-checks of git SHA/container IDs/compose file hash/
+  the *running* container's own `SEARCH_TRANSPORT`/`TOR_ENABLED` remain
+  unchanged and run immediately before this second call.) Calling the
+  same function at both sites, rather than maintaining two hand-written
+  copies of the same checks, is what keeps the preflight and the final
+  gate from ever drifting apart.
+- **The only mutation**: `JOBPULSE_API_IMAGE="$CANONICAL_IMAGE" docker
+  compose ... up -d --no-build --no-deps --force-recreate api`. `db`,
+  `frontend`, and `tor` are never recreated/restarted; production git
+  is never touched (no `git reset`/`checkout`/`pull`/`merge` anywhere
+  in this runner).
+- **Convergence reuses Phase 4L's wall-clock model exactly**: a shared
+  `wait_for_api_convergence()` helper enforces the same two independent
+  bounds (a 45-attempt ceiling *and* an explicit `SECONDS`-based ~90s
+  wall-clock deadline, checked before every iteration's probe) with the
+  same tightened per-command timeouts (health curls:
+  `--connect-timeout 1 --max-time 2`; the three running/health/image-id
+  reads consolidated into one `timeout 3`-wrapped `docker inspect`).
+  Docker health `starting` is tolerated within the bound. After
+  convergence, the same helper additionally requires the container's
+  `Config.Image` to equal a caller-supplied expected reference and
+  re-proves the direct/no-Tor invariant -- used for both candidate
+  normalization (`expected=$CANONICAL_IMAGE`) and rollback
+  (`expected=$EXPECTED_CURRENT_CONFIG_IMAGE`).
+- **Normalization-specific success conditions**: beyond convergence,
+  the new API container ID must differ from the pre-run ID (proving
+  `--force-recreate` actually recreated it), `restart_count` must be
+  `0`, and DB/frontend/Tor container IDs, image IDs, restart counts,
+  health, and the live frontend's exact f476 SHA-256 must all remain
+  completely unchanged. Production git must still be exactly f476 with
+  a clean tracked worktree.
+
+### Rollback design
+
+The underlying image bytes never change during this runner (the same
+`EXPECTED_IMAGE_ID` before and after), so rollback never needs a second
+pull -- it only needs to point the OLD logical reference back at those
+same bytes (`docker tag "$EXPECTED_IMAGE_ID"
+"$EXPECTED_CURRENT_CONFIG_IMAGE"`) and recreate the api service with
+that reference, using the identical `wait_for_api_convergence()`
+helper. There is no git rollback path at all -- this workflow never
+touches git, so there is nothing to revert on that axis. **A confirmed
+rollback does not make the workflow succeed**: the normalization
+attempt itself still failed, and the run concludes non-zero with the
+explicit classification
+`NORMALIZATION_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED`. If
+rollback itself cannot converge, the runner does not attempt a second
+rollback -- it emits narrow final evidence (container ID, `Config.Image`,
+image ID, running/health/both health paths, `SEARCH_TRANSPORT`/
+`TOR_ENABLED`, DB/frontend/Tor IDs) for manual operator review and exits
+non-zero.
+
+**Rollback FULL-input drift guard.** `rollback_api()` recreates the api
+service from the exact SAME production Compose file and CURRENT
+Compose/env inputs that the final pre-mutation gate already proved
+safe -- which is also, therefore, the proof that those inputs describe
+the actual pre-normalization runtime state. The collection-cycle locks
+remain held across mutation and rollback, but they only prevent a
+*concurrent collection cycle* -- they do **not** prevent a human/process
+from editing the production Compose file itself, or
+`.env`/`.api_keys.env`/`.admin.env`, on the host in between. Before ever
+retagging or recreating, `rollback_api()` therefore requires **all
+three** of the following to hold, in this order, re-checked fresh
+(never merely assumed from the earlier preflight):
+
+1. **Static Compose-file provenance** (new in this correction): a fresh
+   `sha256sum "$COMPOSE_FILE"` must still equal the immutable pinned
+   `COMPOSE_SHA256` -- proving the reviewed api/db/frontend service
+   *definitions* on disk did not change at all. Classified
+   `rollback_static_compose_provenance=confirmed` on success.
+2. **Effective CURRENT Compose config identity** (new in this
+   correction): the effective CURRENT config is re-rendered fresh
+   (`JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker
+   compose ... config`), hashed the same byte-preserving way as the
+   final gate (`printf '%s\n' ... | sha256sum`), and must equal the
+   hash the final gate snapshotted
+   (`FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256`). This catches drift the
+   semantic environment hash below cannot see -- a resolved/
+   interpolated **non-environment** property (restart policy, volume
+   definition, command, port mapping, ...) changing after the final
+   gate. Classified `rollback_effective_current_config=unchanged` on
+   success.
+3. **Semantic effective CURRENT environment** (pre-existing guard,
+   unchanged): re-renders effective CURRENT and recomputes its expected
+   semantic environment hash, requiring it to equal the hash the final
+   gate snapshotted (`FINAL_EXPECTED_ENV_SHA256`) -- reusing the same
+   `render_current_env_json_pair()`/`compute_env_parity_hashes()`
+   helpers the main proof uses, never a second hand-written
+   implementation. Classified
+   `rollback_effective_current_environment=unchanged` on success.
+
+Static Compose-file provenance and the effective-config identity check
+are deliberately kept as two separate, explicit checks rather than
+relying on the effective-config hash alone: the static check proves the
+reviewed service *definition* itself did not change, while the
+effective-config check proves its resolved/interpolated *output* is
+still identical to what the final gate saw -- either one failing is
+independently sufficient to abort.
+
+If **any** of the three checks fails (or fails to render/hash at all),
+rollback is refused outright -- classified `ROLLBACK_ABORTED_INPUT_DRIFT`,
+zero rollback `docker tag`/`docker compose up` calls -- rather than
+blindly recreating the api container with unproven, possibly-drifted
+configuration. Production is left in its post-candidate-failure state
+for manual operator review, and (as always) no second rollback is
+attempted. Only hashes (never the full rendered config or any
+environment value) are ever logged. See
+`tests/test_production_api_reference_normalization_workflow.py`'s N31
+(semantic environment drift), N32 (static Compose-file drift), and N33
+(resolved non-environment effective-config drift) regressions for the
+exact failure shapes each check independently catches.
+
+### What Phase 4M does not do
+
+This PR is code/test/docs only. It does not dispatch Production API
+Reference Normalization, Production Direct Runtime Upgrade, Production
+Split-Release Recovery, Production Runtime Diagnostic, Production
+Neutral Canary, Deploy Production, or Build JobPulse API Image, and it
+does not SSH to or mutate production. It does not delete or clean up
+any old image tags on a successful run (out of scope -- the only goal
+is the running container's `Config.Image`). Running the Production
+Runtime Diagnostic after a real normalization is deliberately left as a
+separate, later, reviewed step -- not automated by this runner --
+since the diagnostic already expects production git at f476 and the
+API `Config.Image` at the canonical GHCR reference once normalization
+has actually run. Production remains on the exact Phase 4K/4L baseline,
+`Config.Image` alias included, until a separately authorized dispatch
+of this runner is made.
+
