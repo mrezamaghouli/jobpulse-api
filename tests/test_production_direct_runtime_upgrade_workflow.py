@@ -1158,7 +1158,10 @@ def test_bounded_attempt_loops_use_seq_not_infinite(remote_script):
     health_check_blocks = re.findall(r"for attempt in \$\(seq 1 (\d+)\); do", remote_script)
     assert health_check_blocks, "no bounded attempt loops found"
     for bound in health_check_blocks:
-        assert int(bound) <= 30
+        # Phase 4L: rollback_api's convergence loop uses 45 attempts x 2s
+        # (~90s) to span multiple 20s Docker healthcheck intervals -- every
+        # other bounded loop in this runner remains well under that.
+        assert int(bound) <= 45
 
 
 def test_health_checks_occur_both_pre_and_post_git_reset(remote_script):
@@ -1393,7 +1396,7 @@ def test_rollback_git_targets_expected_current_sha(remote_script):
 
 def test_rollback_api_verifies_image_id_matches_previous(remote_script):
     func_body = remote_script.split("rollback_api() {")[1].split("\n          }")[0]
-    assert '"$rb_image_id" != "$API_IMAGE_ID_BEFORE"' in func_body
+    assert '"$rb_image_id" = "$API_IMAGE_ID_BEFORE"' in func_body
 
 
 def test_rollback_api_reproves_direct_and_no_tor_invariant(remote_script):
@@ -1429,7 +1432,7 @@ def test_rollback_api_includes_bounded_nginx_health_check(remote_script):
     func_body = remote_script.split("rollback_api() {")[1].split("\n          }")[0]
     assert "http://127.0.0.1/api/health" in func_body
     assert "rb_nginx_healthy" in func_body
-    assert '"$rb_nginx_healthy" != "true"' in func_body
+    assert '"$rb_nginx_healthy" = "true"' in func_body
 
 
 def test_no_retry_of_candidate_no_second_deployment_attempt(remote_script):
@@ -1687,8 +1690,11 @@ def test_tor_enabled_allowlist_entry_is_narrow():
 # real PATH -- fully offline, no SSH/sudo/network/production contact.
 # =====================================================================
 
+import base64
+import hashlib
 import os
 import shlex
+import shutil
 import subprocess as sp
 
 
@@ -2313,13 +2319,14 @@ def test_db_health_before_uses_missing_key_safe_health_lookup(remote_script):
 
 
 def test_api_only_health_lookups_remain_intentionally_strict(remote_script):
-    """The three jobpulse-api-prod-only health checks (rollback, before,
-    candidate) were deliberately left unchanged -- the api service always
-    declares a compose HEALTHCHECK, so requiring the strict `healthy`
-    template there is correct, not a bug."""
+    """The four jobpulse-api-prod-only health checks (before, candidate,
+    rollback convergence loop, Phase 4L secondary classification) are all
+    deliberately strict -- the api service always declares a compose
+    HEALTHCHECK, so requiring the strict `healthy` template there is
+    correct, not a bug."""
     strict_snippet = "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
     occurrences = remote_script.count(strict_snippet)
-    assert occurrences == 3, occurrences
+    assert occurrences == 4, occurrences
 
 
 def _run_capture_container_state(capture_container_state_source, harness_bin, tmp_path, mode: str):
@@ -3170,19 +3177,80 @@ def test_post_reset_provider_hash_checked_against_target(remote_script):
     assert '"$POST_RESET_PROVIDER_SHA256" != "$TARGET_PROVIDER_SHA256"' in remote_script
 
 
+def _wait_for_live_frontend_sha_source(remote_script: str) -> str:
+    # Brace-depth extraction (not a fixed-indentation string split) --
+    # robust regardless of how much common leading whitespace YAML's
+    # block-scalar dedenting happens to strip.
+    return _extract_bash_function(remote_script, "wait_for_live_frontend_sha")
+
+
 def test_live_frontend_validation_exists_and_is_localhost_only(remote_script):
-    assert "curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ 2>/dev/null" in remote_script
-    assert "grep -qF 'Open Poster Profile'" in remote_script
+    func_body = _wait_for_live_frontend_sha_source(remote_script)
+    assert (
+        "curl --connect-timeout 1 --max-time 2 -fsS -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o \"$tmp\" http://127.0.0.1/ 2>/dev/null"
+        in func_body
+    )
     # No external domain is ever contacted by this check.
     for forbidden in ("linkedin.com", "http://check.torproject.org", "https://"):
-        for line in remote_script.splitlines():
-            if "LIVE_FRONTEND" in line:
-                assert forbidden not in line, line
+        assert forbidden not in func_body, forbidden
+    # The main-flow call site validates against the exact target SHA; the
+    # Phase 4B marker remains only an earlier release-intent assertion
+    # against the immutable git object (checked separately, well before
+    # SSH), never the final live-serving proof.
+    assert 'wait_for_live_frontend_sha "$TARGET_FRONTEND_SHA256"' in remote_script
 
 
 def test_live_frontend_validation_bounded_not_infinite(remote_script):
-    live_block = remote_script[remote_script.index("live frontend validation") : remote_script.index("frontend container invariant")]
-    assert "for attempt in $(seq 1 15)" in live_block
+    func_body = _wait_for_live_frontend_sha_source(remote_script)
+    assert "for attempt in $(seq 1 15)" in func_body
+    assert "local deadline=$((SECONDS + 30))" in func_body
+
+
+# =====================================================================
+# Phase 4L correction: wait_for_live_frontend_sha() needs the same real
+# wall-clock fix as rollback_api() -- 15 attempts x 2s ("~30s") also
+# ignored curl's own runtime; a slow/failing HTTP response could make
+# the real bound much larger.
+# =====================================================================
+
+_FE_NOMINAL_DEADLINE_SECONDS = 30
+_FE_CURL_MAX_TIME = 2
+_FE_TRAILING_SLEEP = 2
+_FE_THEORETICAL_MAXIMUM = _FE_NOMINAL_DEADLINE_SECONDS + _FE_CURL_MAX_TIME + _FE_TRAILING_SLEEP
+
+
+def test_frontend_sha_wall_clock_regression_attempt_count_times_sleep_is_not_real_bound(wait_for_live_frontend_sha_source):
+    """Named regression test: `15 attempts * 2s = ~30s` ignored curl's
+    own runtime (--max-time 5 could make repeated slow/failing
+    responses consume far more than 30s). Fixed the same way as
+    rollback_api(): an explicit wall-clock deadline checked before every
+    iteration's probe, plus a tightened per-request timeout."""
+    assert "local deadline=$((SECONDS + 30))" in wait_for_live_frontend_sha_source
+    deadline_check_idx = wait_for_live_frontend_sha_source.index('if [ "$SECONDS" -ge "$deadline" ]; then')
+    loop_idx = wait_for_live_frontend_sha_source.index("for attempt in $(seq 1 15); do")
+    break_idx = wait_for_live_frontend_sha_source.index("break", deadline_check_idx)
+    curl_idx = wait_for_live_frontend_sha_source.index("curl --connect-timeout 1 --max-time 2")
+    assert loop_idx < deadline_check_idx < break_idx < curl_idx
+
+
+def test_frontend_sha_curl_is_tightly_bounded_not_left_at_five_seconds(wait_for_live_frontend_sha_source):
+    assert f"curl --connect-timeout 1 --max-time {_FE_CURL_MAX_TIME}" in wait_for_live_frontend_sha_source
+    assert "--max-time 5" not in wait_for_live_frontend_sha_source
+
+
+def test_frontend_sha_failed_hash_never_treated_as_match(wait_for_live_frontend_sha_source):
+    """A failed/unreadable sha256sum must never be silently compared as
+    if it were a valid hash -- it must fall back to empty (never a
+    match) and let the bounded loop continue."""
+    assert 'got_sha="$(sha256sum "$tmp" 2>/dev/null | awk' in wait_for_live_frontend_sha_source
+    assert '|| got_sha=""' in wait_for_live_frontend_sha_source
+    assert '[ -n "$got_sha" ] && [ "$got_sha" = "$expected_sha" ]' in wait_for_live_frontend_sha_source
+
+
+def test_frontend_sha_theoretical_maximum_documented_and_reasonable(wait_for_live_frontend_sha_source):
+    assert _FE_THEORETICAL_MAXIMUM == 34
+    assert _FE_THEORETICAL_MAXIMUM <= 40
+    assert str(_FE_NOMINAL_DEADLINE_SECONDS) in wait_for_live_frontend_sha_source
 
 
 def test_frontend_container_invariant_rechecked_after_reset(remote_script):
@@ -3202,7 +3270,10 @@ def test_post_reset_checks_ordered_after_reset_and_before_success(remote_script)
     git_mutation_started_index = remote_script.index("GIT_MUTATION_STARTED=true")
     frontend_hash_index = remote_script.index('"$POST_RESET_FRONTEND_SHA256" != "$TARGET_FRONTEND_SHA256"')
     provider_hash_index = remote_script.index('"$POST_RESET_PROVIDER_SHA256" != "$TARGET_PROVIDER_SHA256"')
-    live_frontend_index = remote_script.index('"$LIVE_FRONTEND_OK" != "true"')
+    # The function definition itself lives much earlier in the script
+    # (alongside the other rollback helpers); what must fall inside the
+    # rollback-protected window is the CALL SITE in the main flow.
+    live_frontend_index = remote_script.index('wait_for_live_frontend_sha "$TARGET_FRONTEND_SHA256"')
     frontend_invariant_index = remote_script.index('"$FRONTEND_STATE_AFTER_RESET" != "$FRONTEND_STATE_BEFORE"')
     final_provider_proof_index = remote_script.index('"$FINAL_PROVIDER_CHECK" != "PROVIDER_RUNTIME_PROOF_OK"')
     success_index = remote_script.index("WORKFLOW_SUCCESS=true")
@@ -3291,15 +3362,18 @@ def test_rollback_git_verifies_provider_hash(remote_script):
 
 def test_rollback_git_verifies_live_frontend_serves_restored_content(remote_script):
     func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
-    assert "rb_frontend_http_ok" in func_body
-    assert 'if [ "$rb_frontend_http_ok" != "true" ]; then' in func_body
+    # Phase 4L: rollback_git now requires exact-SHA convergence against
+    # the old expected frontend content via the shared helper, not merely
+    # an HTTP 200 probe.
+    assert 'if ! wait_for_live_frontend_sha "$EXPECTED_CURRENT_FRONTEND_SHA256"; then' in func_body
+    assert "return 1" in func_body.split('wait_for_live_frontend_sha "$EXPECTED_CURRENT_FRONTEND_SHA256"')[1].split("fi")[0]
 
 
 def test_rollback_git_hash_checks_precede_http_probe(remote_script):
     func_body = remote_script.split("rollback_git() {")[1].split("\n          }")[0]
     frontend_hash_idx = func_body.index("rb_frontend_sha256=")
     provider_hash_idx = func_body.index("rb_provider_sha256=")
-    http_probe_idx = func_body.index("rb_frontend_http_ok")
+    http_probe_idx = func_body.index('wait_for_live_frontend_sha "$EXPECTED_CURRENT_FRONTEND_SHA256"')
     assert frontend_hash_idx < provider_hash_idx < http_probe_idx
 
 
@@ -3373,7 +3447,15 @@ def test_no_rate_limit_or_proxy_behavior_changed(remote_script):
 
 @pytest.fixture(scope="module")
 def rollback_git_source(remote_script) -> str:
-    return _extract_bash_function(remote_script, "rollback_git")
+    # rollback_git() now calls the shared wait_for_live_frontend_sha()
+    # helper (Phase 4L) -- both are extracted verbatim so the ACTUAL
+    # function bodies run together, never a Python reimplementation of
+    # either.
+    return (
+        _extract_bash_function(remote_script, "wait_for_live_frontend_sha")
+        + "\n"
+        + _extract_bash_function(remote_script, "rollback_git")
+    )
 
 
 def _fake_git_for_rollback(bin_dir, head_after_reset: str):
@@ -3388,50 +3470,96 @@ def _fake_git_for_rollback(bin_dir, head_after_reset: str):
     _write_fake_executable(bin_dir, "git", body)
 
 
+_REAL_SHA256SUM = shutil.which("sha256sum") or "/usr/bin/sha256sum"
+_OLD_FRONTEND_BODY = b"<html>OLD FRONTEND CONTENT (Phase 4L rollback_git fixture)</html>\n"
+_OLD_FRONTEND_BODY_SHA256 = hashlib.sha256(_OLD_FRONTEND_BODY).hexdigest()
+_WRONG_FRONTEND_BODY = b"<html>SOME OTHER, WRONG CONTENT</html>\n"
+
+
 def _fake_sha256sum_for_rollback(bin_dir, frontend_hash: str, provider_hash: str):
+    # `frontend/index.html`/the provider path are faked with literal
+    # test-controlled values (the pre-existing host-file-provenance
+    # check). Any OTHER path -- in practice only the temp file
+    # wait_for_live_frontend_sha() downloads curl's response body into --
+    # falls through to the REAL sha256sum so the live-HTTP-body SHA check
+    # reflects whatever bytes the fake curl below actually wrote, never a
+    # fixed placeholder.
     body = (
         'case "$1" in\n'
         f'  frontend/index.html) echo {shlex.quote(frontend_hash)}"  $1" ;;\n'
         f'  scripts/providers/linkedin_browser_provider.py) echo {shlex.quote(provider_hash)}"  $1" ;;\n'
-        '  *) echo "0000000000000000000000000000000000000000000000000000000000000000  $1" ;;\n'
+        f'  *) exec {shlex.quote(_REAL_SHA256SUM)} "$1" ;;\n'
         'esac\n'
     )
     _write_fake_executable(bin_dir, "sha256sum", body)
 
 
-def _fake_curl_for_rollback(bin_dir, succeed: bool):
-    _write_fake_executable(bin_dir, "curl", "exit 0\n" if succeed else "exit 22\n")
+def _fake_curl_for_rollback(bin_dir, succeed: bool, body_bytes: bytes = _OLD_FRONTEND_BODY):
+    """Mirrors real curl's `-o <file>` behavior: on success, writes
+    `body_bytes` verbatim to whatever path follows `-o` in argv (so
+    wait_for_live_frontend_sha's real sha256sum call downstream hashes
+    genuine bytes, never a hash reached through `BODY="$(curl ...)"`
+    command substitution)."""
+    if succeed:
+        content_b64 = base64.b64encode(body_bytes).decode()
+        body = (
+            'out=""\n'
+            'prev=""\n'
+            'for a in "$@"; do\n'
+            '  if [ "$prev" = "-o" ]; then out="$a"; fi\n'
+            '  prev="$a"\n'
+            'done\n'
+            f'printf %s {shlex.quote(content_b64)} | base64 -d > "$out"\n'
+            'exit 0\n'
+        )
+    else:
+        body = "exit 22\n"
+    _write_fake_executable(bin_dir, "curl", body)
 
 
 def _fake_instant_sleep(bin_dir):
     _write_fake_executable(bin_dir, "sleep", "exit 0\n")
 
 
-def _run_rollback_git(rollback_git_source, harness_bin, tmp_path, *, frontend_hash, provider_hash, curl_succeeds, head_after_reset="f4765f857355c6543f68cea0e481b7f20a917147"):
+def _run_rollback_git(
+    rollback_git_source,
+    harness_bin,
+    tmp_path,
+    *,
+    frontend_hash,
+    provider_hash,
+    curl_succeeds,
+    expected_frontend_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    live_body=_OLD_FRONTEND_BODY,
+    head_after_reset="f4765f857355c6543f68cea0e481b7f20a917147",
+):
     fake_bin = tmp_path / "fake_bin"
     fake_bin.mkdir()
     _fake_git_for_rollback(fake_bin, head_after_reset)
     _fake_sha256sum_for_rollback(fake_bin, frontend_hash, provider_hash)
-    _fake_curl_for_rollback(fake_bin, curl_succeeds)
+    _fake_curl_for_rollback(fake_bin, curl_succeeds, body_bytes=live_body)
     _fake_instant_sleep(fake_bin)
 
     body = (
         f'EXPECTED_CURRENT_SHA={shlex.quote(head_after_reset)}\n'
-        'EXPECTED_CURRENT_FRONTEND_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        f'EXPECTED_CURRENT_FRONTEND_SHA256={shlex.quote(expected_frontend_sha256)}\n'
         'EXPECTED_CURRENT_PROVIDER_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\n'
         'if rollback_git; then echo ROLLBACK_GIT_RESULT=OK; else echo ROLLBACK_GIT_RESULT=FAILED; fi\n'
     )
     return _run_harness(rollback_git_source, harness_bin, body, extra_path_dirs=(fake_bin,))
 
 
+# --- F6: rollback_git's live HTTP bytes converge to the expected old SHA -> succeeds
 def test_behavior_rollback_git_succeeds_when_everything_matches(rollback_git_source, harness_bin, tmp_path):
     result = _run_rollback_git(
         rollback_git_source,
         harness_bin,
         tmp_path,
-        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        frontend_hash=_OLD_FRONTEND_BODY_SHA256,
         provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         curl_succeeds=True,
+        expected_frontend_sha256=_OLD_FRONTEND_BODY_SHA256,
+        live_body=_OLD_FRONTEND_BODY,
     )
     assert "ROLLBACK_GIT_RESULT=OK" in result.stdout, result.stdout + result.stderr
 
@@ -3467,12 +3595,29 @@ def test_behavior_rollback_git_fails_closed_when_localhost_frontend_never_serves
         rollback_git_source,
         harness_bin,
         tmp_path,
-        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        frontend_hash=_OLD_FRONTEND_BODY_SHA256,
         provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         curl_succeeds=False,
+        expected_frontend_sha256=_OLD_FRONTEND_BODY_SHA256,
     )
     assert "ROLLBACK_GIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
-    assert "FATAL: post-rollback localhost frontend HTTP probe never succeeded" in result.stderr
+    assert "FATAL: live frontend localhost GET never succeeded within the bounded window" in result.stderr
+
+
+# --- F7: rollback_git's live HTTP always returns 200 but the wrong bytes forever -> bounded failure
+def test_behavior_rollback_git_fails_closed_when_live_sha_never_converges(rollback_git_source, harness_bin, tmp_path):
+    result = _run_rollback_git(
+        rollback_git_source,
+        harness_bin,
+        tmp_path,
+        frontend_hash=_OLD_FRONTEND_BODY_SHA256,
+        provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        curl_succeeds=True,
+        expected_frontend_sha256=_OLD_FRONTEND_BODY_SHA256,
+        live_body=_WRONG_FRONTEND_BODY,
+    )
+    assert "ROLLBACK_GIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: live frontend SHA-256 never converged to expected" in result.stderr
 
 
 def test_behavior_rollback_git_mutation_sentinels_untouched(rollback_git_source, harness_bin, tmp_path):
@@ -3483,9 +3628,10 @@ def test_behavior_rollback_git_mutation_sentinels_untouched(rollback_git_source,
         rollback_git_source,
         harness_bin,
         tmp_path,
-        frontend_hash="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        frontend_hash=_OLD_FRONTEND_BODY_SHA256,
         provider_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         curl_succeeds=True,
+        expected_frontend_sha256=_OLD_FRONTEND_BODY_SHA256,
     )
     _assert_mutation_sentinels_untouched(result)
 
@@ -3503,3 +3649,847 @@ def test_deploy_workflow_and_generic_deploy_script_not_modified_by_this_change()
     deploy_script = REPO_ROOT / "scripts" / "deploy_prod_from_ghcr.sh"
     assert deploy_workflow.is_file()
     assert deploy_script.is_file()
+
+
+# =====================================================================
+# 44. Phase 4L: structural proof of the rollback_api() convergence redesign
+# =====================================================================
+# The historical Phase 4E rollback false-negative was a Docker health
+# timing race: rollback_api() waited for curl readiness via two
+# serialized 60s loops, then performed exactly ONE immediate `docker
+# inspect` afterward -- the production compose API healthcheck interval
+# is 20s, so curl could be ready while Docker health still said
+# "starting". Phase 4L replaces this with a single bounded loop that
+# re-evaluates ALL FIVE conditions together every attempt.
+
+@pytest.fixture(scope="module")
+def rollback_api_source(remote_script) -> str:
+    return _extract_bash_function(remote_script, "rollback_api")
+
+
+def test_rollback_api_has_exactly_one_convergence_loop(rollback_api_source):
+    loop_count = rollback_api_source.count("for attempt in $(seq 1 45); do")
+    assert loop_count == 1, rollback_api_source
+
+
+def test_rollback_api_no_longer_has_two_serialized_health_loops(rollback_api_source):
+    """The pre-Phase-4L shape had TWO separate `for attempt in $(seq 1
+    30); do` loops (one per curl path) followed by a single un-looped
+    docker-inspect block -- that shape must not return."""
+    assert rollback_api_source.count("for attempt in $(seq 1 30); do") == 0
+
+
+def test_rollback_api_convergence_loop_checks_all_five_conditions_together(rollback_api_source):
+    loop_body = rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    for needle in (
+        "http://127.0.0.1:8000/health",
+        "http://127.0.0.1/api/health",
+        # Phase 4L: the three running/health/image-id reads are
+        # consolidated into ONE bounded docker inspect call.
+        "docker inspect -f '{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Image}}'",
+    ):
+        assert needle in loop_body, needle
+    convergence_check_idx = rollback_api_source.index('rb_converged=true')
+    loop_end_idx = rollback_api_source.index("for attempt in $(seq 1 45); do") + len(
+        rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    )
+    assert rollback_api_source.index("for attempt in $(seq 1 45); do") < convergence_check_idx < loop_end_idx
+
+
+def test_rollback_api_tolerates_starting_inside_the_loop(rollback_api_source):
+    """The convergence loop must not treat a single non-"healthy" reading
+    as fatal -- it must keep polling ("starting" tolerated) up to the
+    bound, never breaking/failing on the first unhealthy observation."""
+    loop_body = rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    assert "return 1" not in loop_body
+    assert "exit 1" not in loop_body
+
+
+def test_rollback_api_final_failure_reports_last_narrow_state_not_raw_dump(rollback_api_source):
+    assert 'echo "ROLLBACK: last observed state running=$rb_running health=$rb_health imageId=$rb_image_id directHealth=$rb_healthy nginxHealth=$rb_nginx_healthy"' in rollback_api_source
+    for forbidden in ("docker inspect jobpulse-api-prod$", "docker inspect jobpulse-api-prod > ", "printenv\n"):
+        assert forbidden not in rollback_api_source
+
+
+def test_rollback_api_no_single_immediate_post_curl_health_assertion_remains(rollback_api_source):
+    """The historical shape's tell was a docker-inspect block sitting
+    OUTSIDE (after) the curl-readiness loops with no further polling --
+    i.e. `rb_running=...`/`rb_health=...`/`rb_image_id=...` assignments
+    that are NOT inside the (single) bounded loop. Phase 4L moves all
+    three inside the loop; none may remain at the function's outer
+    (post-loop, pre-invariant-check) indentation level."""
+    after_loop = rollback_api_source.split("done", 1)[1]
+    # Everything up to the direct/no-Tor invariant re-check (a separate,
+    # intentional, one-time post-convergence read) must contain no
+    # further running/health/image-id assignment.
+    pre_invariant = after_loop.split("rb_search_transport=")[0]
+    for forbidden in ('rb_running="$(docker inspect', 'rb_health="$(docker inspect', 'rb_image_id="$(docker inspect'):
+        assert forbidden not in pre_invariant, forbidden
+
+
+def test_rollback_api_bound_spans_multiple_healthcheck_intervals(rollback_api_source):
+    """The attempt ceiling and the wall-clock deadline both exist and
+    both span multiple 20s Docker healthcheck intervals -- the exact
+    Phase 4E race window."""
+    assert "for attempt in $(seq 1 45); do" in rollback_api_source
+    assert "sleep 2" in rollback_api_source
+    assert "local rb_deadline=$((SECONDS + 90))" in rollback_api_source
+
+
+# =====================================================================
+# 44b. Phase 4L correction (independent review): real wall-clock bounds
+# =====================================================================
+# `attempts * sleep_interval` is NOT a real wall-clock bound when every
+# command inside the loop has its own runtime -- 45 attempts of two
+# 5s-max curls could theoretically consume ~450s, holding production
+# scheduler locks for roughly nine minutes instead of ~90 seconds. Fixed
+# with TWO independent bounds (attempt ceiling AND an explicit
+# SECONDS-based wall-clock deadline, checked at the start of every
+# iteration) plus tightened per-command timeouts, so the real
+# theoretical maximum stays close to the stated envelope.
+
+# Reviewed theoretical envelope constants (rollback_api). Kept in sync
+# with the implementation's own literals below -- if either side drifts,
+# the corresponding assertion fails rather than silently tolerating a
+# wider real-world window than documented.
+_RB_NOMINAL_DEADLINE_SECONDS = 90
+_RB_DIRECT_CURL_MAX_TIME = 2
+_RB_NGINX_CURL_MAX_TIME = 2
+_RB_DOCKER_INSPECT_TIMEOUT = 3
+_RB_TRAILING_SLEEP = 2
+_RB_MAX_SINGLE_ITERATION_BUDGET = _RB_DIRECT_CURL_MAX_TIME + _RB_NGINX_CURL_MAX_TIME + _RB_DOCKER_INSPECT_TIMEOUT
+_RB_THEORETICAL_MAXIMUM = _RB_NOMINAL_DEADLINE_SECONDS + _RB_MAX_SINGLE_ITERATION_BUDGET + _RB_TRAILING_SLEEP
+
+
+def test_rollback_api_wall_clock_regression_attempt_count_times_sleep_is_not_real_bound(rollback_api_source):
+    """Named regression test for the exact defect an independent review
+    found: `attempt_count * sleep_interval` (45 * 2s = "~90s") ignores
+    that every curl/docker command inside the loop has its own runtime,
+    and was NOT a real wall-clock bound -- worst case the two curls
+    alone could consume 45 * (5s + 5s) = 450s. The fix requires BOTH an
+    attempt ceiling and an explicit wall-clock deadline, checked before
+    every iteration's probe, with every command inside tightly bounded."""
+    assert "local rb_deadline=$((SECONDS + 90))" in rollback_api_source
+    deadline_check_idx = rollback_api_source.index('if [ "$SECONDS" -ge "$rb_deadline" ]; then')
+    loop_idx = rollback_api_source.index("for attempt in $(seq 1 45); do")
+    break_idx = rollback_api_source.index("break", deadline_check_idx)
+    curl_idx = rollback_api_source.index("curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8000/health")
+    # The deadline check must be the FIRST thing each iteration does --
+    # before any command with its own runtime is invoked.
+    assert loop_idx < deadline_check_idx < break_idx < curl_idx
+
+
+def test_rollback_api_curls_are_tightly_bounded_not_left_at_five_seconds(rollback_api_source):
+    loop_body = rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    assert (
+        f"curl --connect-timeout 1 --max-time {_RB_DIRECT_CURL_MAX_TIME} -fsS http://127.0.0.1:8000/health"
+        in loop_body
+    )
+    assert (
+        f"curl --connect-timeout 1 --max-time {_RB_NGINX_CURL_MAX_TIME} -fsS http://127.0.0.1/api/health"
+        in loop_body
+    )
+    # The old ~90s claim relied on --max-time 5 curls; that width must
+    # not remain inside the convergence loop.
+    assert "--max-time 5" not in loop_body
+
+
+def test_rollback_api_docker_inspect_is_bounded_with_timeout(rollback_api_source):
+    loop_body = rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    assert f"timeout {_RB_DOCKER_INSPECT_TIMEOUT} docker inspect" in loop_body
+
+
+def test_rollback_api_docker_inspect_failure_records_unknown_and_continues(rollback_api_source):
+    loop_body = rollback_api_source.split("for attempt in $(seq 1 45); do")[1].split("done")[0]
+    assert '|| rb_state_line=""' in loop_body
+    assert "rb_running=unknown" in loop_body
+    assert "rb_health=unknown" in loop_body
+    assert "rb_image_id=unknown" in loop_body
+    # A failed/timed-out inspect must never itself return/exit the
+    # function -- it must let the deadline/attempt-ceiling decide.
+    fallback_idx = loop_body.index('rb_running=unknown')
+    fallback_block = loop_body[fallback_idx : fallback_idx + 200]
+    assert "return" not in fallback_block
+    assert "exit" not in fallback_block
+
+
+def test_rollback_api_theoretical_maximum_documented_and_reasonable(rollback_api_source):
+    """The reviewed theoretical maximum (nominal deadline + one
+    in-flight iteration's worst-case probe budget + one trailing sleep)
+    must stay close to the stated ~90s envelope, never anywhere near the
+    ~450s the untightened per-command timeouts could have produced."""
+    assert _RB_THEORETICAL_MAXIMUM == 99
+    assert _RB_THEORETICAL_MAXIMUM <= 110
+    assert str(_RB_NOMINAL_DEADLINE_SECONDS) in rollback_api_source
+
+
+# =====================================================================
+# 45. Phase 4L: rollback outcome state + eligibility matrix (structural)
+# =====================================================================
+
+def test_rollback_outcome_variables_declared(remote_script):
+    init_block = remote_script.split("rollback_api() {")[0]
+    for var in (
+        "API_ROLLBACK_ATTEMPTED=false",
+        "API_ROLLBACK_CONFIRMED=false",
+        "GIT_ROLLBACK_ATTEMPTED=false",
+        "GIT_ROLLBACK_CONFIRMED=false",
+        'API_STATE_CLASSIFICATION=""',
+    ):
+        assert var in init_block, var
+
+
+def test_classify_api_state_function_exists_and_sets_all_three_classifications(remote_script):
+    func_body = _extract_bash_function(remote_script, "classify_api_state_after_failed_rollback")
+    assert "OLD_API_CONFIRMED" in func_body
+    assert "TARGET_API_CONFIRMED" in func_body
+    assert "UNKNOWN_API_STATE" in func_body
+    # Immutable image ID only -- never Config.Image tag-based inference.
+    assert "Config.Image" not in func_body
+    assert '"$cur_image_id" = "$API_IMAGE_ID_BEFORE"' in func_body
+    assert '"$cur_image_id" = "$TARGET_IMAGE_ID"' in func_body
+
+
+def test_classify_api_state_is_read_only(remote_script):
+    func_body = _extract_bash_function(remote_script, "classify_api_state_after_failed_rollback")
+    for forbidden in ("docker compose", "docker create", "docker restart", "docker rm", "git reset"):
+        assert forbidden not in func_body, forbidden
+
+
+def test_trap_never_blindly_rolls_back_with_bare_or_true(remote_script):
+    """Regression guard: the redesigned trap must never degrade to
+    `rollback_api || true; rollback_git || true` -- that could manufacture
+    a NEW split state if the API is genuinely still on the candidate
+    image."""
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    trap_code = "\n".join(_executable_lines(trap_body))
+    assert "rollback_api || true" not in trap_code
+    assert "rollback_git || true" not in trap_code
+
+
+def test_trap_git_rollback_eligible_on_old_api_confirmed_classification(remote_script):
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    assert 'elif [ "$API_STATE_CLASSIFICATION" = "OLD_API_CONFIRMED" ]; then' in trap_body
+
+
+def test_trap_does_not_special_case_target_or_unknown_for_git_rollback(remote_script):
+    """TARGET_API_CONFIRMED and UNKNOWN_API_STATE must both fall through
+    to the same refusal branch (the `else` of the OLD_API_CONFIRMED
+    check) -- neither gets its own eligibility branch that could
+    accidentally trigger a git rollback."""
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    assert 'if [ "$API_STATE_CLASSIFICATION" = "TARGET_API_CONFIRMED" ]' not in trap_body
+    assert 'if [ "$API_STATE_CLASSIFICATION" = "UNKNOWN_API_STATE" ]' not in trap_body
+    assert "refusing to touch the git checkout to avoid manufacturing a different split-release state" in trap_body
+
+
+def test_trap_calls_secondary_classification_only_after_rollback_api_failure(remote_script):
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    if_idx = trap_body.index("if rollback_api; then")
+    else_idx = trap_body.index("else", if_idx)
+    classify_idx = trap_body.index("classify_api_state_after_failed_rollback")
+    git_check_idx = trap_body.index('if [ "$GIT_MUTATION_STARTED" = "true" ]; then')
+    assert if_idx < else_idx < classify_idx < git_check_idx
+
+
+def test_trap_prints_rollback_summary_fields(remote_script):
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    for field in (
+        "api_mutation_started=",
+        "git_mutation_started=",
+        "api_rollback_attempted=",
+        "api_rollback_confirmed=",
+        "api_state_after_failed_rollback=",
+        "git_rollback_attempted=",
+        "git_rollback_confirmed=",
+    ):
+        assert field in trap_body, field
+
+
+def test_trap_summary_never_prints_secrets(remote_script):
+    trap_body = remote_script.split("final_exit_trap() {")[1].split("trap final_exit_trap EXIT")[0]
+    for forbidden in ("VM_SSH_KEY", "GHCR", "password", "token"):
+        assert forbidden not in trap_body, forbidden
+
+
+# =====================================================================
+# 46. Phase 4L: behavioral execution of the ACTUAL rollback_api()
+# =====================================================================
+# Same discipline as the rollback_git behavioral section above: the
+# REAL rollback_api() bash function is extracted verbatim and executed
+# via `bash -c` against a stateful fake `docker`/`curl`/`sleep` --
+# never a Python reimplementation of the convergence logic. `docker`
+# and `curl` share one round counter (a plain file under tmp_path) so
+# every read within the SAME loop iteration reflects the SAME simulated
+# moment: curl reads the round BEFORE `docker inspect -f
+# '{{.State.Running}}'` (the loop's first docker call) increments it,
+# so both observe identical iteration state.
+
+_OLD_API_IMAGE_ID = "sha256:" + "0" * 12 + "oldapiimage" + "0" * 41
+_TARGET_API_IMAGE_ID = "sha256:" + "1" * 12 + "targetimage" + "0" * 41
+_WRONG_API_IMAGE_ID = "sha256:" + "9" * 64
+
+
+def _write_rollback_api_fakes(bin_dir, tmp_path, sequence, *, search_transport="", tor_enabled="false", compose_exit=0):
+    """`sequence`: list of dicts with keys running/health/image/direct/nginx
+    (direct/nginx are bools). One entry per loop iteration; once
+    exhausted the LAST entry repeats -- exactly the "forever" shape R3-R7
+    need for a bounded-failure proof."""
+    state_dir = tmp_path / "rb_state"
+    state_dir.mkdir(exist_ok=True)
+    for i, s in enumerate(sequence):
+        (state_dir / f"{i}.running").write_text(s["running"])
+        (state_dir / f"{i}.health").write_text(s["health"])
+        (state_dir / f"{i}.image").write_text(s["image"])
+        (state_dir / f"{i}.direct").write_text("true" if s["direct"] else "false")
+        (state_dir / f"{i}.nginx").write_text("true" if s["nginx"] else "false")
+    round_file = tmp_path / "rb_round"
+    max_idx = len(sequence) - 1
+
+    env_lines = []
+    if search_transport:
+        env_lines.append(f"SEARCH_TRANSPORT={search_transport}")
+    env_lines.append(f"TOR_ENABLED={tor_enabled}")
+    env_blob = "\\n".join(env_lines)
+
+    docker_body = f'''
+STATE_DIR={shlex.quote(str(state_dir))}
+ROUND_FILE={shlex.quote(str(round_file))}
+[ -f "$ROUND_FILE" ] || echo 0 > "$ROUND_FILE"
+MAX_IDX={max_idx}
+
+cmd="$1"; shift
+case "$cmd" in
+  compose)
+    exit {int(compose_exit)}
+    ;;
+  inspect)
+    fmt=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) fmt="$2"; shift 2 ;;
+        --format) fmt="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$fmt" in
+      '{{{{.State.Running}}}}|{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}|{{{{.Image}}}}')
+        # Phase 4L: the three running/health/image-id reads are
+        # consolidated into ONE call -- advance the round exactly once
+        # per loop iteration, same as the pre-consolidation three-call
+        # shape advanced it on the first of three calls.
+        ROUND=$(cat "$ROUND_FILE")
+        echo $((ROUND+1)) > "$ROUND_FILE"
+        IDX=$ROUND
+        [ "$IDX" -gt "$MAX_IDX" ] && IDX="$MAX_IDX"
+        printf '%s|%s|%s\\n' "$(cat "$STATE_DIR/$IDX.running")" "$(cat "$STATE_DIR/$IDX.health")" "$(cat "$STATE_DIR/$IDX.image")"
+        ;;
+      '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}')
+        printf '%b\\n' {shlex.quote(env_blob)}
+        ;;
+      *)
+        echo "UNKNOWN_FORMAT: $fmt" >&2
+        exit 1
+        ;;
+    esac
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+'''
+    _write_fake_executable(bin_dir, "docker", docker_body)
+
+    curl_body = f'''
+STATE_DIR={shlex.quote(str(state_dir))}
+ROUND_FILE={shlex.quote(str(round_file))}
+[ -f "$ROUND_FILE" ] || echo 0 > "$ROUND_FILE"
+MAX_IDX={max_idx}
+ROUND=$(cat "$ROUND_FILE")
+IDX=$ROUND
+[ "$IDX" -gt "$MAX_IDX" ] && IDX="$MAX_IDX"
+url="${{@: -1}}"
+case "$url" in
+  http://127.0.0.1:8000/health)
+    [ "$(cat "$STATE_DIR/$IDX.direct")" = "true" ] && exit 0 || exit 22 ;;
+  http://127.0.0.1/api/health)
+    [ "$(cat "$STATE_DIR/$IDX.nginx")" = "true" ] && exit 0 || exit 22 ;;
+  *) exit 1 ;;
+esac
+'''
+    _write_fake_executable(bin_dir, "curl", curl_body)
+
+
+def _run_rollback_api(
+    rollback_api_source,
+    harness_bin,
+    tmp_path,
+    *,
+    sequence,
+    api_image_id_before=_OLD_API_IMAGE_ID,
+    search_transport="",
+    tor_enabled="false",
+):
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    _write_rollback_api_fakes(fake_bin, tmp_path, sequence, search_transport=search_transport, tor_enabled=tor_enabled)
+    _fake_instant_sleep(fake_bin)
+
+    body = (
+        f'API_IMAGE_ID_BEFORE={shlex.quote(api_image_id_before)}\n'
+        'ROLLBACK_TAG="jobpulse-api-rollback:test-1234"\n'
+        'PRODUCTION_PROJECT="jobpulse"\n'
+        'COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"\n'
+        'if rollback_api; then echo ROLLBACK_API_RESULT=OK; else echo ROLLBACK_API_RESULT=FAILED; fi\n'
+    )
+    return _run_harness(rollback_api_source, harness_bin, body, extra_path_dirs=(fake_bin,))
+
+
+def _rb_state(running="true", health="healthy", image=None, direct=True, nginx=True):
+    return {
+        "running": running,
+        "health": health,
+        "image": image if image is not None else _OLD_API_IMAGE_ID,
+        "direct": direct,
+        "nginx": nginx,
+    }
+
+
+# --- R1: Docker health starting then healthy -> succeeds (the exact Phase 4E regression)
+def test_behavior_rollback_api_r1_health_starting_then_healthy_succeeds(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[
+            _rb_state(health="starting"),
+            _rb_state(health="healthy"),
+        ],
+    )
+    assert "ROLLBACK_API_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+# --- R2: curl ready from the first attempt, Docker health stays "starting" for several attempts -> eventual success, no false negative
+def test_behavior_rollback_api_r2_curl_ready_before_docker_health_no_false_negative(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[
+            _rb_state(health="starting", direct=True, nginx=True),
+            _rb_state(health="starting", direct=True, nginx=True),
+            _rb_state(health="starting", direct=True, nginx=True),
+            _rb_state(health="healthy", direct=True, nginx=True),
+        ],
+    )
+    assert "ROLLBACK_API_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+# --- R3: wrong image ID forever -> bounded failure
+def test_behavior_rollback_api_r3_wrong_image_id_forever_bounded_failure(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(image=_WRONG_API_IMAGE_ID)],
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: API rollback did not converge" in result.stderr
+
+
+# --- R4: container stops -> bounded failure
+def test_behavior_rollback_api_r4_container_not_running_bounded_failure(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(running="false")],
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: API rollback did not converge" in result.stderr
+
+
+# --- R5: Docker health never leaves "starting" -> bounded failure
+def test_behavior_rollback_api_r5_health_never_healthy_bounded_failure(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(health="starting")],
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: API rollback did not converge" in result.stderr
+
+
+# --- R6: direct health endpoint never succeeds -> bounded failure
+def test_behavior_rollback_api_r6_direct_health_never_succeeds_bounded_failure(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(direct=False)],
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: API rollback did not converge" in result.stderr
+
+
+# --- R7: nginx health endpoint never succeeds -> bounded failure
+def test_behavior_rollback_api_r7_nginx_health_never_succeeds_bounded_failure(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(nginx=False)],
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: API rollback did not converge" in result.stderr
+
+
+# --- R8: old image healthy/running/both-endpoints-ok, but TOR_ENABLED is not exactly "false" -> failure after convergence
+def test_behavior_rollback_api_r8_tor_enabled_not_false_fails_after_convergence(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state()],
+        tor_enabled="true",
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: rollback API TOR_ENABLED is not exactly 'false'" in result.stderr
+
+
+# --- R9: SEARCH_TRANSPORT=proxy -> failure after convergence
+def test_behavior_rollback_api_r9_search_transport_proxy_fails_after_convergence(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state()],
+        search_transport="proxy",
+    )
+    assert "ROLLBACK_API_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: rollback API SEARCH_TRANSPORT is not unset/direct" in result.stderr
+
+
+def test_behavior_rollback_api_mutation_sentinels_untouched(rollback_api_source, harness_bin, tmp_path):
+    result = _run_rollback_api(
+        rollback_api_source,
+        harness_bin,
+        tmp_path,
+        sequence=[_rb_state(health="starting"), _rb_state(health="healthy")],
+    )
+    _assert_mutation_sentinels_untouched(result)
+
+
+# =====================================================================
+# 47. Phase 4L: behavioral execution of the ACTUAL final_exit_trap()
+# rollback-eligibility matrix, with controlled fake rollback_api/
+# rollback_git/classify_api_state_after_failed_rollback
+# =====================================================================
+# Same technique already established by
+# test_behavior_internal_busy_exit_trap_releases_outer_lock: the REAL
+# extracted_functions_and_trap_script (through the real `trap
+# final_exit_trap EXIT` registration) is used, and simple bash stub
+# functions redefine rollback_api/rollback_git/
+# classify_api_state_after_failed_rollback AFTER that real script text
+# (bash uses the LAST definition of a function name) -- proving the
+# REAL final_exit_trap's eligibility logic, never a Python
+# reimplementation of it.
+
+def _run_trap_matrix(
+    extracted_functions_and_trap_script,
+    harness_bin,
+    *,
+    api_mutation_started,
+    git_mutation_started,
+    api_succeeds,
+    classification,
+    git_succeeds,
+):
+    body = (
+        'ROLLBACK_TAG=""\nTMP_DOCKER_CONFIG=""\nREMOTE_SCRIPT_SELF=""\n'
+        'CYCLE_LOCK_FD=""\nOUTER_LOCK_FD=""\n'
+        f'API_MUTATION_STARTED={"true" if api_mutation_started else "false"}\n'
+        f'GIT_MUTATION_STARTED={"true" if git_mutation_started else "false"}\n'
+        'WORKFLOW_SUCCESS=false\n'
+        'API_ROLLBACK_ATTEMPTED=false\nAPI_ROLLBACK_CONFIRMED=false\n'
+        'GIT_ROLLBACK_ATTEMPTED=false\nGIT_ROLLBACK_CONFIRMED=false\n'
+        'API_STATE_CLASSIFICATION=""\n'
+        f'rollback_api() {{ echo ROLLBACK_API_CALLED; return {0 if api_succeeds else 1}; }}\n'
+        f'classify_api_state_after_failed_rollback() {{ echo CLASSIFY_CALLED; API_STATE_CLASSIFICATION={shlex.quote(classification)}; }}\n'
+        f'rollback_git() {{ echo ROLLBACK_GIT_CALLED; return {0 if git_succeeds else 1}; }}\n'
+        'exit 1\n'
+    )
+    return _run_harness(extracted_functions_and_trap_script, harness_bin, body)
+
+
+# --- T1: API rollback succeeds; git mutation started -> git rollback attempted
+def test_behavior_trap_t1_api_rollback_succeeds_git_rollback_attempted(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=True,
+        api_succeeds=True,
+        classification="",
+        git_succeeds=True,
+    )
+    assert "ROLLBACK_API_CALLED" in result.stdout
+    assert "CLASSIFY_CALLED" not in result.stdout
+    assert "ROLLBACK_GIT_CALLED" in result.stdout
+    assert "api_rollback_confirmed=true" in result.stderr
+    assert "git_rollback_confirmed=true" in result.stderr
+
+
+# --- T2: API rollback fails, secondary classification=OLD_API_CONFIRMED -> git rollback still attempted
+def test_behavior_trap_t2_old_api_confirmed_still_rolls_back_git(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=True,
+        api_succeeds=False,
+        classification="OLD_API_CONFIRMED",
+        git_succeeds=True,
+    )
+    assert "CLASSIFY_CALLED" in result.stdout
+    assert "ROLLBACK_GIT_CALLED" in result.stdout
+    assert "api_rollback_confirmed=false" in result.stderr
+    assert "api_state_after_failed_rollback=OLD_API_CONFIRMED" in result.stderr
+    assert "git_rollback_confirmed=true" in result.stderr
+
+
+# --- T3: classification=TARGET_API_CONFIRMED -> git rollback NOT attempted
+def test_behavior_trap_t3_target_api_confirmed_blocks_git_rollback(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=True,
+        api_succeeds=False,
+        classification="TARGET_API_CONFIRMED",
+        git_succeeds=True,
+    )
+    assert "CLASSIFY_CALLED" in result.stdout
+    assert "ROLLBACK_GIT_CALLED" not in result.stdout
+    assert "refusing to touch the git checkout" in result.stderr
+    assert "git_rollback_attempted=false" in result.stderr
+
+
+# --- T4: classification=UNKNOWN_API_STATE -> git rollback NOT attempted
+def test_behavior_trap_t4_unknown_api_state_blocks_git_rollback(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=True,
+        api_succeeds=False,
+        classification="UNKNOWN_API_STATE",
+        git_succeeds=True,
+    )
+    assert "CLASSIFY_CALLED" in result.stdout
+    assert "ROLLBACK_GIT_CALLED" not in result.stdout
+    assert "refusing to touch the git checkout" in result.stderr
+    assert "git_rollback_attempted=false" in result.stderr
+
+
+# --- T5: git rollback fails after API confirmed old -> both outcomes reported independently
+def test_behavior_trap_t5_git_rollback_failure_reported_independently_of_api_state(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=True,
+        api_succeeds=False,
+        classification="OLD_API_CONFIRMED",
+        git_succeeds=False,
+    )
+    assert "ROLLBACK_GIT_CALLED" in result.stdout
+    assert "api_rollback_confirmed=false" in result.stderr
+    assert "api_state_after_failed_rollback=OLD_API_CONFIRMED" in result.stderr
+    assert "git_rollback_attempted=true" in result.stderr
+    assert "git_rollback_confirmed=false" in result.stderr
+    assert "FATAL: git rollback failed" in result.stderr
+
+
+# --- T6: no git mutation started -> git rollback never attempted
+def test_behavior_trap_t6_no_git_mutation_git_rollback_never_attempted(extracted_functions_and_trap_script, harness_bin):
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=True,
+        git_mutation_started=False,
+        api_succeeds=True,
+        classification="",
+        git_succeeds=True,
+    )
+    assert "ROLLBACK_API_CALLED" in result.stdout
+    assert "ROLLBACK_GIT_CALLED" not in result.stdout
+    assert "git_rollback_attempted=false" in result.stderr
+
+
+def test_behavior_trap_no_api_mutation_nothing_to_roll_back(extracted_functions_and_trap_script, harness_bin):
+    """Pre-existing no-rollback branch must still work unchanged."""
+    result = _run_trap_matrix(
+        extracted_functions_and_trap_script,
+        harness_bin,
+        api_mutation_started=False,
+        git_mutation_started=False,
+        api_succeeds=True,
+        classification="",
+        git_succeeds=True,
+    )
+    assert "ROLLBACK_API_CALLED" not in result.stdout
+    assert "No candidate API mutation had started -- nothing to roll back." in result.stderr
+
+
+# =====================================================================
+# 48. Phase 4L: behavioral execution of the ACTUAL wait_for_live_frontend_sha()
+# =====================================================================
+# Exercises the shared frontend-SHA-convergence helper directly (used by
+# both the main-flow target-frontend check and rollback_git's
+# old-frontend check) against a stateful fake curl that writes real
+# bytes to curl's own `-o` target -- sha256sum is a thin passthrough to
+# the REAL system binary, so the hash comparison is genuine, never a
+# fixed placeholder.
+
+_TARGET_BODY = b"<html>Open Poster Profile TARGET BUILD</html>\n"
+_TARGET_BODY_SHA256 = hashlib.sha256(_TARGET_BODY).hexdigest()
+_STALE_BODY_WITH_MARKER = b"<html>Open Poster Profile STALE BUILD</html>\n"
+
+
+@pytest.fixture(scope="module")
+def wait_for_live_frontend_sha_source(remote_script) -> str:
+    return _extract_bash_function(remote_script, "wait_for_live_frontend_sha")
+
+
+def _write_sequenced_curl_for_sha(bin_dir, tmp_path, outcomes):
+    """`outcomes`: list of ('fail' or bytes) -- one entry per curl
+    invocation; once exhausted the LAST entry repeats."""
+    counter_file = tmp_path / "sha_curl_count"
+    outcomes_dir = tmp_path / "sha_curl_outcomes"
+    outcomes_dir.mkdir(exist_ok=True)
+    for i, outcome in enumerate(outcomes):
+        if outcome != "fail":
+            (outcomes_dir / f"{i}.bin").write_bytes(outcome)
+    max_idx = len(outcomes) - 1
+    body = f'''
+COUNT_FILE={shlex.quote(str(counter_file))}
+OUTCOMES_DIR={shlex.quote(str(outcomes_dir))}
+[ -f "$COUNT_FILE" ] || echo 0 > "$COUNT_FILE"
+N=$(cat "$COUNT_FILE")
+echo $((N+1)) > "$COUNT_FILE"
+IDX=$N
+[ "$IDX" -gt {max_idx} ] && IDX={max_idx}
+
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+
+if [ -e "$OUTCOMES_DIR/$IDX.bin" ]; then
+  cat "$OUTCOMES_DIR/$IDX.bin" > "$out"
+  exit 0
+else
+  exit 22
+fi
+'''
+    _write_fake_executable(bin_dir, "curl", body)
+
+
+def _run_wait_for_live_frontend_sha(wait_for_live_frontend_sha_source, harness_bin, tmp_path, *, expected_sha, outcomes):
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    _write_sequenced_curl_for_sha(fake_bin, tmp_path, outcomes)
+    _write_fake_executable(fake_bin, "sha256sum", f'exec {shlex.quote(_REAL_SHA256SUM)} "$@"\n')
+    _fake_instant_sleep(fake_bin)
+    body = f'if wait_for_live_frontend_sha {shlex.quote(expected_sha)}; then echo WAIT_RESULT=OK; else echo WAIT_RESULT=FAILED; fi\n'
+    return _run_harness(wait_for_live_frontend_sha_source, harness_bin, body, extra_path_dirs=(fake_bin,))
+
+
+# --- F1: first body old/stale bytes, later bodies converge to target -> succeeds after propagation
+def test_behavior_frontend_sha_f1_succeeds_after_propagation(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=[_STALE_BODY_WITH_MARKER, _STALE_BODY_WITH_MARKER, _TARGET_BODY],
+    )
+    assert "WAIT_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+# --- F2: HTTP always 200 but bytes always stale/old -> bounded failure
+def test_behavior_frontend_sha_f2_stale_bytes_forever_bounded_failure(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=[_STALE_BODY_WITH_MARKER],
+    )
+    assert "WAIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+    assert "FATAL: live frontend SHA-256 never converged to expected" in result.stderr
+
+
+# --- F3: GET fails initially then exact target bytes -> succeeds
+def test_behavior_frontend_sha_f3_get_failure_then_success(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=["fail", "fail", _TARGET_BODY],
+    )
+    assert "WAIT_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+# --- F4: served body contains the marker string but its SHA differs from target -> must fail
+def test_behavior_frontend_sha_f4_marker_present_but_sha_differs_fails(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    assert b"Open Poster Profile" in _STALE_BODY_WITH_MARKER
+    assert hashlib.sha256(_STALE_BODY_WITH_MARKER).hexdigest() != _TARGET_BODY_SHA256
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=[_STALE_BODY_WITH_MARKER],
+    )
+    assert "WAIT_RESULT=FAILED" in result.stdout, result.stdout + result.stderr
+
+
+# --- F5: exact SHA matches target on the very first attempt -> succeeds
+def test_behavior_frontend_sha_f5_exact_match_first_attempt_succeeds(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=[_TARGET_BODY],
+    )
+    assert "WAIT_RESULT=OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_behavior_frontend_sha_mutation_sentinels_untouched(wait_for_live_frontend_sha_source, harness_bin, tmp_path):
+    result = _run_wait_for_live_frontend_sha(
+        wait_for_live_frontend_sha_source,
+        harness_bin,
+        tmp_path,
+        expected_sha=_TARGET_BODY_SHA256,
+        outcomes=[_TARGET_BODY],
+    )
+    _assert_mutation_sentinels_untouched(result)
+
+
+def test_no_command_substitution_body_hash_anywhere(remote_script):
+    """Regression guard: hashing an HTTP body through
+    `BODY="$(curl ...)"` strips trailing newlines via command
+    substitution and can silently change the byte stream. Every live
+    frontend byte-hash check must go through a file, never a
+    variable-captured curl body."""
+    code = "\n".join(_executable_lines(remote_script))
+    assert 'BODY="$(curl' not in code
+    assert "sha256sum <<<" not in code
