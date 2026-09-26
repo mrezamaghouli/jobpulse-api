@@ -563,25 +563,119 @@ jobs:
           # variable (never a blanket fallback that would mask a
           # nonzero exit), and none print the complete raw command
           # output (bounded status code + source/action label only).
+          #
+          # Phase 4I (run 35846112545) proved this needs a two-level
+          # model, not a single blind `systemctl show` over every name
+          # `systemctl list-unit-files` returns: the live host's
+          # persistent unit-file inventory includes uninstantiated
+          # systemd TEMPLATE units (e.g. apport-coredump-hook@.service),
+          # and `systemctl show <template>@.service` is not a reliable
+          # operation for those -- it returned exit 1, which correctly
+          # fail-closed this runner before any mutation, but the
+          # enumeration/inspection model itself was too naive. Phase 4J
+          # distinguishes, semantically (never by hardcoded unit name):
+          #   - an uninstantiated template unit file (name matches
+          #     *@.service exactly) -> inspect its static definition via
+          #     `systemctl cat`, never `systemctl show`.
+          #   - every other (ordinary, concrete) unit-file name -> as
+          #     before, `systemctl show`.
+          # A currently-instantiated copy of a template (e.g.
+          # foo@instance.service) does not appear in the persistent
+          # unit-file inventory as such, so it is caught separately below
+          # via `systemctl list-units` (the loaded-unit inventory) and
+          # inspected via `systemctl show` like any other loaded unit.
           command -v systemctl > /dev/null 2>&1 || fail "systemctl command unavailable -- cannot establish systemd scheduler state, refusing to proceed without proven systemd provenance"
 
           UNIT_LIST_STATUS=0
-          UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager 2>&1)" || UNIT_LIST_STATUS=$?
+          UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager --full 2>&1)" || UNIT_LIST_STATUS=$?
           [ "$UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-unit-files failed in a bounded read (source=systemctl list-unit-files, exit $UNIT_LIST_STATUS) -- refusing to proceed without proven systemd unit enumeration"
-          UNIT_NAMES="$(awk '{print $1}' <<< "$UNIT_LIST_OUTPUT")"
+          # `--full` so a long unit name is never ellipsized before
+          # semantic template detection; `NF {print $1}` so a blank
+          # record never yields an empty first field.
+          UNIT_NAMES="$(awk 'NF {print $1}' <<< "$UNIT_LIST_OUTPUT")"
 
           while IFS= read -r unit; do
             [ -z "$unit" ] && continue
-            UNIT_SHOW_STATUS=0
-            UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || UNIT_SHOW_STATUS=$?
-            [ "$UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$unit, exit $UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
-            [ -n "$UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $unit -- refusing to proceed without proven effective systemd state"
-            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$UNIT_SHOW_OUTPUT" \
-              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$UNIT_SHOW_OUTPUT" \
-              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$UNIT_SHOW_OUTPUT"; then
-              fail "systemd unit $unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
-            fi
+            # Defense in depth: if `systemctl list-unit-files` output
+            # ever shapes differently than expected (decoration,
+            # truncation, a future systemd version), refuse to guess and
+            # never let a malformed token reach `systemctl show`/`cat`.
+            case "$unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-unit-files output (token=$unit)" ;;
+            esac
+            case "$unit" in
+              *@.service)
+                # Uninstantiated systemd template unit -- `systemctl show`
+                # against a bare template name is not a reliable
+                # operation (this is the exact Phase 4I regression:
+                # apport-coredump-hook@.service returned exit 1). Inspect
+                # the template's static definition instead.
+                TEMPLATE_CAT_STATUS=0
+                TEMPLATE_CAT_OUTPUT="$(timeout 5 systemctl cat "$unit" --no-pager 2>&1)" || TEMPLATE_CAT_STATUS=$?
+                [ "$TEMPLATE_CAT_STATUS" -eq 0 ] || fail "systemctl cat failed in a bounded read (source=systemctl cat, unit=$unit, exit $TEMPLATE_CAT_STATUS) -- refusing to proceed without proven template unit definition"
+                [ -n "$TEMPLATE_CAT_OUTPUT" ] || fail "systemctl cat returned an unusable (empty) result for template unit $unit -- refusing to proceed without proven template unit definition"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$TEMPLATE_CAT_OUTPUT"; then
+                  fail "systemd template unit $unit definition references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+              *)
+                UNIT_SHOW_STATUS=0
+                UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || UNIT_SHOW_STATUS=$?
+                [ "$UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$unit, exit $UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+                [ -n "$UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $unit -- refusing to proceed without proven effective systemd state"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$UNIT_SHOW_OUTPUT"; then
+                  fail "systemd unit $unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+            esac
           done <<< "$UNIT_NAMES"
+          echo "systemd_unit_file_drift=none"
+
+          echo "== scheduler drift check: systemd loaded unit inventory (systemctl list-units, catches instantiated templates) =="
+          LOADED_UNIT_LIST_STATUS=0
+          # `--plain` is mandatory: without it, systemctl renders a
+          # leading status-circle glyph (e.g. "* broken.service ...") for
+          # a failed/degraded unit, which would otherwise become a
+          # pseudo-column and shift $1 away from the actual unit name.
+          # `--full` prevents a long unit name from being ellipsized
+          # before it is inspected.
+          LOADED_UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-units --type=service --all --no-legend --no-pager --plain --full 2>&1)" || LOADED_UNIT_LIST_STATUS=$?
+          [ "$LOADED_UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-units failed in a bounded read (source=systemctl list-units, exit $LOADED_UNIT_LIST_STATUS) -- refusing to proceed without proven loaded systemd unit enumeration"
+          LOADED_UNIT_NAMES="$(awk 'NF {print $1}' <<< "$LOADED_UNIT_LIST_OUTPUT")"
+
+          while IFS= read -r loaded_unit; do
+            [ -z "$loaded_unit" ] && continue
+            # Defense in depth: refuse to guess if a parsed record is not
+            # a `*.service` name (see the identical unit-file check
+            # above) -- never call `systemctl show` with an unexpected
+            # token such as a stray status-circle glyph.
+            case "$loaded_unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-units output (token=$loaded_unit)" ;;
+            esac
+            # Every loaded unit -- including an instantiated template
+            # such as foo@instance.service -- is inspected the same way
+            # as an ordinary concrete unit. A normal service may already
+            # have been inspected once above from the unit-file
+            # inventory; inspecting it again here is acceptable (simple,
+            # auditable logic beats premature deduplication).
+            LOADED_UNIT_SHOW_STATUS=0
+            LOADED_UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$loaded_unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || LOADED_UNIT_SHOW_STATUS=$?
+            [ "$LOADED_UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$loaded_unit, exit $LOADED_UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+            [ -n "$LOADED_UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $loaded_unit -- refusing to proceed without proven effective systemd state"
+            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$LOADED_UNIT_SHOW_OUTPUT"; then
+              fail "systemd loaded unit $loaded_unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+            fi
+          done <<< "$LOADED_UNIT_NAMES"
+          echo "systemd_loaded_unit_drift=none"
+
           echo "systemd_drift=none"
 
           echo "== effective internal lock path provenance: /opt/jobpulse/.collection.env (parsed as data only, never sourced/eval'd) =="

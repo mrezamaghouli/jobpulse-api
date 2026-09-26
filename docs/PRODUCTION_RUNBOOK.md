@@ -3052,3 +3052,167 @@ mutate production. Production remains in the `CASE_B_GIT_TARGET_API_OLD`
 split state described above until a separately authorized dispatch of
 `production-split-release-recovery.yml` is made.
 
+## Phase 4I-4J: Recovery run 35846112545 -- systemd template-unit fix
+
+**Phase 4I (real recovery attempt, safe pre-mutation abort).**
+`production-split-release-recovery.yml` was dispatched
+(run `35846112545`, `run_attempt=1`, `conclusion=failure`). Result:
+**`SAFE_PRE_MUTATION_RECOVERY_ABORT`** -- the runner failed closed during
+the systemd alternate-source scheduler drift check, strictly before
+`GIT_RECOVERY_STARTED` was ever set, before either the outer
+(`/tmp/jobpulse_collection_cycle.lock`) or internal
+(`/opt/jobpulse/state/run_collection_cycle.lock`) lock was acquired, and
+before `git reset --hard` ran. Production was therefore left completely
+unchanged, still in the exact `CASE_B_GIT_TARGET_API_OLD` split state:
+
+- git: `bccbbd997ee83ee9219d6051a808dae17f5cc933`
+- API underlying image:
+  `sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`
+- API `Config.Image`: `jobpulse-api-rollback:bccbbd997ee8-1427495`
+- API: running, healthy, `restart_count=0`
+- DB/frontend/Tor: unchanged
+
+**Exact blocker.** The Phase 4H systemd drift check enumerated
+`systemctl list-unit-files --type=service` and ran `systemctl show
+"$unit" ...` for every returned name. The live production host's
+persistent unit-file inventory includes the uninstantiated systemd
+TEMPLATE unit `apport-coredump-hook@.service`. `systemctl show
+apport-coredump-hook@.service ...` is not a valid/reliable operation
+against a bare template name and returned exit `1`, so the bounded,
+fail-closed check correctly refused to proceed. **The safety policy
+(fail closed before mutation) was correct; the enumeration/inspection
+model was too naive** -- it did not distinguish an ordinary concrete
+unit-file name from an uninstantiated template.
+
+**Phase 4J (this fix).** `production-split-release-recovery.yml` now
+uses a two-level, purely semantic template-unit model (unit-name shape,
+never a hardcoded allowlist of `apport-coredump-hook@.service` or any
+other specific unit name):
+
+- **Uninstantiated template unit file** (persistent unit-file name
+  matching exactly `*@.service`, e.g. `apport-coredump-hook@.service`):
+  inspected via bounded, fail-closed `timeout 5 systemctl cat "$unit"
+  --no-pager` (its static definition) -- never `systemctl show`. A
+  nonzero exit, a timeout, or an empty/unusable result all fail closed;
+  the returned definition is scanned for `run_collection_cycle_safe.sh`,
+  `JOBPULSE_COLLECTION_ROOT`, and `JOBPULSE_COLLECTION_CYCLE_LOCK_PATH`,
+  exactly the same drift signals as before.
+- **Every other (ordinary, concrete) persistent unit-file name**:
+  unchanged from Phase 4H -- bounded, fail-closed `systemctl show
+  "$unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager`.
+- **Loaded unit inventory** (`timeout 5 systemctl list-units
+  --type=service --all --no-legend --no-pager`, a second, independent,
+  bounded, fail-closed enumeration): this is how a currently
+  *instantiated* copy of a template -- e.g. `foo@instance.service`,
+  which never appears in the persistent unit-file inventory as such --
+  is still caught. Every loaded unit name this returns, instantiated
+  templates included, is inspected via bounded, fail-closed `systemctl
+  show` exactly like an ordinary concrete unit. A normal service may
+  therefore be inspected twice (once from each enumeration); this
+  duplication is accepted deliberately -- simple, auditable logic over
+  premature deduplication.
+- No `|| true`, no "skip units that error", no "warn and continue" --
+  every read operation (`list-unit-files`, `list-units`, `show`, `cat`)
+  remains bounded and fail-closed, and only bounded status codes and
+  source/action labels are ever printed; complete raw `systemctl`
+  output (list, show, or cat) is never dumped.
+- Required order is unchanged and still entirely before the one
+  authorized mutation: own-crontab launcher -> alternate-source drift
+  (now including the loaded-unit enumeration) -> effective internal
+  lock path -> outer lock -> internal lock -> active-collector check ->
+  `git reset --hard`.
+
+A named regression test
+(`test_regression_phase4i_apport_coredump_hook_template_no_longer_blocks_recovery`
+in `tests/test_production_split_release_recovery_workflow.py`) proves
+both halves of the fix against the real incident unit name: an
+irrelevant `apport-coredump-hook@.service` with a benign definition no
+longer blocks recovery, and the same unit name with a `systemctl cat`
+failure still fails closed -- proving the template is genuinely
+inspected, not skipped.
+
+### Frontend forensics (Phase 4I evidence)
+
+Run `35846112545` also completed its pre-recovery frontend forensics
+step before the systemd abort. All three sources agreed exactly:
+
+- host `frontend/index.html` SHA-256
+- container-mounted (`docker exec jobpulse-frontend-prod`) SHA-256
+- live HTTP body (`curl http://127.0.0.1/`) SHA-256
+
+all equal to
+`65fe3f497e22d2e9ae275fd765f34b575574ab8b668155d541fcd7d82af9b673`, and
+the `Open Poster Profile` marker was present in the host file, the
+container-mounted file, and the live HTTP response. Classification:
+**`HOST_CONTAINER_HTTP_TARGET`**.
+
+This states clearly what the evidence supports and no more: the old
+Phase 4E live-frontend marker-check failure is **not currently
+reproducible as a persistent stale-frontend production state** -- host,
+container, and live HTTP all already agree on the incident-commit
+frontend content. This does **not** establish a definitive root cause
+for the original Phase 4E transient failure (the most likely
+explanation remains the rollback-verification timing race documented
+under "Deferred to a separate, later PR" above); it only rules out an
+ongoing stale-frontend condition as of this forensic snapshot. Because
+of this finding, Phase 4J makes no frontend, provider, or compose
+changes -- it is scoped exclusively to the systemd template-unit
+inspection fix.
+
+### Machine-safe systemd enumeration correction (independent review, PR #35)
+
+An independent review of the Phase 4J template-unit fix (still on PR
+`#35`, before merge) found the new loaded-unit enumeration itself was
+not sufficiently machine-safe: `systemctl list-units --type=service
+--all --no-legend --no-pager` piped to `awk '{print $1}'` assumes the
+first whitespace-separated field is always the unit name, but real
+`systemctl` renders a leading status-circle glyph for a failed/degraded
+unit (e.g. `● broken.service loaded failed failed ...`) unless
+`--plain` is passed -- without it, `$1` could be the glyph itself, and
+the runner could attempt `systemctl show "●"` and safe-abort on a
+parser artifact rather than genuine scheduler drift. Separately,
+neither enumeration passed `--full`, so a sufficiently long unit name
+could in principle be ellipsized before either template detection or
+inspection.
+
+This is fixed, still entirely fail-closed and still amended onto the
+same single PR #35 commit rather than merged first and patched later:
+
+- `systemctl list-unit-files --type=service --no-legend --no-pager`
+  gains `--full` (persistent unit-file names are never ellipsized
+  before semantic `*@.service` template detection).
+- `systemctl list-units --type=service --all --no-legend --no-pager`
+  gains both `--plain` (no status-circle decoration) and `--full`.
+- Both enumerations parse with `awk 'NF {print $1}'` (skips a genuinely
+  blank record; the command output itself is made deterministic via
+  `--plain`, never repaired after the fact with fuzzy Unicode
+  stripping).
+- Before either persistent unit-file name or loaded unit name is
+  inspected via `systemctl show`/`cat`, a defense-in-depth sanity check
+  requires it to match `*.service`; anything else fails closed with a
+  bounded message (`unexpected token while parsing systemctl
+  list-unit-files/list-units output`) naming only the offending token,
+  never the complete raw enumeration output, and never calls
+  `systemctl show`/`cat` with that token.
+- No `|| true`, no skip-and-continue, no hardcoded allowlist of a
+  specific failed-unit name -- a malformed/unexpected record still
+  fails the whole recovery closed, before either scheduler lock and
+  before `git reset --hard`.
+
+Template semantics from the original Phase 4J fix are unchanged: an
+uninstantiated template (`*@.service`) still goes directly to
+`systemctl cat` and never `systemctl show`; an ordinary persistent unit
+file and a loaded (including instantiated-template) unit still both use
+`systemctl show`.
+
+### Not authorized by Phase 4J
+
+Phase 4J is code/test/docs only -- it does not dispatch
+`production-split-release-recovery.yml` (including no rerun of
+`35846112545`), does not dispatch Production Direct Runtime Upgrade,
+Production Runtime Diagnostic, Production Neutral Canary, Deploy
+Production, or Build JobPulse API Image, and it does not SSH to or
+mutate production. Production remains in the `CASE_B_GIT_TARGET_API_OLD`
+split state described above until a separately authorized dispatch of
+the (now-fixed) recovery runner is made.
+
