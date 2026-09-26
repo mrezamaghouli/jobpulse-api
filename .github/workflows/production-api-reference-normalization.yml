@@ -1,0 +1,991 @@
+name: Production API Reference Normalization
+
+# ============================================================================
+# PHASE 4M -- ONE-TIME, INCIDENT-CLEANUP PRODUCTION RUNNER.
+#
+# Context: Phase 4K (Production Split-Release Recovery run 36238209271)
+# restored production's functional f476 baseline -- git checked out at
+# f4765f857355c6543f68cea0e481b7f20a917147, API running the correct old
+# (f476) image bytes, healthy. The API's Config.Image reference is,
+# however, still the temporary local rollback alias
+# jobpulse-api-rollback:bccbbd997ee8-1427495 that Phase 4E's rollback
+# left behind -- intentional debt, deferred at every prior phase (4H,
+# 4J, 4L) specifically so it could be handled here, deliberately,
+# separately from any code/git/byte change.
+#
+# This workflow performs exactly ONE semantic change: it recreates ONLY
+# the production api container so that Docker records its Config.Image
+# as the canonical GHCR reference
+# ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147
+# instead of the rollback alias -- while requiring the underlying image
+# ID to be EXACTLY the same bytes as before
+# (sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753).
+# There is no code/image-byte upgrade and no git checkout change; the
+# container itself must still be recreated (with --force-recreate)
+# because Docker stores Config.Image on the container's own
+# configuration, not something that can be edited in place.
+#
+# This is NOT a repurposing of, and does not modify:
+#   - production-direct-runtime-upgrade.yml (the general-purpose
+#     upgrade/rollback runner)
+#   - production-split-release-recovery.yml (the Phase 4H/4J recovery
+#     runner)
+#   - production-runtime-diagnostic.yml (deliberately run separately,
+#     AFTER this workflow, as its own reviewed step)
+#   - deploy.yml
+#
+# It never sets SEARCH_TRANSPORT=proxy, never touches Tor
+# configuration/ControlPort/NEWNYM, never contacts LinkedIn, never runs
+# a collector/queue script, never mutates production git, and never
+# recreates/restarts db/frontend/tor. The scheduler-provenance model
+# (crontab/systemd discovery before the two collection-cycle locks are
+# acquired) is copied as literally as practical from the already-
+# reviewed Phase 4J version in production-split-release-recovery.yml --
+# see tests/test_production_api_reference_normalization_workflow.py's
+# parity test.
+#
+# If candidate recreation succeeds but any post-recreation validation
+# fails, this workflow attempts exactly one API-only rollback: it
+# retags the same (unchanged) image bytes back under the exact old
+# rollback alias and recreates the api service with that reference, so
+# production returns to its pre-run state. A confirmed rollback does
+# NOT make this workflow succeed -- the normalization attempt still
+# failed, and the run concludes non-zero with the classification
+# NORMALIZATION_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED.
+#
+# workflow_dispatch ONLY, gated by an exact confirmation token typed by
+# the operator. See docs/PRODUCTION_RUNBOOK.md's Phase 4M section for
+# the full rationale.
+# ============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: >-
+          Type exactly NORMALIZE_F476_API_REFERENCE to confirm. This
+          recreates ONLY the production api container so its
+          Config.Image becomes the canonical
+          ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147
+          reference, requiring the underlying image ID to remain
+          EXACTLY sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753
+          (the same bytes, never a code/image upgrade). It never
+          changes production git, never touches db/frontend/tor, and
+          attempts an API-only rollback to the prior rollback alias if
+          any post-recreation check fails.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Shares the SAME concurrency group as production-direct-runtime-upgrade.yml
+# because both mutate the same production API runtime -- this ensures
+# the two runners can never overlap.
+concurrency:
+  group: jobpulse-production-direct-runtime-upgrade
+  cancel-in-progress: false
+
+env:
+  VM_HOST: "35.192.251.190"
+  VM_USER: "mrezamaghouli"
+  VM_PORT: "22"
+  CONFIRMATION: ${{ inputs.confirmation }}
+  # One-time pinned constants -- see docs/PRODUCTION_RUNBOOK.md's Phase
+  # 4M section. Production is proven by Phase 4K to be functionally on
+  # this exact commit/image; any drift from these exact values fails
+  # closed before mutation.
+  EXPECTED_PRODUCTION_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  EXPECTED_CURRENT_CONFIG_IMAGE: "jobpulse-api-rollback:bccbbd997ee8-1427495"
+  CANONICAL_IMAGE: "ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+  EXPECTED_IMAGE_ID: "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+  EXPECTED_API_CONTAINER_ID: "ac66a4acef51c8ac3dc27b38a5559c5aa056ec033ceef43c9f8a0e4a8cbd3682"
+  EXPECTED_DB_CONTAINER_ID: "98f20abb30f4fdfe9473431370c3f6db29c39183d67f31d49638a493a1f605e9"
+  EXPECTED_FRONTEND_CONTAINER_ID: "fb949b779e80a53f4a9542d2eaa30945d1abbf357fbb2391b2422238371b7dd8"
+  EXPECTED_TOR_CONTAINER_ID: "e2210c3c47f7a73fca1d5b2faeb62b2eeec89526a56f5da4cb1a00a3298b1612"
+
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require dispatch from main
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${{ github.ref }}')" >&2
+            exit 1
+          fi
+
+      - name: Require exact confirmation token
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRMATION" != "NORMALIZE_F476_API_REFERENCE" ]; then
+            echo "ERROR: confirmation input must be exactly NORMALIZE_F476_API_REFERENCE" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive immutable file hashes for the f476 production baseline
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git cat-file -e "${EXPECTED_PRODUCTION_SHA}^{commit}"
+
+          # Production remains checked out at f476 throughout this
+          # workflow (it never touches git) -- these hashes MUST come
+          # from the immutable f476 commit object, never from this
+          # branch's own (possibly newer) working tree.
+          COMPOSE_SHA256="$(git show "${EXPECTED_PRODUCTION_SHA}:docker-compose.prod.yml" | sha256sum | awk '{print $1}')"
+          FRONTEND_SHA256="$(git show "${EXPECTED_PRODUCTION_SHA}:frontend/index.html" | sha256sum | awk '{print $1}')"
+          PROVIDER_SHA256="$(git show "${EXPECTED_PRODUCTION_SHA}:scripts/providers/linkedin_browser_provider.py" | sha256sum | awk '{print $1}')"
+
+          echo "f476 compose SHA-256: $COMPOSE_SHA256"
+          echo "f476 frontend SHA-256: $FRONTEND_SHA256"
+          echo "f476 provider SHA-256: $PROVIDER_SHA256"
+
+          {
+            echo "COMPOSE_SHA256=$COMPOSE_SHA256"
+            echo "FRONTEND_SHA256=$FRONTEND_SHA256"
+            echo "PROVIDER_SHA256=$PROVIDER_SHA256"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate VM_SSH_KEY secret is present
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "ERROR: VM_SSH_KEY secret is missing" >&2
+            exit 1
+          fi
+
+      - name: Run production API reference normalization
+        id: normalization
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_normalization_key
+          chmod 600 ~/.ssh/jobpulse_normalization_key
+          ssh-keyscan -T 10 -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          SSH_OPTS=(-o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          SSH_KEY_PATH=~/.ssh/jobpulse_normalization_key
+
+          REMOTE_SCRIPT_LOCAL="$(mktemp)"
+          cat > "$REMOTE_SCRIPT_LOCAL" <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          COMPOSE_SHA256="$1"
+          FRONTEND_SHA256="$2"
+          PROVIDER_SHA256="$3"
+          HAS_TOKEN="$4"
+          REMOTE_SCRIPT_SELF="$0"
+
+          # Generic failure tracer: fires on any command that trips set -e,
+          # including inside functions (requires -E). Reports rc/line/command
+          # only -- never env or secret values.
+          report_err() {
+            local rc=$?
+            local line="$1"
+            local cmd="$2"
+            echo "NORMALIZATION_ERROR_TRACE: rc=${rc} line=${line} cmd=${cmd}" >&2
+            return "$rc"
+          }
+          trap 'report_err "$LINENO" "$BASH_COMMAND"' ERR
+
+          fail() {
+            echo "NORMALIZATION_FAILED: $*" >&2
+            exit 1
+          }
+
+          COMPOSE_SHA256="${COMPOSE_SHA256:?required}"
+          FRONTEND_SHA256="${FRONTEND_SHA256:?required}"
+          PROVIDER_SHA256="${PROVIDER_SHA256:?required}"
+          HAS_TOKEN="${HAS_TOKEN:?required}"
+
+          # One-time pinned constants -- see docs/PRODUCTION_RUNBOOK.md's
+          # Phase 4M section. Hardcoded here (not threaded through as
+          # arguments) exactly like EXPECTED_CURRENT_SHA is hardcoded
+          # inside production-direct-runtime-upgrade.yml's remote
+          # script: these values are specific to this one-time runner
+          # version, not general parameters.
+          EXPECTED_PRODUCTION_SHA="f4765f857355c6543f68cea0e481b7f20a917147"
+          EXPECTED_CURRENT_CONFIG_IMAGE="jobpulse-api-rollback:bccbbd997ee8-1427495"
+          CANONICAL_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+          EXPECTED_IMAGE_ID="sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+          EXPECTED_API_CONTAINER_ID="ac66a4acef51c8ac3dc27b38a5559c5aa056ec033ceef43c9f8a0e4a8cbd3682"
+          EXPECTED_DB_CONTAINER_ID="98f20abb30f4fdfe9473431370c3f6db29c39183d67f31d49638a493a1f605e9"
+          EXPECTED_FRONTEND_CONTAINER_ID="fb949b779e80a53f4a9542d2eaa30945d1abbf357fbb2391b2422238371b7dd8"
+          EXPECTED_TOR_CONTAINER_ID="e2210c3c47f7a73fca1d5b2faeb62b2eeec89526a56f5da4cb1a00a3298b1612"
+          PRODUCTION_PROJECT="jobpulse"
+          COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"
+
+          # Same canonical lock paths as the Phase 4J-reviewed recovery
+          # runner -- reused, not reinvented (see the scheduler
+          # provenance section below).
+          OUTER_LOCK_PATH="/tmp/jobpulse_collection_cycle.lock"
+          INTERNAL_LOCK_PATH="/opt/jobpulse/state/run_collection_cycle.lock"
+          OUTER_LOCK_FD=""
+          INTERNAL_LOCK_FD=""
+          TMP_DOCKER_CONFIG=""
+
+          WORKFLOW_SUCCESS=false
+          # Set immediately BEFORE the mutating command, not after it
+          # returns -- same partial-mutation discipline as
+          # production-direct-runtime-upgrade.yml: `docker compose ...
+          # up --force-recreate` can itself partially apply and then
+          # still exit non-zero.
+          API_MUTATION_STARTED=false
+          NORMALIZATION_CONFIRMED=false
+          ROLLBACK_ATTEMPTED=false
+          ROLLBACK_CONFIRMED=false
+
+          # Populated by the pre-mutation precondition checks below;
+          # rollback_api() and the final EXIT trap read these.
+          API_IMAGE_ID_BEFORE=""
+
+          # Phase 4L-style shared bounded convergence check. Re-evaluates
+          # ALL FIVE core conditions together every attempt (never two
+          # serialized readiness loops followed by one immediate,
+          # non-repeated Docker health inspect -- the historical Phase
+          # 4E false-negative shape) and enforces TWO independent bounds
+          # (a 45-attempt ceiling AND an explicit SECONDS-based ~90s
+          # wall-clock deadline, checked before every iteration's
+          # probe), with every command inside an iteration carrying its
+          # own tight timeout (health curls: connect-timeout 1s/
+          # max-time 2s; the three running/health/image-id reads
+          # consolidated into one timeout-3-wrapped docker inspect).
+          # After convergence, additionally requires the container's
+          # Config.Image equals the caller-supplied expected reference
+          # and re-proves the direct/no-Tor invariant -- used both for
+          # candidate normalization (expected=$CANONICAL_IMAGE) and for
+          # rollback (expected=$EXPECTED_CURRENT_CONFIG_IMAGE).
+          wait_for_api_convergence() {
+            local expected_config_image="$1"
+            local healthy=false
+            local nginx_healthy=false
+            local running=unknown
+            local health=unknown
+            local image_id=unknown
+            local converged=false
+            local state_line
+            local attempt
+            local deadline=$((SECONDS + 90))
+            for attempt in $(seq 1 45); do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                break
+              fi
+
+              healthy=false
+              curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1 && healthy=true
+
+              nginx_healthy=false
+              curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1/api/health > /dev/null 2>&1 && nginx_healthy=true
+
+              state_line="$(timeout 3 docker inspect -f '{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Image}}' jobpulse-api-prod 2>/dev/null)" || state_line=""
+              if [ -n "$state_line" ]; then
+                IFS='|' read -r running health image_id <<< "$state_line"
+              else
+                running=unknown
+                health=unknown
+                image_id=unknown
+              fi
+
+              if [ "$healthy" = "true" ] && [ "$nginx_healthy" = "true" ] && [ "$running" = "true" ] && [ "$health" = "healthy" ] && [ "$image_id" = "$EXPECTED_IMAGE_ID" ]; then
+                converged=true
+                break
+              fi
+              sleep 2
+            done
+
+            echo "CONVERGENCE: last observed state running=$running health=$health imageId=$image_id directHealth=$healthy nginxHealth=$nginx_healthy" >&2
+
+            if [ "$converged" != "true" ]; then
+              echo "FATAL: API did not converge on expected running/healthy/image-id/health-endpoint state within the bounded window" >&2
+              return 1
+            fi
+
+            local cur_config_image cur_search_transport cur_tor_enabled
+            cur_config_image="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
+            if [ "$cur_config_image" != "$expected_config_image" ]; then
+              echo "FATAL: API Config.Image '$cur_config_image' does not equal expected '$expected_config_image'" >&2
+              return 1
+            fi
+
+            # The old (pre-normalization) image predates the reviewed
+            # SearchTransport abstraction and cannot be trusted to
+            # expose get_search_transport_mode() -- re-prove the same
+            # direct/no-Tor invariant via narrow env inspection only,
+            # never a full env dump, exactly like
+            # production-direct-runtime-upgrade.yml's rollback_api().
+            cur_search_transport="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^SEARCH_TRANSPORT=//p' | head -n1 || true)"
+            cur_tor_enabled="$(docker inspect jobpulse-api-prod --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^TOR_ENABLED=//p' | head -n1 || true)"
+
+            if [ -n "$cur_search_transport" ] && [ "$cur_search_transport" != "direct" ]; then
+              echo "FATAL: API SEARCH_TRANSPORT is not unset/direct (got '$cur_search_transport')" >&2
+              return 1
+            fi
+            if [ "$cur_tor_enabled" != "false" ]; then
+              echo "FATAL: API TOR_ENABLED is not exactly 'false' (got '${cur_tor_enabled:-<unset>}')" >&2
+              return 1
+            fi
+
+            return 0
+          }
+
+          # API-only rollback: the underlying image bytes never changed
+          # (EXPECTED_IMAGE_ID is the same before and after normalization),
+          # so rollback only needs to point the OLD logical reference back
+          # at those same bytes and recreate the container with it --
+          # never a second image pull, never a git operation (this
+          # workflow has no git rollback path because it never touches
+          # git).
+          rollback_api() {
+            echo "ROLLBACK: retagging $EXPECTED_IMAGE_ID as $EXPECTED_CURRENT_CONFIG_IMAGE and recreating api" >&2
+            docker tag "$EXPECTED_IMAGE_ID" "$EXPECTED_CURRENT_CONFIG_IMAGE" || {
+              echo "FATAL: failed to retag rollback reference $EXPECTED_CURRENT_CONFIG_IMAGE -> $EXPECTED_IMAGE_ID" >&2
+              return 1
+            }
+            JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps --force-recreate api
+
+            wait_for_api_convergence "$EXPECTED_CURRENT_CONFIG_IMAGE" || return 1
+
+            echo "ROLLBACK: API restored to pre-normalization reference $EXPECTED_CURRENT_CONFIG_IMAGE, running+healthy, direct/no-Tor invariant holds" >&2
+            return 0
+          }
+
+          release_locks() {
+            if [ -n "$INTERNAL_LOCK_FD" ]; then
+              exec {INTERNAL_LOCK_FD}>&- || true
+            fi
+            if [ -n "$OUTER_LOCK_FD" ]; then
+              exec {OUTER_LOCK_FD}>&- || true
+            fi
+          }
+
+          final_exit_trap() {
+            local ec=$?
+            set +e
+
+            if [ "$WORKFLOW_SUCCESS" != "true" ] && [ "$API_MUTATION_STARTED" = "true" ] && [ "$NORMALIZATION_CONFIRMED" != "true" ]; then
+              echo "--- normalization did not complete successfully -- attempting API-only rollback ---" >&2
+              ROLLBACK_ATTEMPTED=true
+              if rollback_api; then
+                ROLLBACK_CONFIRMED=true
+                # Rollback succeeding does NOT make this workflow
+                # succeed -- the normalization attempt itself still
+                # failed. This classification is the explicit, narrow
+                # evidence an operator needs: production is safely back
+                # at its pre-run state, but nothing was normalized.
+                echo "NORMALIZATION_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED"
+              else
+                echo "FATAL: rollback failed -- production API state is uncertain; manual operator review required (no second rollback attempt)" >&2
+                CUR_API_ID="$(docker inspect -f '{{.Id}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+                CUR_CONFIG_IMAGE="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+                CUR_IMAGE_ID="$(docker inspect -f '{{.Image}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+                CUR_RUNNING="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+                CUR_HEALTH="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+                CUR_DIRECT_HEALTH=false
+                curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1 && CUR_DIRECT_HEALTH=true
+                CUR_NGINX_HEALTH=false
+                curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1/api/health > /dev/null 2>&1 && CUR_NGINX_HEALTH=true
+                CUR_SEARCH_TRANSPORT="$(docker exec jobpulse-api-prod printenv SEARCH_TRANSPORT 2>/dev/null || echo UNSET)"
+                CUR_TOR_ENABLED="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNSET)"
+                CUR_DB_ID="$(docker inspect -f '{{.Id}}' jobpulse-postgres-prod 2>/dev/null || echo unknown)"
+                CUR_FRONTEND_ID="$(docker inspect -f '{{.Id}}' jobpulse-frontend-prod 2>/dev/null || echo unknown)"
+                CUR_TOR_ID="$(docker inspect -f '{{.Id}}' jobpulse-tor-prod 2>/dev/null || echo unknown)"
+                echo "final_api_container_id=$CUR_API_ID" >&2
+                echo "final_api_config_image=$CUR_CONFIG_IMAGE" >&2
+                echo "final_api_image_id=$CUR_IMAGE_ID" >&2
+                echo "final_api_running=$CUR_RUNNING" >&2
+                echo "final_api_health=$CUR_HEALTH" >&2
+                echo "final_api_direct_health=$CUR_DIRECT_HEALTH" >&2
+                echo "final_api_nginx_health=$CUR_NGINX_HEALTH" >&2
+                echo "final_search_transport=$CUR_SEARCH_TRANSPORT" >&2
+                echo "final_tor_enabled=$CUR_TOR_ENABLED" >&2
+                echo "final_db_id=$CUR_DB_ID" >&2
+                echo "final_frontend_id=$CUR_FRONTEND_ID" >&2
+                echo "final_tor_id=$CUR_TOR_ID" >&2
+              fi
+
+              echo "--- rollback summary ---" >&2
+              echo "api_mutation_started=$API_MUTATION_STARTED" >&2
+              echo "rollback_attempted=$ROLLBACK_ATTEMPTED" >&2
+              echo "rollback_confirmed=$ROLLBACK_CONFIRMED" >&2
+            fi
+
+            [ -n "$TMP_DOCKER_CONFIG" ] && rm -rf "$TMP_DOCKER_CONFIG"
+            release_locks
+            rm -f "$REMOTE_SCRIPT_SELF"
+
+            exit "$ec"
+          }
+          trap final_exit_trap EXIT
+
+          cd /opt/jobpulse || fail "cannot cd to /opt/jobpulse"
+
+          echo "===NORMALIZATION_START==="
+          echo "== identity =="
+          hostname
+
+          echo "== precondition: production git state (this workflow NEVER mutates git) =="
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          echo "current_sha=$CURRENT_SHA"
+          [ "$CURRENT_SHA" = "$EXPECTED_PRODUCTION_SHA" ] || fail "production git HEAD ($CURRENT_SHA) is not the expected f476 SHA ($EXPECTED_PRODUCTION_SHA) -- refusing to guess, no mutation"
+
+          DIRTY_TRACKED_BEFORE="$(git status --porcelain | grep -v '^??' || true)"
+          [ -z "$DIRTY_TRACKED_BEFORE" ] || fail "production tracked worktree is not clean before mutation"
+          echo "git_precondition=ok"
+
+          echo "== precondition: host file provenance against immutable f476 hashes =="
+          ACTUAL_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
+          [ "$ACTUAL_COMPOSE_SHA256" = "$COMPOSE_SHA256" ] || fail "compose file SHA-256 ($ACTUAL_COMPOSE_SHA256) does not match expected f476 hash ($COMPOSE_SHA256)"
+          ACTUAL_FRONTEND_SHA256="$(sha256sum frontend/index.html | awk '{print $1}')"
+          [ "$ACTUAL_FRONTEND_SHA256" = "$FRONTEND_SHA256" ] || fail "frontend/index.html SHA-256 ($ACTUAL_FRONTEND_SHA256) does not match expected f476 hash ($FRONTEND_SHA256)"
+          ACTUAL_PROVIDER_SHA256="$(sha256sum scripts/providers/linkedin_browser_provider.py | awk '{print $1}')"
+          [ "$ACTUAL_PROVIDER_SHA256" = "$PROVIDER_SHA256" ] || fail "provider file SHA-256 ($ACTUAL_PROVIDER_SHA256) does not match expected f476 hash ($PROVIDER_SHA256)"
+          echo "file_provenance=confirmed_f476"
+
+          echo "== precondition: current API container state =="
+          api_field() {
+            docker inspect jobpulse-api-prod --format "$1"
+          }
+          API_ID_BEFORE="$(api_field '{{.Id}}')"
+          API_CONFIG_IMAGE_BEFORE="$(api_field '{{.Config.Image}}')"
+          API_IMAGE_ID_BEFORE="$(api_field '{{.Image}}')"
+          API_RUNNING_BEFORE="$(api_field '{{.State.Running}}')"
+          API_HEALTH_BEFORE="$(api_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          API_RESTART_COUNT_BEFORE="$(api_field '{{.RestartCount}}')"
+          API_SERVICE_LABEL_BEFORE="$(docker inspect jobpulse-api-prod --format '{{index .Config.Labels "com.docker.compose.service"}}')"
+          API_PROJECT_LABEL_BEFORE="$(docker inspect jobpulse-api-prod --format '{{index .Config.Labels "com.docker.compose.project"}}')"
+
+          echo "api_id_before=$API_ID_BEFORE"
+          echo "api_config_image_before=$API_CONFIG_IMAGE_BEFORE"
+          echo "api_image_id_before=$API_IMAGE_ID_BEFORE"
+          echo "api_running_before=$API_RUNNING_BEFORE"
+          echo "api_health_before=$API_HEALTH_BEFORE"
+          echo "api_restart_count_before=$API_RESTART_COUNT_BEFORE"
+
+          [ "$API_ID_BEFORE" = "$EXPECTED_API_CONTAINER_ID" ] || fail "API container ID ($API_ID_BEFORE) does not match expected ($EXPECTED_API_CONTAINER_ID)"
+          [ "$API_CONFIG_IMAGE_BEFORE" = "$EXPECTED_CURRENT_CONFIG_IMAGE" ] || fail "API Config.Image ($API_CONFIG_IMAGE_BEFORE) does not match expected pre-normalization alias ($EXPECTED_CURRENT_CONFIG_IMAGE) -- may already be normalized or otherwise drifted"
+          [ "$API_IMAGE_ID_BEFORE" = "$EXPECTED_IMAGE_ID" ] || fail "API underlying image ID ($API_IMAGE_ID_BEFORE) does not match expected f476 image ($EXPECTED_IMAGE_ID)"
+          [ "$API_RUNNING_BEFORE" = "true" ] || fail "API container is not running"
+          [ "$API_HEALTH_BEFORE" = "healthy" ] || fail "API container is not healthy (got $API_HEALTH_BEFORE)"
+          [ "$API_RESTART_COUNT_BEFORE" = "0" ] || fail "API restart_count is not 0 (got $API_RESTART_COUNT_BEFORE)"
+          [ "$API_SERVICE_LABEL_BEFORE" = "api" ] || fail "API compose service label is not 'api' (got $API_SERVICE_LABEL_BEFORE)"
+          [ "$API_PROJECT_LABEL_BEFORE" = "$PRODUCTION_PROJECT" ] || fail "API compose project label is not '$PRODUCTION_PROJECT' (got $API_PROJECT_LABEL_BEFORE)"
+
+          curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null || fail "API direct health check failed"
+          curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null || fail "API nginx-proxied health check failed"
+          echo "api_precondition=ok"
+
+          echo "== precondition: direct transport / no Tor =="
+          SEARCH_TRANSPORT_BEFORE="$(docker exec jobpulse-api-prod printenv SEARCH_TRANSPORT 2>/dev/null || echo UNSET)"
+          TOR_ENABLED_BEFORE="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNSET)"
+          echo "search_transport_before=$SEARCH_TRANSPORT_BEFORE"
+          echo "tor_enabled_before=$TOR_ENABLED_BEFORE"
+          if [ "$SEARCH_TRANSPORT_BEFORE" != "UNSET" ] && [ "$SEARCH_TRANSPORT_BEFORE" != "direct" ]; then
+            fail "SEARCH_TRANSPORT is neither unset nor 'direct' (got $SEARCH_TRANSPORT_BEFORE)"
+          fi
+          [ "$TOR_ENABLED_BEFORE" = "false" ] || fail "TOR_ENABLED is not exactly 'false' (got $TOR_ENABLED_BEFORE)"
+
+          echo "== precondition: DB/frontend/Tor container identity =="
+          db_field() { docker inspect jobpulse-postgres-prod --format "$1"; }
+          DB_ID_BEFORE="$(db_field '{{.Id}}')"
+          DB_IMAGE_ID_BEFORE="$(db_field '{{.Image}}')"
+          DB_RUNNING_BEFORE="$(db_field '{{.State.Running}}')"
+          DB_HEALTH_BEFORE="$(db_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          DB_RESTART_COUNT_BEFORE="$(db_field '{{.RestartCount}}')"
+          [ "$DB_ID_BEFORE" = "$EXPECTED_DB_CONTAINER_ID" ] || fail "DB container ID mismatch ($DB_ID_BEFORE)"
+          [ "$DB_RUNNING_BEFORE" = "true" ] || fail "DB is not running"
+          [ "$DB_HEALTH_BEFORE" = "healthy" ] || fail "DB is not healthy (got $DB_HEALTH_BEFORE)"
+          [ "$DB_RESTART_COUNT_BEFORE" = "0" ] || fail "DB restart_count is not 0 (got $DB_RESTART_COUNT_BEFORE)"
+
+          frontend_field() { docker inspect jobpulse-frontend-prod --format "$1"; }
+          FRONTEND_ID_BEFORE="$(frontend_field '{{.Id}}')"
+          FRONTEND_IMAGE_ID_BEFORE="$(frontend_field '{{.Image}}')"
+          FRONTEND_RUNNING_BEFORE="$(frontend_field '{{.State.Running}}')"
+          FRONTEND_RESTART_COUNT_BEFORE="$(frontend_field '{{.RestartCount}}')"
+          [ "$FRONTEND_ID_BEFORE" = "$EXPECTED_FRONTEND_CONTAINER_ID" ] || fail "frontend container ID mismatch ($FRONTEND_ID_BEFORE)"
+          [ "$FRONTEND_RUNNING_BEFORE" = "true" ] || fail "frontend is not running"
+          [ "$FRONTEND_RESTART_COUNT_BEFORE" = "0" ] || fail "frontend restart_count is not 0 (got $FRONTEND_RESTART_COUNT_BEFORE)"
+
+          tor_field() { docker inspect jobpulse-tor-prod --format "$1"; }
+          TOR_ID_BEFORE="$(tor_field '{{.Id}}')"
+          TOR_IMAGE_ID_BEFORE="$(tor_field '{{.Image}}')"
+          TOR_RUNNING_BEFORE="$(tor_field '{{.State.Running}}')"
+          TOR_HEALTH_BEFORE="$(tor_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          TOR_RESTART_COUNT_BEFORE="$(tor_field '{{.RestartCount}}')"
+          [ "$TOR_ID_BEFORE" = "$EXPECTED_TOR_CONTAINER_ID" ] || fail "Tor container ID mismatch ($TOR_ID_BEFORE)"
+          [ "$TOR_RUNNING_BEFORE" = "true" ] || fail "Tor is not running"
+          [ "$TOR_HEALTH_BEFORE" = "healthy" ] || fail "Tor is not healthy (got $TOR_HEALTH_BEFORE)"
+          [ "$TOR_RESTART_COUNT_BEFORE" = "0" ] || fail "Tor restart_count is not 0 (got $TOR_RESTART_COUNT_BEFORE)"
+          TOR_PUBLISHED_PORTS_BEFORE="$(docker port jobpulse-tor-prod 2>/dev/null || true)"
+          [ -z "$TOR_PUBLISHED_PORTS_BEFORE" ] || fail "Tor publishes host ports (expected none): $TOR_PUBLISHED_PORTS_BEFORE"
+          echo "other_services_precondition=ok"
+
+          echo "== precondition: frontend bind mount + live f476 baseline =="
+          MOUNT_LINE="$(docker inspect jobpulse-frontend-prod --format '{{range .Mounts}}{{if eq .Destination "/usr/share/nginx/html"}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{end}}{{end}}')"
+          [ -n "$MOUNT_LINE" ] || fail "no mount found for /usr/share/nginx/html"
+          MOUNT_TYPE="$(cut -d'|' -f1 <<< "$MOUNT_LINE")"
+          MOUNT_SOURCE="$(cut -d'|' -f2 <<< "$MOUNT_LINE")"
+          MOUNT_RW="$(cut -d'|' -f4 <<< "$MOUNT_LINE")"
+          [ "$MOUNT_TYPE" = "bind" ] || fail "frontend mount type is not bind (got $MOUNT_TYPE)"
+          [ "$MOUNT_SOURCE" = "/opt/jobpulse/frontend" ] || fail "frontend mount source is not /opt/jobpulse/frontend (got $MOUNT_SOURCE)"
+          [ "$MOUNT_RW" = "false" ] || fail "frontend mount is not read-only (RW=$MOUNT_RW)"
+
+          LIVE_FRONTEND_SHA256_BEFORE="$(curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ | sha256sum | awk '{print $1}')"
+          [ "$LIVE_FRONTEND_SHA256_BEFORE" = "$FRONTEND_SHA256" ] || fail "live frontend SHA-256 ($LIVE_FRONTEND_SHA256_BEFORE) does not match immutable f476 baseline ($FRONTEND_SHA256) -- exact bytes required, not marker-only"
+          echo "frontend_live_baseline=confirmed_f476"
+
+          # ---------------------------------------------------------------
+          # Scheduler provenance (bounded, read-only, non-executing).
+          #
+          # Copied as literally as practical from the already-reviewed
+          # Phase 4J version in
+          # .github/workflows/production-split-release-recovery.yml --
+          # see tests/test_production_api_reference_normalization_workflow.py's
+          # parity test. Not reinvented, not the older
+          # production-direct-runtime-upgrade.yml scanner. The two
+          # hardcoded lock paths above are only safe to acquire if the
+          # production scheduler still uses the launcher they were
+          # pinned from; this section re-proves that before either lock
+          # is taken.
+          # ---------------------------------------------------------------
+          echo "== scheduler provenance: this account's own crontab (bounded, read-only, non-executing) =="
+          command -v timeout > /dev/null 2>&1 || fail "timeout utility unavailable -- cannot bound scheduler provenance checks"
+          command -v crontab > /dev/null 2>&1 || fail "crontab command unavailable -- cannot establish this account's own scheduled launcher"
+
+          CANONICAL_LAUNCHER_LINE='*/30 * * * * cd /opt/jobpulse && flock -n /tmp/jobpulse_collection_cycle.lock ./scripts/run_collection_cycle_safe.sh'
+
+          OWN_CRONTAB_STATUS=0
+          OWN_CRONTAB_OUTPUT="$(timeout 5 crontab -l 2>&1)" || OWN_CRONTAB_STATUS=$?
+          # Historical evidence (runs 34479326097 and 34679402811) proves
+          # this account HAS a scheduled launcher -- an unreadable or
+          # empty ("no crontab for this account") crontab is therefore
+          # itself scheduler drift, never an acceptable empty state.
+          if [ "$OWN_CRONTAB_STATUS" -ne 0 ]; then
+            # Never echo $OWN_CRONTAB_OUTPUT -- a crontab may contain
+            # unrelated sensitive commands or environment values. Report
+            # only a bounded classification, never the raw content.
+            OWN_CRONTAB_FAILURE_CATEGORY="read_error"
+            grep -qi 'no crontab for' <<< "$OWN_CRONTAB_OUTPUT" && OWN_CRONTAB_FAILURE_CATEGORY="no_crontab"
+            fail "cannot read this account's own crontab in a bounded way (exit $OWN_CRONTAB_STATUS, category=$OWN_CRONTAB_FAILURE_CATEGORY) -- historical evidence proves a scheduled launcher exists here, so this is scheduler drift, not an acceptable empty state"
+          fi
+
+          CANONICAL_MATCH_COUNT="$(grep -Fxc "$CANONICAL_LAUNCHER_LINE" <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          WRAPPER_MENTION_COUNT="$(grep -Fc 'run_collection_cycle_safe.sh' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          OWN_ROOT_VAR_COUNT="$(grep -Fc 'JOBPULSE_COLLECTION_ROOT' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          OWN_LOCK_VAR_COUNT="$(grep -Fc 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+
+          [ "$CANONICAL_MATCH_COUNT" = "1" ] || fail "this account's crontab does not contain exactly one occurrence of the historically proven canonical launcher line (found $CANONICAL_MATCH_COUNT) -- refusing to proceed, scheduler may have drifted"
+          [ "$WRAPPER_MENTION_COUNT" = "1" ] || fail "this account's crontab mentions run_collection_cycle_safe.sh $WRAPPER_MENTION_COUNT time(s), expected exactly 1 -- refusing to proceed"
+          # Historical evidence proves the canonical launcher line itself,
+          # never an environment-variable override -- any such reference
+          # now would be unproven drift, not something to guess about.
+          [ "$OWN_ROOT_VAR_COUNT" = "0" ] || fail "this account's crontab references JOBPULSE_COLLECTION_ROOT, which historical evidence never proved -- refusing to guess, failing closed"
+          [ "$OWN_LOCK_VAR_COUNT" = "0" ] || fail "this account's crontab references JOBPULSE_COLLECTION_CYCLE_LOCK_PATH, which historical evidence never proved -- refusing to guess, failing closed"
+          echo "own_crontab_provenance=confirmed_canonical_launcher"
+
+          echo "== scheduler drift check: /etc/crontab (read-only, bounded, absence-only) =="
+          if [ -e /etc/crontab ]; then
+            [ -r /etc/crontab ] || fail "/etc/crontab exists but is not readable -- refusing to proceed without proven scheduler drift status"
+            ETC_CRONTAB_CONTENT="$(timeout 5 cat /etc/crontab)" || fail "timed out reading /etc/crontab"
+            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$ETC_CRONTAB_CONTENT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$ETC_CRONTAB_CONTENT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$ETC_CRONTAB_CONTENT"; then
+              fail "/etc/crontab now references the collection wrapper or its launcher variables -- unexpected scheduler drift from the historically proven single-launcher state (run 34679402811), refusing to proceed"
+            fi
+          fi
+          echo "etc_crontab_drift=none"
+
+          echo "== scheduler drift check: /etc/cron.d/* (read-only, bounded, absence-only) =="
+          if [ -d /etc/cron.d ]; then
+            CRON_D_FILES="$(timeout 5 find /etc/cron.d -maxdepth 1 -type f 2>&1)" || fail "could not list /etc/cron.d in a bounded way"
+            while IFS= read -r cron_d_file; do
+              [ -z "$cron_d_file" ] && continue
+              [ -r "$cron_d_file" ] || fail "$cron_d_file exists but is not readable -- refusing to proceed without proven scheduler drift status"
+              CRON_D_CONTENT="$(timeout 5 cat "$cron_d_file")" || fail "timed out reading $cron_d_file"
+              if grep -Fq 'run_collection_cycle_safe.sh' <<< "$CRON_D_CONTENT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$CRON_D_CONTENT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$CRON_D_CONTENT"; then
+                fail "$cron_d_file now references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+              fi
+            done <<< "$CRON_D_FILES"
+          fi
+          echo "cron_d_drift=none"
+
+          echo "== scheduler drift check: root crontab (bounded, non-interactive sudo, absence-only) =="
+          if command -v sudo > /dev/null 2>&1 && command -v crontab > /dev/null 2>&1; then
+            ROOT_CRONTAB_STATUS=0
+            ROOT_CRONTAB_OUTPUT="$(timeout 5 sudo -n crontab -u root -l 2>&1)" || ROOT_CRONTAB_STATUS=$?
+            if [ "$ROOT_CRONTAB_STATUS" -eq 0 ]; then
+              if grep -Fq 'run_collection_cycle_safe.sh' <<< "$ROOT_CRONTAB_OUTPUT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$ROOT_CRONTAB_OUTPUT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$ROOT_CRONTAB_OUTPUT"; then
+                fail "root's crontab now references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+              fi
+            elif grep -qi 'no crontab for' <<< "$ROOT_CRONTAB_OUTPUT"; then
+              :
+            else
+              # Never echo $ROOT_CRONTAB_OUTPUT -- root's crontab may
+              # contain unrelated sensitive commands or environment
+              # values. Report only source label and exit status.
+              fail "cannot establish root's crontab configuration read-only (source=sudo -n crontab -u root -l, exit $ROOT_CRONTAB_STATUS) -- refusing to proceed without proven root-cron provenance"
+            fi
+          else
+            fail "sudo or crontab command unavailable -- cannot establish root's crontab configuration, refusing to proceed without proven root-cron provenance"
+          fi
+          echo "root_crontab_drift=none"
+
+          echo "== scheduler drift check: systemd effective unit configuration (read-only, bounded, fail-closed, absence-only) =="
+          # Fail-closed: systemd state must be positively established --
+          # never silently skipped -- before this runner is allowed to
+          # proceed to mutation. Every enumeration/inspection step below
+          # captures its exit status explicitly via a dedicated STATUS
+          # variable (never a blanket fallback that would mask a
+          # nonzero exit), and none print the complete raw command
+          # output (bounded status code + source/action label only).
+          #
+          # Phase 4I (run 35846112545) proved this needs a two-level
+          # model, not a single blind `systemctl show` over every name
+          # `systemctl list-unit-files` returns: the live host's
+          # persistent unit-file inventory includes uninstantiated
+          # systemd TEMPLATE units (e.g. apport-coredump-hook@.service),
+          # and `systemctl show <template>@.service` is not a reliable
+          # operation for those -- it returned exit 1, which correctly
+          # fail-closed this runner before any mutation, but the
+          # enumeration/inspection model itself was too naive. Phase 4J
+          # distinguishes, semantically (never by hardcoded unit name):
+          #   - an uninstantiated template unit file (name matches
+          #     *@.service exactly) -> inspect its static definition via
+          #     `systemctl cat`, never `systemctl show`.
+          #   - every other (ordinary, concrete) unit-file name -> as
+          #     before, `systemctl show`.
+          # A currently-instantiated copy of a template (e.g.
+          # foo@instance.service) does not appear in the persistent
+          # unit-file inventory as such, so it is caught separately below
+          # via `systemctl list-units` (the loaded-unit inventory) and
+          # inspected via `systemctl show` like any other loaded unit.
+          command -v systemctl > /dev/null 2>&1 || fail "systemctl command unavailable -- cannot establish systemd scheduler state, refusing to proceed without proven systemd provenance"
+
+          UNIT_LIST_STATUS=0
+          UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager --full 2>&1)" || UNIT_LIST_STATUS=$?
+          [ "$UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-unit-files failed in a bounded read (source=systemctl list-unit-files, exit $UNIT_LIST_STATUS) -- refusing to proceed without proven systemd unit enumeration"
+          # `--full` so a long unit name is never ellipsized before
+          # semantic template detection; `NF {print $1}` so a blank
+          # record never yields an empty first field.
+          UNIT_NAMES="$(awk 'NF {print $1}' <<< "$UNIT_LIST_OUTPUT")"
+
+          while IFS= read -r unit; do
+            [ -z "$unit" ] && continue
+            # Defense in depth: if `systemctl list-unit-files` output
+            # ever shapes differently than expected (decoration,
+            # truncation, a future systemd version), refuse to guess and
+            # never let a malformed token reach `systemctl show`/`cat`.
+            case "$unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-unit-files output (token=$unit)" ;;
+            esac
+            case "$unit" in
+              *@.service)
+                # Uninstantiated systemd template unit -- `systemctl show`
+                # against a bare template name is not a reliable
+                # operation (this is the exact Phase 4I regression:
+                # apport-coredump-hook@.service returned exit 1). Inspect
+                # the template's static definition instead.
+                TEMPLATE_CAT_STATUS=0
+                TEMPLATE_CAT_OUTPUT="$(timeout 5 systemctl cat "$unit" --no-pager 2>&1)" || TEMPLATE_CAT_STATUS=$?
+                [ "$TEMPLATE_CAT_STATUS" -eq 0 ] || fail "systemctl cat failed in a bounded read (source=systemctl cat, unit=$unit, exit $TEMPLATE_CAT_STATUS) -- refusing to proceed without proven template unit definition"
+                [ -n "$TEMPLATE_CAT_OUTPUT" ] || fail "systemctl cat returned an unusable (empty) result for template unit $unit -- refusing to proceed without proven template unit definition"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$TEMPLATE_CAT_OUTPUT"; then
+                  fail "systemd template unit $unit definition references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+              *)
+                UNIT_SHOW_STATUS=0
+                UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || UNIT_SHOW_STATUS=$?
+                [ "$UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$unit, exit $UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+                [ -n "$UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $unit -- refusing to proceed without proven effective systemd state"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$UNIT_SHOW_OUTPUT"; then
+                  fail "systemd unit $unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+            esac
+          done <<< "$UNIT_NAMES"
+          echo "systemd_unit_file_drift=none"
+
+          echo "== scheduler drift check: systemd loaded unit inventory (systemctl list-units, catches instantiated templates) =="
+          LOADED_UNIT_LIST_STATUS=0
+          # `--plain` is mandatory: without it, systemctl renders a
+          # leading status-circle glyph (e.g. "* broken.service ...") for
+          # a failed/degraded unit, which would otherwise become a
+          # pseudo-column and shift $1 away from the actual unit name.
+          # `--full` prevents a long unit name from being ellipsized
+          # before it is inspected.
+          LOADED_UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-units --type=service --all --no-legend --no-pager --plain --full 2>&1)" || LOADED_UNIT_LIST_STATUS=$?
+          [ "$LOADED_UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-units failed in a bounded read (source=systemctl list-units, exit $LOADED_UNIT_LIST_STATUS) -- refusing to proceed without proven loaded systemd unit enumeration"
+          LOADED_UNIT_NAMES="$(awk 'NF {print $1}' <<< "$LOADED_UNIT_LIST_OUTPUT")"
+
+          while IFS= read -r loaded_unit; do
+            [ -z "$loaded_unit" ] && continue
+            # Defense in depth: refuse to guess if a parsed record is not
+            # a `*.service` name (see the identical unit-file check
+            # above) -- never call `systemctl show` with an unexpected
+            # token such as a stray status-circle glyph.
+            case "$loaded_unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-units output (token=$loaded_unit)" ;;
+            esac
+            # Every loaded unit -- including an instantiated template
+            # such as foo@instance.service -- is inspected the same way
+            # as an ordinary concrete unit. A normal service may already
+            # have been inspected once above from the unit-file
+            # inventory; inspecting it again here is acceptable (simple,
+            # auditable logic beats premature deduplication).
+            LOADED_UNIT_SHOW_STATUS=0
+            LOADED_UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$loaded_unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || LOADED_UNIT_SHOW_STATUS=$?
+            [ "$LOADED_UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$loaded_unit, exit $LOADED_UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+            [ -n "$LOADED_UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $loaded_unit -- refusing to proceed without proven effective systemd state"
+            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$LOADED_UNIT_SHOW_OUTPUT"; then
+              fail "systemd loaded unit $loaded_unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+            fi
+          done <<< "$LOADED_UNIT_NAMES"
+          echo "systemd_loaded_unit_drift=none"
+
+          echo "systemd_drift=none"
+
+          echo "== effective internal lock path provenance: /opt/jobpulse/.collection.env (parsed as data only, never sourced/eval'd) =="
+          COLLECTION_ENV_PATH="/opt/jobpulse/.collection.env"
+          if [ -e "$COLLECTION_ENV_PATH" ]; then
+            [ -r "$COLLECTION_ENV_PATH" ] || fail "$COLLECTION_ENV_PATH exists but is not readable -- refusing to proceed"
+            COLLECTION_ENV_CONTENT="$(timeout 5 cat "$COLLECTION_ENV_PATH")" || fail "timed out reading $COLLECTION_ENV_PATH"
+            LOCK_ASSIGNMENTS_FOUND=0
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?JOBPULSE_COLLECTION_CYCLE_LOCK_PATH=(.*)$ ]]; then
+                RAW_VALUE="${BASH_REMATCH[2]}"
+                if [[ "$RAW_VALUE" =~ ^([^\#]*[^[:space:]\#])[[:space:]]+\#.*$ ]]; then
+                  RAW_VALUE="${BASH_REMATCH[1]}"
+                fi
+                RAW_VALUE="${RAW_VALUE%"${RAW_VALUE##*[![:space:]]}"}"
+                if [[ "$RAW_VALUE" =~ ^\'(.*)\'$ ]]; then
+                  LOCK_VALUE="${BASH_REMATCH[1]}"
+                elif [[ "$RAW_VALUE" =~ ^\"(.*)\"$ ]]; then
+                  LOCK_VALUE="${BASH_REMATCH[1]}"
+                  if [[ "$LOCK_VALUE" == *'$'* ]] || [[ "$LOCK_VALUE" == *'`'* ]]; then
+                    fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH using dynamic shell syntax -- refusing to guess, failing closed"
+                  fi
+                else
+                  LOCK_VALUE="$RAW_VALUE"
+                fi
+                if [[ "$LOCK_VALUE" == *'$'* ]] || [[ "$LOCK_VALUE" == *'`'* ]]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH using dynamic shell syntax -- refusing to guess, failing closed"
+                fi
+                LOCK_ASSIGNMENTS_FOUND=$((LOCK_ASSIGNMENTS_FOUND + 1))
+                if [ "$LOCK_ASSIGNMENTS_FOUND" -gt 1 ]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH more than once with potentially conflicting values -- refusing to guess which is authoritative, failing closed"
+                fi
+                if [ "$LOCK_VALUE" != "$INTERNAL_LOCK_PATH" ]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH to '$LOCK_VALUE', not the expected '$INTERNAL_LOCK_PATH' -- refusing to proceed"
+                fi
+              elif [[ "$line" == *"JOBPULSE_COLLECTION_CYCLE_LOCK_PATH"* ]]; then
+                fail "$COLLECTION_ENV_PATH references JOBPULSE_COLLECTION_CYCLE_LOCK_PATH in a line that is not a recognizable assignment -- refusing to guess, failing closed"
+              fi
+            done <<< "$COLLECTION_ENV_CONTENT"
+          fi
+          # Absent file or absent assignment is acceptable: the wrapper's
+          # own source default already resolves to INTERNAL_LOCK_PATH,
+          # and run 34679402811 proved that is the live effective value.
+          echo "effective_internal_lock_provenance=confirmed_or_absent_default"
+
+          echo "== collection scheduler safety: acquire locks non-blocking, outer then internal =="
+          exec {OUTER_LOCK_FD}>"$OUTER_LOCK_PATH" || fail "cannot open outer lock file $OUTER_LOCK_PATH"
+          flock -n "$OUTER_LOCK_FD" || fail "outer collection lock busy: $OUTER_LOCK_PATH -- refusing to proceed, no mutation"
+          echo "outer_lock_acquired=yes"
+
+          exec {INTERNAL_LOCK_FD}>"$INTERNAL_LOCK_PATH" || fail "cannot open internal lock file $INTERNAL_LOCK_PATH"
+          flock -n "$INTERNAL_LOCK_FD" || fail "internal collection lock busy: $INTERNAL_LOCK_PATH -- refusing to proceed, no mutation"
+          echo "internal_lock_acquired=yes"
+
+          echo "== active collector check (read-only, docker top -- never kills anything) =="
+          TOP_OUTPUT="$(docker top jobpulse-api-prod)"
+          echo "$TOP_OUTPUT"
+          ACTIVE_COLLECTOR=no
+          for pattern in linkedin_auth_preflight seed_priority_coverage_queue process_search_demand_queue linkedin_plan_collect collector_postgres reconcile_priority_coverage run_collection_cycle; do
+            if grep -q "$pattern" <<< "$TOP_OUTPUT"; then
+              ACTIVE_COLLECTOR=yes
+              echo "active_collector_pattern=$pattern"
+            fi
+          done
+          echo "active_collector=$ACTIVE_COLLECTOR"
+          [ "$ACTIVE_COLLECTOR" = "no" ] || fail "active collector process detected -- refusing to proceed, no mutation"
+
+          echo "== canonical image provenance (GHCR pull, never touches a running container) =="
+          TMP_DOCKER_CONFIG="$(mktemp -d)"
+          if [ "$HAS_TOKEN" = "true" ]; then
+            # The GHCR token (if any) arrives on THIS script's own stdin,
+            # piped through the SSH session that invoked it -- never as a
+            # command-line argument/argv, never Base64-transformed in
+            # transit, never printed. Public images can also be pulled
+            # anonymously (HAS_TOKEN=false is accepted).
+            DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker login ghcr.io -u mrezamaghouli --password-stdin
+          fi
+          DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$CANONICAL_IMAGE"
+          PULLED_IMAGE_ID="$(docker image inspect "$CANONICAL_IMAGE" --format '{{.Id}}')"
+          [ "$PULLED_IMAGE_ID" = "$EXPECTED_IMAGE_ID" ] || fail "canonical image $CANONICAL_IMAGE resolved to unexpected ID $PULLED_IMAGE_ID (expected $EXPECTED_IMAGE_ID) -- refusing to mutate before ever touching the running container"
+          echo "canonical_image_provenance=confirmed_same_bytes"
+
+          echo "== effective candidate compose config (read-only, no mutation yet) =="
+          EFFECTIVE_CANDIDATE_CONFIG="$(JOBPULSE_API_IMAGE="$CANONICAL_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)"
+          EFFECTIVE_CANDIDATE_API_BLOCK="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_CONFIG" | awk '
+            /^  api:/ { in_api=1; next }
+            in_api && /^  [A-Za-z0-9_.-]+:/ { in_api=0 }
+            in_api { print }
+          ')"
+          EFFECTIVE_CANDIDATE_API_IMAGE="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_API_BLOCK" | sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          [ "$EFFECTIVE_CANDIDATE_API_IMAGE" = "$CANONICAL_IMAGE" ] || fail "effective candidate Compose image is '$EFFECTIVE_CANDIDATE_API_IMAGE', expected exactly '$CANONICAL_IMAGE'"
+
+          EFFECTIVE_CANDIDATE_ENV_BLOCK="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_API_BLOCK" | awk '
+            /^    environment:/ { in_env=1; next }
+            in_env && /^    [A-Za-z0-9_.-]+:/ { in_env=0 }
+            in_env { print }
+          ')"
+          EFFECTIVE_CANDIDATE_TOR_ENABLED="$(printf '%s\n' "$EFFECTIVE_CANDIDATE_ENV_BLOCK" | sed -n 's/^[[:space:]]*TOR_ENABLED:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          [ "$EFFECTIVE_CANDIDATE_TOR_ENABLED" = "false" ] || fail "effective candidate Compose TOR_ENABLED is not exactly 'false' (got '${EFFECTIVE_CANDIDATE_TOR_ENABLED:-<unset>}')"
+          echo "effective_candidate_config=confirmed"
+
+          echo "== final pre-mutation revalidation (narrows the preflight-to-mutation race window) =="
+          REVALIDATE_SHA="$(git rev-parse HEAD)"
+          [ "$REVALIDATE_SHA" = "$EXPECTED_PRODUCTION_SHA" ] || fail "production git SHA drifted before mutation (revalidation): $REVALIDATE_SHA"
+          REVALIDATE_API_ID="$(api_field '{{.Id}}')"
+          [ "$REVALIDATE_API_ID" = "$EXPECTED_API_CONTAINER_ID" ] || fail "API container ID drifted before mutation (revalidation)"
+          REVALIDATE_API_CONFIG_IMAGE="$(api_field '{{.Config.Image}}')"
+          [ "$REVALIDATE_API_CONFIG_IMAGE" = "$EXPECTED_CURRENT_CONFIG_IMAGE" ] || fail "API Config.Image drifted before mutation (revalidation)"
+          REVALIDATE_API_IMAGE_ID="$(api_field '{{.Image}}')"
+          [ "$REVALIDATE_API_IMAGE_ID" = "$EXPECTED_IMAGE_ID" ] || fail "API underlying image ID drifted before mutation (revalidation)"
+          REVALIDATE_DB_ID="$(db_field '{{.Id}}')"
+          [ "$REVALIDATE_DB_ID" = "$EXPECTED_DB_CONTAINER_ID" ] || fail "DB container ID drifted before mutation (revalidation)"
+          REVALIDATE_FRONTEND_ID="$(frontend_field '{{.Id}}')"
+          [ "$REVALIDATE_FRONTEND_ID" = "$EXPECTED_FRONTEND_CONTAINER_ID" ] || fail "frontend container ID drifted before mutation (revalidation)"
+          REVALIDATE_TOR_ID="$(tor_field '{{.Id}}')"
+          [ "$REVALIDATE_TOR_ID" = "$EXPECTED_TOR_CONTAINER_ID" ] || fail "Tor container ID drifted before mutation (revalidation)"
+          REVALIDATE_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
+          [ "$REVALIDATE_COMPOSE_SHA256" = "$COMPOSE_SHA256" ] || fail "compose file SHA-256 drifted before mutation (revalidation)"
+          REVALIDATE_SEARCH_TRANSPORT="$(docker exec jobpulse-api-prod printenv SEARCH_TRANSPORT 2>/dev/null || echo UNSET)"
+          if [ "$REVALIDATE_SEARCH_TRANSPORT" != "UNSET" ] && [ "$REVALIDATE_SEARCH_TRANSPORT" != "direct" ]; then
+            fail "SEARCH_TRANSPORT drifted before mutation (revalidation)"
+          fi
+          REVALIDATE_TOR_ENABLED="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNSET)"
+          [ "$REVALIDATE_TOR_ENABLED" = "false" ] || fail "TOR_ENABLED drifted before mutation (revalidation)"
+          echo "final_pre_mutation_revalidation=ok"
+
+          echo "== ONLY AUTHORIZED PRODUCTION MUTATION: recreate api with the canonical f476 reference (same image bytes) =="
+          API_MUTATION_STARTED=true
+          JOBPULSE_API_IMAGE="$CANONICAL_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps --force-recreate api
+
+          wait_for_api_convergence "$CANONICAL_IMAGE" || exit 1
+
+          echo "== normalization-specific success conditions =="
+          NEW_API_ID="$(docker inspect -f '{{.Id}}' jobpulse-api-prod)"
+          [ "$NEW_API_ID" != "$EXPECTED_API_CONTAINER_ID" ] || fail "API container ID is unchanged after --force-recreate -- recreation did not actually occur"
+          NEW_API_RESTART_COUNT="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
+          [ "$NEW_API_RESTART_COUNT" = "0" ] || fail "API restart_count is not 0 after recreation (got $NEW_API_RESTART_COUNT)"
+          echo "new_api_container_id=$NEW_API_ID"
+          echo "image_bytes_unchanged=true (still $EXPECTED_IMAGE_ID)"
+
+          echo "== post-candidate DB/frontend/Tor invariant (must remain fully unchanged) =="
+          DB_ID_AFTER="$(db_field '{{.Id}}')"
+          DB_IMAGE_ID_AFTER="$(db_field '{{.Image}}')"
+          DB_RESTART_COUNT_AFTER="$(db_field '{{.RestartCount}}')"
+          DB_HEALTH_AFTER="$(db_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          [ "$DB_ID_AFTER" = "$DB_ID_BEFORE" ] || fail "DB container ID changed: before=$DB_ID_BEFORE after=$DB_ID_AFTER"
+          [ "$DB_IMAGE_ID_AFTER" = "$DB_IMAGE_ID_BEFORE" ] || fail "DB image ID changed: before=$DB_IMAGE_ID_BEFORE after=$DB_IMAGE_ID_AFTER"
+          [ "$DB_RESTART_COUNT_AFTER" = "$DB_RESTART_COUNT_BEFORE" ] || fail "DB restart_count changed: before=$DB_RESTART_COUNT_BEFORE after=$DB_RESTART_COUNT_AFTER"
+          [ "$DB_HEALTH_AFTER" = "healthy" ] || fail "DB is not healthy after recreation (got $DB_HEALTH_AFTER)"
+
+          FRONTEND_ID_AFTER="$(frontend_field '{{.Id}}')"
+          FRONTEND_IMAGE_ID_AFTER="$(frontend_field '{{.Image}}')"
+          FRONTEND_RESTART_COUNT_AFTER="$(frontend_field '{{.RestartCount}}')"
+          FRONTEND_RUNNING_AFTER="$(frontend_field '{{.State.Running}}')"
+          [ "$FRONTEND_ID_AFTER" = "$FRONTEND_ID_BEFORE" ] || fail "frontend container ID changed (was recreated): before=$FRONTEND_ID_BEFORE after=$FRONTEND_ID_AFTER"
+          [ "$FRONTEND_IMAGE_ID_AFTER" = "$FRONTEND_IMAGE_ID_BEFORE" ] || fail "frontend image ID changed: before=$FRONTEND_IMAGE_ID_BEFORE after=$FRONTEND_IMAGE_ID_AFTER"
+          [ "$FRONTEND_RESTART_COUNT_AFTER" = "$FRONTEND_RESTART_COUNT_BEFORE" ] || fail "frontend restart_count changed: before=$FRONTEND_RESTART_COUNT_BEFORE after=$FRONTEND_RESTART_COUNT_AFTER"
+          [ "$FRONTEND_RUNNING_AFTER" = "true" ] || fail "frontend is not running after recreation"
+
+          TOR_ID_AFTER="$(tor_field '{{.Id}}')"
+          TOR_IMAGE_ID_AFTER="$(tor_field '{{.Image}}')"
+          TOR_RESTART_COUNT_AFTER="$(tor_field '{{.RestartCount}}')"
+          TOR_HEALTH_AFTER="$(tor_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          [ "$TOR_ID_AFTER" = "$TOR_ID_BEFORE" ] || fail "Tor container ID changed: before=$TOR_ID_BEFORE after=$TOR_ID_AFTER"
+          [ "$TOR_IMAGE_ID_AFTER" = "$TOR_IMAGE_ID_BEFORE" ] || fail "Tor image ID changed: before=$TOR_IMAGE_ID_BEFORE after=$TOR_IMAGE_ID_AFTER"
+          [ "$TOR_RESTART_COUNT_AFTER" = "$TOR_RESTART_COUNT_BEFORE" ] || fail "Tor restart_count changed: before=$TOR_RESTART_COUNT_BEFORE after=$TOR_RESTART_COUNT_AFTER"
+          [ "$TOR_HEALTH_AFTER" = "healthy" ] || fail "Tor is not healthy after recreation (got $TOR_HEALTH_AFTER)"
+          TOR_PUBLISHED_PORTS_AFTER="$(docker port jobpulse-tor-prod 2>/dev/null || true)"
+          [ -z "$TOR_PUBLISHED_PORTS_AFTER" ] || fail "Tor now publishes host ports (expected none): $TOR_PUBLISHED_PORTS_AFTER"
+          echo "db_frontend_tor_post_candidate_invariant=ok"
+
+          echo "== post-candidate live frontend invariant (must remain exact f476, no frontend action taken) =="
+          LIVE_FRONTEND_SHA256_AFTER="$(curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ | sha256sum | awk '{print $1}')"
+          [ "$LIVE_FRONTEND_SHA256_AFTER" = "$FRONTEND_SHA256" ] || fail "live frontend SHA-256 changed after API recreation (before=$FRONTEND_SHA256 after=$LIVE_FRONTEND_SHA256_AFTER)"
+
+          echo "== post-candidate git invariant (this workflow never mutates git) =="
+          POST_SHA="$(git rev-parse HEAD)"
+          [ "$POST_SHA" = "$EXPECTED_PRODUCTION_SHA" ] || fail "production git SHA changed unexpectedly (before=$EXPECTED_PRODUCTION_SHA after=$POST_SHA)"
+          DIRTY_TRACKED_AFTER="$(git status --porcelain | grep -v '^??' || true)"
+          [ -z "$DIRTY_TRACKED_AFTER" ] || fail "production tracked worktree is not clean after recreation"
+          echo "git_invariant=ok"
+
+          echo "===NORMALIZATION_END==="
+          echo "API_REFERENCE_NORMALIZED_TO_CANONICAL_F476"
+          echo "PRODUCTION_API_REFERENCE_NORMALIZATION_COMPLETE"
+          NORMALIZATION_CONFIRMED=true
+          WORKFLOW_SUCCESS=true
+          REMOTE_SCRIPT
+
+          cleanup_runner() {
+            rm -f ~/.ssh/jobpulse_normalization_key "$REMOTE_SCRIPT_LOCAL"
+          }
+          trap cleanup_runner EXIT
+
+          REMOTE_SCRIPT_PATH="/tmp/jobpulse-api-reference-normalization-remote-${RUN_ID}.sh"
+
+          # Only this one temporary file is transferred -- never .env,
+          # .api_keys.env, .admin.env, .auth, cookies, storage state, the
+          # ControlPort password file, or database credentials.
+          scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -P "$VM_PORT" \
+            "$REMOTE_SCRIPT_LOCAL" "$VM_USER@$VM_HOST:${REMOTE_SCRIPT_PATH}"
+
+          HAS_TOKEN="false"
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            HAS_TOKEN="true"
+          fi
+
+          # The GHCR token (if any) travels ONLY through this ssh
+          # invocation's own stdin, piped straight into the remote
+          # script's `docker login --password-stdin` -- never Base64-
+          # encoded, never placed in the remote command string/argv,
+          # never logged. Docker auth uses an isolated temporary
+          # DOCKER_CONFIG (never the production user's default config),
+          # so no credential persists in ~/.docker/config.json.
+          printf '%s' "${GHCR_TOKEN:-}" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PATH" -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            "bash '$REMOTE_SCRIPT_PATH' '$COMPOSE_SHA256' '$FRONTEND_SHA256' '$PROVIDER_SHA256' '$HAS_TOKEN'"
