@@ -1199,7 +1199,37 @@ class Scenario:
             # sequence of (unit_name, show_output, show_exit) -- show_output
             # is the verbatim stdout `systemctl show <unit> --property=...`
             # would produce for that unit; show_exit is its exit status.
+            # `unit_name` here is always an ORDINARY (non-template) unit
+            # file name with no "@" -- `list-unit-files` emits it as
+            # "<unit_name>.service" and it is inspected via `systemctl show`.
             systemd_units=(),
+            # Phase 4J: uninstantiated systemd TEMPLATE unit files, e.g.
+            # the real apport-coredump-hook@.service that caused run
+            # 35846112545 to fail closed. Sequence of
+            # (template_name, cat_output, cat_exit) -- `list-unit-files`
+            # emits it as "<template_name>@.service" and it is inspected
+            # via `systemctl cat`, never `systemctl show`.
+            systemd_template_units=(),
+            # Phase 4J: exit status of `systemctl list-units --type=service
+            # --all` (the separate LOADED-unit enumeration that catches an
+            # instantiated template such as foo@instance.service).
+            systemd_list_units_exit=0,
+            # Phase 4J: sequence of (full_unit_name, show_output, show_exit)
+            # for units returned by `systemctl list-units --type=service
+            # --all` -- full_unit_name is used verbatim (e.g.
+            # "jobpulse-worker@production.service") and is inspected via
+            # `systemctl show`, exactly like an ordinary concrete unit.
+            systemd_loaded_units=(),
+            # Phase 4J correction: when set, this RAW text (one line per
+            # physical line) is emitted verbatim as the `systemctl
+            # list-units` stdout instead of the normal generated
+            # "<unit> loaded active running <desc>" rows -- used only to
+            # model a hypothetically malformed/decorated record (e.g. a
+            # leading status-circle glyph) reaching the parser despite
+            # `--plain`/`--full` having been correctly requested, proving
+            # the `*.service` sanity check is a genuine independent
+            # defense and not just reliance on the flags.
+            systemd_loaded_units_list_raw_override=None,
             collection_env_content=None,  # None => file absent
         )
         defaults.update(overrides)
@@ -1502,15 +1532,60 @@ exec "$@"
         # systemd_units to drive the ACTUAL extracted remote script down
         # every fail-closed path.
         if self.systemctl_available:
+            # Persistent unit-file inventory (`systemctl list-unit-files`):
+            # ordinary concrete names plus, separately, uninstantiated
+            # template names (emitted with the "@.service" suffix).
+            # Modeled as realistic multi-column `systemctl list-unit-files`
+            # rows (UNIT FILE / STATE / VENDOR PRESET) -- the script must
+            # still correctly extract only the first field.
             unit_list_printf = "\n".join(
-                f"printf '%s\\n' {self._q(name + '.service')}" for name, _show_output, _show_exit in self.systemd_units
+                f"printf '%s\\n' {self._q(name + '.service enabled enabled')}" for name, _show_output, _show_exit in self.systemd_units
             )
+            template_list_printf = "\n".join(
+                f"printf '%s\\n' {self._q(name + '@.service static -')}" for name, _cat_output, _cat_exit in self.systemd_template_units
+            )
+            combined_unit_list_printf = "\n".join(p for p in (unit_list_printf, template_list_printf) if p)
+
             show_cases = "\n".join(
                 f'''  {self._q(name + ".service")})
     printf '%s' {self._q(show_output)}
     exit {int(show_exit)} ;;'''
                 for name, show_output, show_exit in self.systemd_units
             )
+            loaded_show_cases = "\n".join(
+                f'''  {self._q(full_name)})
+    printf '%s' {self._q(show_output)}
+    exit {int(show_exit)} ;;'''
+                for full_name, show_output, show_exit in self.systemd_loaded_units
+            )
+            cat_cases = "\n".join(
+                f'''  {self._q(name + "@.service")})
+    printf '%s' {self._q(cat_output)}
+    exit {int(cat_exit)} ;;'''
+                for name, cat_output, cat_exit in self.systemd_template_units
+            )
+
+            # Loaded-unit inventory (`systemctl list-units --type=service
+            # --all --plain --full`) -- this is what would surface an
+            # INSTANTIATED copy of a template (e.g. foo@instance.service)
+            # even though the persistent unit-file inventory only ever
+            # contains the bare foo@.service template name. Modeled as
+            # realistic `systemctl list-units --plain` rows (UNIT LOAD
+            # ACTIVE SUB DESCRIPTION), including a unit whose SUB column
+            # would render a status-circle decoration WITHOUT --plain --
+            # the script must still correctly extract only the first
+            # field.
+            if self.systemd_loaded_units_list_raw_override is not None:
+                loaded_unit_list_printf = "\n".join(
+                    f"printf '%s\\n' {self._q(line)}"
+                    for line in self.systemd_loaded_units_list_raw_override.splitlines()
+                )
+            else:
+                loaded_unit_list_printf = "\n".join(
+                    f"printf '%s\\n' {self._q(full_name + ' loaded active running Service')}"
+                    for full_name, _show_output, _show_exit in self.systemd_loaded_units
+                )
+
             systemctl_body = f'''
 case "$1" in
   list-unit-files)
@@ -1518,18 +1593,52 @@ case "$1" in
       echo "simulated systemctl list-unit-files failure" >&2
       exit {int(self.systemctl_list_exit)}
     fi
-    {unit_list_printf if unit_list_printf else "true"}
+    {combined_unit_list_printf if combined_unit_list_printf else "true"}
+    exit 0 ;;
+  list-units)
+    # Phase 4J correction: require the caller to actually pass --plain
+    # and --full -- without --plain, real systemctl would render a
+    # status-circle glyph for a failed/degraded unit as a leading
+    # pseudo-column, and without --full a long unit name could be
+    # ellipsized. If a future refactor silently drops either flag, this
+    # fake fails loudly instead of the tests continuing to pass against
+    # an unrealistic happy-path shape.
+    HAS_PLAIN=no
+    HAS_FULL=no
+    for a in "$@"; do
+      case "$a" in
+        --plain) HAS_PLAIN=yes ;;
+        --full) HAS_FULL=yes ;;
+      esac
+    done
+    if [ "$HAS_PLAIN" != "yes" ] || [ "$HAS_FULL" != "yes" ]; then
+      echo "fake systemctl: list-units invoked without required --plain/--full flags" >&2
+      exit 1
+    fi
+    if [ {int(self.systemd_list_units_exit)} -ne 0 ]; then
+      echo "simulated systemctl list-units failure" >&2
+      exit {int(self.systemd_list_units_exit)}
+    fi
+    {loaded_unit_list_printf if loaded_unit_list_printf else "true"}
     exit 0 ;;
   show)
     unit="$2"
     case "$unit" in
 {show_cases}
+{loaded_show_cases}
       *)
         printf 'ExecStart=\\nEnvironment=\\nEnvironmentFiles=\\nFragmentPath=\\nDropInPaths=\\n'
         exit 0 ;;
     esac
     ;;
-  cat) exit 1 ;;
+  cat)
+    unit="$2"
+    case "$unit" in
+{cat_cases}
+      *)
+        exit 1 ;;
+    esac
+    ;;
   *) exit 1 ;;
 esac
 '''
@@ -2018,3 +2127,623 @@ def test_behavior_systemd_scenario_f_clean_enumeration_reaches_mutation(remote_s
     assert result.returncode == 0, result.stdout + result.stderr
     assert "systemd_drift=none" in result.stdout
     assert scenario.marker.exists()
+
+
+# =====================================================================
+# Phase 4J: systemd TEMPLATE unit handling.
+#
+# Context: real recovery run 35846112545 (run_attempt 1) failed closed
+# (SAFE_PRE_MUTATION_RECOVERY_ABORT) because the live production host's
+# persistent unit-file inventory includes the uninstantiated systemd
+# template unit apport-coredump-hook@.service, and the Phase 4H scanner
+# blindly ran `systemctl show apport-coredump-hook@.service ...` for
+# every name `systemctl list-unit-files` returned -- an invalid
+# operation against a bare template name, which exited 1. The safety
+# policy (fail closed before mutation) was correct; the
+# enumeration/inspection model was too naive. Phase 4J fixes this
+# SEMANTICALLY (unit-name shape: `*@.service`), never by hardcoding
+# apport-coredump-hook@.service as an allowlisted exception:
+#   - uninstantiated template unit file -> `systemctl cat` (static
+#     definition, read-only)
+#   - every other persistent unit-file name, and every LOADED unit name
+#     from a separate `systemctl list-units --type=service --all`
+#     enumeration (which is how a currently-instantiated copy of a
+#     template, e.g. foo@instance.service, is still caught) ->
+#     `systemctl show` (effective runtime state), exactly as before.
+# Same discipline as every other behavioral scenario in this file: the
+# ACTUAL extracted remote script executes verbatim via `bash -c` against
+# a configurable fake `systemctl` -- no Python reimplementation of the
+# drift-check logic.
+# =====================================================================
+def _unit_file_loop_section(remote_script: str) -> str:
+    return remote_script[
+        remote_script.index('UNIT_NAMES="$(awk') : remote_script.index(
+            'echo "systemd_unit_file_drift=none"'
+        )
+    ]
+
+
+def _template_branch_section(remote_script: str) -> str:
+    section = _unit_file_loop_section(remote_script)
+    start = section.index("*@.service)")
+    end = section.index("*)", start)
+    return section[start:end]
+
+
+def _loaded_unit_section(remote_script: str) -> str:
+    return remote_script[
+        remote_script.index("timeout 5 systemctl list-units --type=service --all") : remote_script.index(
+            'echo "systemd_loaded_unit_drift=none"'
+        )
+    ]
+
+
+# --- B: list-units --type=service --all is bounded and fail closed
+def test_list_units_is_bounded_and_status_captured(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert "timeout 5 systemctl list-units --type=service --all --no-legend --no-pager" in section
+    assert "LOADED_UNIT_LIST_STATUS=$?" in section
+    assert '[ "$LOADED_UNIT_LIST_STATUS" -eq 0 ] || fail' in section
+    assert "|| true" not in section
+
+
+# --- C: template detection recognizes exactly the semantic form *@.service
+def test_template_detection_uses_exact_semantic_glob(remote_script):
+    section = _unit_file_loop_section(remote_script)
+    assert "*@.service)" in section
+    # Semantic (unit-name shape), never a hardcoded allowlist of a known
+    # distro-specific unit name. A comment may reference the real
+    # incident unit for context; the executable code must not.
+    assert "apport-coredump-hook" not in _code_only(section)
+
+
+# --- D: template unit definitions use systemctl cat
+def test_template_branch_uses_systemctl_cat(remote_script):
+    branch = _template_branch_section(remote_script)
+    assert 'timeout 5 systemctl cat "$unit" --no-pager' in branch
+
+
+# --- E: template definitions are NOT passed to systemctl show
+def test_template_branch_never_calls_systemctl_show(remote_script):
+    branch = _code_only(_template_branch_section(remote_script))
+    assert "systemctl show" not in branch
+
+
+# --- F: systemctl cat failure fails closed (structural)
+def test_template_cat_failure_is_not_swallowed(remote_script):
+    branch = _template_branch_section(remote_script)
+    assert "TEMPLATE_CAT_STATUS=$?" in branch
+    assert '[ "$TEMPLATE_CAT_STATUS" -eq 0 ] || fail' in branch
+    cat_line = next(line for line in branch.splitlines() if "systemctl cat" in line and "timeout" in line)
+    assert "|| true" not in cat_line
+
+
+# --- G: empty template definition fails closed (structural)
+def test_template_cat_empty_result_fails_closed(remote_script):
+    branch = _template_branch_section(remote_script)
+    assert '[ -n "$TEMPLATE_CAT_OUTPUT" ] || fail' in branch
+
+
+# --- H/I/J: template definition scanned for wrapper + both launcher vars
+def test_template_definition_scanned_for_wrapper_and_launcher_vars(remote_script):
+    branch = _template_branch_section(remote_script)
+    assert "grep -Fq 'run_collection_cycle_safe.sh' <<< \"$TEMPLATE_CAT_OUTPUT\"" in branch
+    assert "grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< \"$TEMPLATE_CAT_OUTPUT\"" in branch
+    assert "grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< \"$TEMPLATE_CAT_OUTPUT\"" in branch
+
+
+# --- K: loaded instantiated units use systemctl show, never systemctl cat
+def test_loaded_unit_section_uses_show_never_cat(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert (
+        'timeout 5 systemctl show "$loaded_unit" '
+        "--property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager"
+        in section
+    )
+    assert "systemctl cat" not in section
+
+
+# --- L: loaded-unit show failure fails closed (structural)
+def test_loaded_unit_show_failure_is_not_swallowed(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert "LOADED_UNIT_SHOW_STATUS=$?" in section
+    assert '[ "$LOADED_UNIT_SHOW_STATUS" -eq 0 ] || fail' in section
+    assert '[ -n "$LOADED_UNIT_SHOW_OUTPUT" ] || fail' in section
+    assert "|| true" not in section
+
+
+# --- N: loaded-unit effective wrapper/env references fail closed (structural)
+def test_loaded_unit_scanned_for_wrapper_and_launcher_vars(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert "grep -Fq 'run_collection_cycle_safe.sh' <<< \"$LOADED_UNIT_SHOW_OUTPUT\"" in section
+    assert "grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< \"$LOADED_UNIT_SHOW_OUTPUT\"" in section
+    assert "grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< \"$LOADED_UNIT_SHOW_OUTPUT\"" in section
+
+
+# --- O/P: all systemd checks (unit-file AND loaded-unit) remain before
+# lock acquisition and before git reset
+def test_loaded_unit_checks_precede_locks_and_git_reset(remote_script):
+    loaded_end_idx = remote_script.index('echo "systemd_loaded_unit_drift=none"')
+    outer_lock_idx = remote_script.index('flock -n "$OUTER_LOCK_FD"')
+    internal_lock_idx = remote_script.index('flock -n "$INTERNAL_LOCK_FD"')
+    reset_idx = remote_script.index('git reset --hard "$RECOVERY_TARGET_SHA"')
+    assert loaded_end_idx < outer_lock_idx < internal_lock_idx < reset_idx
+
+
+# --- Q: no raw systemd output (list-units, cat) is ever echoed
+def test_no_raw_systemd_cat_or_list_units_output_echoed(remote_script):
+    for var in ("TEMPLATE_CAT_OUTPUT", "LOADED_UNIT_LIST_OUTPUT", "LOADED_UNIT_SHOW_OUTPUT"):
+        for line in remote_script.splitlines():
+            if var in line:
+                assert not line.strip().startswith("echo") or "fail" in line, line
+
+
+# --- R: no systemd mutation exists in the new sections
+def test_no_systemd_mutation_in_template_or_loaded_sections(remote_script):
+    for section in (_unit_file_loop_section(remote_script), _loaded_unit_section(remote_script)):
+        for forbidden in (
+            "systemctl start",
+            "systemctl stop",
+            "systemctl restart",
+            "systemctl enable",
+            "systemctl disable",
+            "systemctl daemon-reload",
+            "systemctl mask",
+            "systemctl unmask",
+            "systemctl kill",
+        ):
+            assert forbidden not in section, forbidden
+
+
+_BENIGN_TEMPLATE_DEFINITION = (
+    "# /lib/systemd/system/apport-coredump-hook@.service\n"
+    "[Unit]\n"
+    "Description=Process error reports when systemd-coredump receives a coredump\n"
+    "Documentation=man:core(5)\n"
+    "DefaultDependencies=no\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "ExecStart=/bin/sh -c 'if [ -x /usr/share/apport/apport ]; then /usr/share/apport/apport %P %s %c %d %P %E; fi'\n"
+    "TimeoutStartSec=30\n"
+)
+
+
+# --- T1: uninstantiated template with benign definition, no relevant
+# loaded instance -> systemd provenance passes, recovery reaches mutation.
+# Reproduces the real Phase 4I host shape that caused run 35846112545 to
+# fail closed.
+def test_behavior_systemd_t1_uninstantiated_template_reaches_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(("apport-coredump-hook", _BENIGN_TEMPLATE_DEFINITION, 0),),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "systemd_drift=none" in result.stdout
+    assert scenario.marker.exists()
+
+
+# --- T2: template definition references the collection wrapper -> failure before mutation
+def test_behavior_systemd_t2_template_definition_wrapper_reference_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(
+            (
+                "jobpulse-worker",
+                "[Service]\nExecStart=/opt/jobpulse/scripts/run_collection_cycle_safe.sh %i\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "template unit" in result.stderr
+    assert "references the collection wrapper" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T3: systemctl cat exits nonzero for the template -> failure before mutation
+def test_behavior_systemd_t3_template_cat_failure_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(("apport-coredump-hook", "", 1),),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "systemctl cat failed in a bounded read" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T4: systemctl cat returns an empty result for the template -> failure before mutation
+def test_behavior_systemd_t4_template_cat_empty_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(("apport-coredump-hook", "", 0),),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "unusable (empty) result for template unit" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T5: instantiated template (jobpulse-worker@production.service, found
+# only via the LOADED-unit enumeration) has an effective wrapper reference
+# -> failure before mutation, even though its template definition alone
+# (jobpulse-worker@.service) is irrelevant.
+def test_behavior_systemd_t5_instantiated_template_effective_wrapper_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(
+            ("jobpulse-worker", "[Service]\nExecStart=/usr/bin/jobpulse-worker %i\n", 0),
+        ),
+        systemd_loaded_units=(
+            (
+                "jobpulse-worker@production.service",
+                "ExecStart=/opt/jobpulse/scripts/run_collection_cycle_safe.sh\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/jobpulse-worker@.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "loaded unit" in result.stderr
+    assert "references the collection wrapper" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T6: the loaded-unit enumeration itself (systemctl list-units) exits
+# nonzero -> failure before mutation.
+def test_behavior_systemd_t6_list_units_failure_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(tmp_path, systemd_list_units_exit=1)
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "systemctl list-units failed in a bounded read" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T7: systemctl show for a loaded unit exits nonzero -> failure before mutation
+def test_behavior_systemd_t7_loaded_unit_show_failure_blocks_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_loaded_units=(("unrelated-loaded.service", "", 1),),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "systemctl show failed in a bounded read" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- T8: clean mix of ordinary services, irrelevant template unit files,
+# and irrelevant instantiated template services -> systemd_drift=none,
+# recovery proceeds to mutation.
+def test_behavior_systemd_t8_clean_mixed_inventory_reaches_mutation(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_units=(
+            (
+                "unrelated-ordinary",
+                "ExecStart=/usr/sbin/nginx -g daemon off;\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/unrelated-ordinary.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+        systemd_template_units=(
+            ("irrelevant-template", _BENIGN_TEMPLATE_DEFINITION, 0),
+        ),
+        systemd_loaded_units=(
+            (
+                "irrelevant-template@instance1.service",
+                "ExecStart=/usr/bin/true\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/irrelevant-template@.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "systemd_drift=none" in result.stdout
+    assert scenario.marker.exists()
+
+
+# --- Named regression test for the exact real Phase 4I failure
+# (run 35846112545): an irrelevant UNINSTANTIATED template
+# (apport-coredump-hook@.service) must no longer cause the recovery
+# runner to fail merely because `systemctl show <template>@.service`
+# would be an invalid operation -- AND the template must still be
+# genuinely inspected via `systemctl cat` (not silently skipped): a
+# nonzero `systemctl cat` exit for that *same* unit name must still fail
+# closed before mutation.
+def test_regression_phase4i_apport_coredump_hook_template_no_longer_blocks_recovery(tmp_path_factory, remote_script):
+    passthrough_scenario = Scenario(
+        tmp_path_factory.mktemp("phase4j_regression_pass"),
+        systemd_template_units=(("apport-coredump-hook", _BENIGN_TEMPLATE_DEFINITION, 0),),
+    )
+    pass_result = _run_recovery(passthrough_scenario, remote_script)
+    assert pass_result.returncode == 0, pass_result.stdout + pass_result.stderr
+    assert "systemd_drift=none" in pass_result.stdout
+    assert passthrough_scenario.marker.exists()
+
+    # Same exact unit name, isolated tmp dir -- proves the template is
+    # still genuinely inspected via `systemctl cat` (not skipped): if the
+    # runner ever stopped calling `systemctl cat` for this unit, this
+    # nonzero-exit configuration would go unnoticed and recovery would
+    # wrongly reach mutation.
+    still_inspected_scenario = Scenario(
+        tmp_path_factory.mktemp("phase4j_regression_inspected"),
+        systemd_template_units=(("apport-coredump-hook", "irrelevant but present", 1),),
+    )
+    inspected_result = _run_recovery(still_inspected_scenario, remote_script)
+    assert inspected_result.returncode != 0
+    assert "systemctl cat failed in a bounded read" in inspected_result.stderr
+    assert "unit=apport-coredump-hook@.service" in inspected_result.stderr
+    _assert_no_mutation_occurred(inspected_result, still_inspected_scenario)
+
+
+# =====================================================================
+# Phase 4J correction (independent review): the loaded-unit enumeration
+# (`systemctl list-units --type=service --all`) plus `awk '{print $1}'`
+# is not machine-safe. Without `--plain`, systemctl can render a leading
+# status-circle glyph for a failed/degraded unit (e.g.
+# "* broken.service loaded failed failed ..."), which would shift $1
+# away from the actual unit name -- the runner could then attempt
+# `systemctl show "*"` (or the real glyph) and safe-abort for a parser
+# artifact rather than genuine scheduler drift. Without `--full`, a long
+# unit name can be ellipsized before either template detection or
+# inspection.
+#
+# Fix: both enumerations now request `--full`; the loaded-unit
+# enumeration also requests `--plain`. Parsing uses `awk 'NF {print $1}'`
+# (never repairs decorated output after the fact). A defense-in-depth
+# `*.service` sanity check on every parsed record refuses to guess and
+# fails closed -- before any `systemctl show`/`cat` call -- if a record
+# is ever malformed regardless of the flags requested.
+# =====================================================================
+def test_list_unit_files_requests_full(remote_script):
+    section = _systemd_section(remote_script)
+    assert "timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager --full" in section
+
+
+def test_list_units_requests_plain_and_full(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert "timeout 5 systemctl list-units --type=service --all --no-legend --no-pager --plain --full" in section
+
+
+def test_unit_file_parsing_skips_blank_records(remote_script):
+    section = _systemd_section(remote_script)
+    assert "UNIT_NAMES=\"$(awk 'NF {print $1}' <<< \"$UNIT_LIST_OUTPUT\")\"" in section
+
+
+def test_loaded_unit_parsing_skips_blank_records(remote_script):
+    section = _loaded_unit_section(remote_script)
+    assert "LOADED_UNIT_NAMES=\"$(awk 'NF {print $1}' <<< \"$LOADED_UNIT_LIST_OUTPUT\")\"" in section
+
+
+def _unit_file_sanity_check_section(remote_script: str) -> str:
+    section = _unit_file_loop_section(remote_script)
+    start = section.index('[ -z "$unit" ] && continue')
+    end = section.index("*@.service)")
+    return section[start:end]
+
+
+def _loaded_unit_sanity_check_section(remote_script: str) -> str:
+    section = _loaded_unit_section(remote_script)
+    start = section.index('[ -z "$loaded_unit" ] && continue')
+    end = section.index('LOADED_UNIT_SHOW_STATUS=0')
+    return section[start:end]
+
+
+def test_unit_file_sanity_check_precedes_template_branch(remote_script):
+    section = _code_only(_unit_file_sanity_check_section(remote_script))
+    assert '*.service) ;;' in section
+    assert 'fail "unexpected token while parsing systemctl list-unit-files output' in section
+    assert "systemctl show" not in section
+    assert "systemctl cat" not in section
+
+
+def test_loaded_unit_sanity_check_precedes_show(remote_script):
+    section = _code_only(_loaded_unit_sanity_check_section(remote_script))
+    assert '*.service) ;;' in section
+    assert 'fail "unexpected token while parsing systemctl list-units output' in section
+    assert "systemctl show" not in section
+
+
+def test_sanity_check_fail_messages_do_not_dump_full_list_output(remote_script):
+    for var in ("UNIT_LIST_OUTPUT", "LOADED_UNIT_LIST_OUTPUT"):
+        for line in remote_script.splitlines():
+            if "unexpected token while parsing" in line:
+                assert var not in line
+
+
+# --- Structural: no relaxed error handling was introduced alongside the fix
+def test_no_relaxed_error_handling_in_sanity_checks(remote_script):
+    for section in (
+        _unit_file_sanity_check_section(remote_script),
+        _loaded_unit_sanity_check_section(remote_script),
+    ):
+        assert "|| true" not in section
+
+
+def test_sanity_check_continue_only_used_for_blank_line_skip(remote_script):
+    # The only `continue` statements in either loop are the pre-existing
+    # blank-line skips (`[ -z "$unit" ] && continue` /
+    # `[ -z "$loaded_unit" ] && continue`) -- the new sanity check must
+    # `fail`, never silently `continue`/skip a malformed token.
+    unit_section = _unit_file_loop_section(remote_script)
+    loaded_section = _loaded_unit_section(remote_script)
+    for section, var in ((unit_section, "unit"), (loaded_section, "loaded_unit")):
+        continue_lines = [line for line in section.splitlines() if "continue" in line]
+        assert len(continue_lines) == 1
+        assert f'[ -z "${var}" ] && continue' in continue_lines[0]
+
+
+# --- Behavioral: the dangerous non-plain shape, if it somehow still
+# reaches the parser, is rejected by the sanity check before any
+# systemctl show/cat call and before mutation.
+def test_behavior_status_circle_decorated_line_fails_closed_before_show(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_loaded_units_list_raw_override="● broken.service loaded failed failed Broken_Service",
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "unexpected token while parsing systemctl list-units output" in result.stderr
+    assert 'systemctl show "●"' not in result.stdout
+    assert 'systemctl show "●"' not in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- Behavioral: the normal plain-form row for the SAME unit parses
+# correctly and is inspected normally via systemctl show.
+def test_behavior_plain_form_loaded_unit_row_parsed_and_inspected_normally(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_loaded_units=(
+            (
+                "broken.service",
+                "ExecStart=/usr/bin/true\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/broken.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "systemd_drift=none" in result.stdout
+    assert scenario.marker.exists()
+
+
+# --- Behavioral: same decorated-line defense, but proving the wrapper
+# scan is never even reached for the malformed token (fails at the
+# sanity check, not later at the drift grep).
+def test_behavior_status_circle_line_never_reaches_wrapper_scan(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_loaded_units_list_raw_override="● broken.service loaded failed failed Broken_Service",
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "references the collection wrapper" not in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- Behavioral: a long unit name survives the enumeration -> parsing ->
+# inspection pipeline unchanged (proving `--full` matters end to end,
+# independent of any real terminal width).
+_LONG_UNIT_BASE = "jobpulse-" + ("x" * 180)
+
+
+def test_behavior_long_unit_name_reaches_systemctl_show_unchanged(remote_script, tmp_path):
+    long_name = _LONG_UNIT_BASE
+    scenario = Scenario(
+        tmp_path,
+        systemd_units=(
+            (
+                long_name,
+                "ExecStart=/opt/jobpulse/scripts/run_collection_cycle_safe.sh\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/"
+                + long_name
+                + ".service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert f"systemd unit {long_name}.service effective configuration references the collection wrapper" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+def test_behavior_long_loaded_unit_name_reaches_systemctl_show_unchanged(remote_script, tmp_path):
+    long_name = _LONG_UNIT_BASE + "@production.service"
+    scenario = Scenario(
+        tmp_path,
+        systemd_loaded_units=(
+            (
+                long_name,
+                "ExecStart=/opt/jobpulse/scripts/run_collection_cycle_safe.sh\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/"
+                + _LONG_UNIT_BASE
+                + "@.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert f"systemd loaded unit {long_name} effective configuration references the collection wrapper" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+# --- Regression: fake systemctl enforces --plain/--full so a future
+# refactor that silently drops either flag cannot pass tests unnoticed.
+def test_fake_systemctl_rejects_list_units_missing_plain_or_full(tmp_path):
+    scenario = Scenario(tmp_path)
+    fake_bin = scenario.build_fakes()
+    result = sp.run(
+        [str(fake_bin / "systemctl"), "list-units", "--type=service", "--all", "--no-legend", "--no-pager"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    result_with_flags = sp.run(
+        [
+            str(fake_bin / "systemctl"),
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+            "--full",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result_with_flags.returncode == 0
+
+
+# --- Template regression must still pass unchanged with the machine-safe
+# enumeration in place (Phase 4J semantics preserved).
+def test_regression_apport_template_still_uses_cat_not_show_after_machine_safety_fix(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(("apport-coredump-hook", _BENIGN_TEMPLATE_DEFINITION, 0),),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "systemd_drift=none" in result.stdout
+    assert scenario.marker.exists()
+
+
+# --- Loaded template instance regression must still pass unchanged.
+def test_regression_loaded_template_instance_still_uses_show_after_machine_safety_fix(remote_script, tmp_path):
+    scenario = Scenario(
+        tmp_path,
+        systemd_template_units=(
+            ("jobpulse-worker", "[Service]\nExecStart=/usr/bin/jobpulse-worker %i\n", 0),
+        ),
+        systemd_loaded_units=(
+            (
+                "jobpulse-worker@production.service",
+                "ExecStart=/opt/jobpulse/scripts/run_collection_cycle_safe.sh\nEnvironment=\nEnvironmentFiles=\nFragmentPath=/etc/systemd/system/jobpulse-worker@.service\nDropInPaths=\n",
+                0,
+            ),
+        ),
+    )
+    result = _run_recovery(scenario, remote_script)
+    assert result.returncode != 0
+    assert "loaded unit" in result.stderr
+    assert "references the collection wrapper" in result.stderr
+    _assert_no_mutation_occurred(result, scenario)
+
+
+def test_structural_ordering_unaffected_by_machine_safety_fix(remote_script):
+    systemd_idx = remote_script.index("scheduler drift check: systemd")
+    loaded_end_idx = remote_script.index('echo "systemd_loaded_unit_drift=none"')
+    outer_lock_idx = remote_script.index('flock -n "$OUTER_LOCK_FD"')
+    internal_lock_idx = remote_script.index('flock -n "$INTERNAL_LOCK_FD"')
+    docker_top_idx = remote_script.index("docker top jobpulse-api-prod")
+    reset_idx = remote_script.index('git reset --hard "$RECOVERY_TARGET_SHA"')
+    assert (
+        systemd_idx
+        < loaded_end_idx
+        < outer_lock_idx
+        < internal_lock_idx
+        < docker_top_idx
+        < reset_idx
+    )
