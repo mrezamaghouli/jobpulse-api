@@ -3216,3 +3216,238 @@ mutate production. Production remains in the `CASE_B_GIT_TARGET_API_OLD`
 split state described above until a separately authorized dispatch of
 the (now-fixed) recovery runner is made.
 
+## Phase 4K: production recovery executed -- functional f476 baseline restored
+
+A separately authorized dispatch of the Phase 4J-fixed
+`production-split-release-recovery.yml` (run `36238209271`,
+`run_attempt=1`, `conclusion=success`) completed the full recovery. The
+systemd drift check passed cleanly (`systemd_unit_file_drift=none`,
+`systemd_loaded_unit_drift=none`) -- proving the Phase 4J template-unit
+fix works against the real host, including whatever uninstantiated
+template units (e.g. `apport-coredump-hook@.service`) are present on
+it -- every other precondition (own-crontab launcher, alternate cron
+sources, internal lock provenance, lock acquisition, active-collector
+check, frontend forensics) also passed, `git reset --hard` ran exactly
+once to `f4765f857355c6543f68cea0e481b7f20a917147`, and every post-reset
+invariant (file provenance, live frontend, API/DB/Tor identity and
+health) held. Production is therefore now functionally on the f476
+baseline:
+
+- git: `f4765f857355c6543f68cea0e481b7f20a917147`
+- API underlying image:
+  `sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`
+  (unchanged by the recovery -- it was already this image; only the git
+  checkout advanced)
+- API `Config.Image`: `jobpulse-api-rollback:bccbbd997ee8-1427495` --
+  **intentionally left as this temporary local rollback alias.**
+  Normalizing it back to a standard
+  `ghcr.io/mrezamaghouli/jobpulse-api:<sha>` reference is explicitly
+  deferred to a separate, later, reviewed production operation -- never
+  bundled into a code/test/docs-only PR.
+- API: running, healthy, `restart_count=0`
+- Frontend: live at the f476 baseline (host, container-mounted, and
+  live HTTP SHA-256 all agree)
+- DB/Tor: unchanged throughout
+
+## Phase 4L: Direct runtime upgrade rollback hardening
+
+With the functional f476 baseline confirmed restored (Phase 4K), the
+two other runners' known defects called out in "Deferred to a separate,
+later PR" above are addressed for
+`.github/workflows/production-direct-runtime-upgrade.yml` specifically
+(the general-purpose upgrade runner, never
+`production-split-release-recovery.yml`, which Phase 4J already fixed).
+**This phase makes no production mutation, dispatches no workflow, and
+performs no reference normalization** -- it is code/test/docs only,
+hardening the runner's OWN rollback path for the next time it is used.
+
+### Historical Phase 4E rollback race, now conclusively reclassified
+
+Phase 4E's own timeline (`docs/PRODUCTION_RUNBOOK.md`'s Phase 3.4N-B/4E
+history above) already suspected a timing race: the runner recreated
+the API container, its rollback-verification step ran roughly 4 seconds
+later, and it declared the rollback a failure -- while the production
+compose API `HEALTHCHECK` interval is 20 seconds, nowhere near enough
+time for even one healthcheck cycle to report `healthy`. Two
+independent later facts now confirm this was exactly what happened,
+never a real rollback failure:
+
+- **Phase 4G** (read-only diagnostic, run `35442611756`) found the API
+  already running the correct old (f476) image bytes, healthy, with
+  `restart_count=0` -- i.e. the rollback image swap itself had already
+  succeeded; only `rollback_git()` had never run, producing the
+  `CASE_B_GIT_TARGET_API_OLD` split.
+- **Phase 4K** (this runbook, above) independently completed a full,
+  successful recovery of the git side of that exact split, with every
+  API/DB/frontend/Tor invariant holding throughout.
+
+Classification: **`ROLLBACK_API_WAS_SUCCESSFUL_BUT_VERIFICATION_RACED_DOCKER_HEALTHCHECK`.**
+The rollback bytes were correct from the start; only the verification
+step's single immediate post-curl Docker-health inspect was too
+impatient to observe it.
+
+### Rollback health race fix: bounded convergence, not two serialized loops
+
+The pre-Phase-4L `rollback_api()` waited up to 60s for curl readiness
+on each of two paths (direct, then nginx) and only THEN performed one
+immediate, non-repeated `docker inspect` of running/health/image-id --
+exactly the shape that raced the 20s healthcheck interval. It is
+replaced with a single bounded loop that re-evaluates ALL FIVE
+conditions together every attempt: container running, Docker health
+exactly `healthy`, underlying image ID matches the pre-upgrade image,
+and both the direct (`:8000/health`) and nginx (`/api/health`)
+endpoints succeed. A transient `starting` health status is tolerated
+until the bound below; only bounded status/label fields (never a full
+`docker inspect`, full environment, or container logs) are logged,
+including on the final failure so an operator can still distinguish
+health-still-starting from wrong-image from container-not-running from
+either health-endpoint failure. The direct/no-Tor re-proof
+(`rb_search_transport`/`rb_tor_enabled`, narrow env inspection only)
+runs unchanged, after convergence.
+
+**Wall-clock bound correction (independent review, still on PR #36
+before merge).** The first version of this loop used a 45-attempt
+ceiling with a 2s sleep between attempts and documented that as
+"45 x 2s = ~90s". That arithmetic ignores that every command *inside*
+the loop has its own runtime: the original per-request curl bound was
+`--max-time 5`, so in the worst case the two health curls alone could
+consume `45 x (5s + 5s) = 450s` before the sleep/inspect overhead is
+even counted -- the rollback verifier could hold the production
+scheduler locks for roughly nine minutes, not ~90 seconds. Fixed with
+**two independent bounds**, both required (the loop stops when either
+is exhausted), never inferring elapsed time from the sleep count alone:
+
+- an **attempt ceiling** (`for attempt in $(seq 1 45); do`), kept as
+  defense in depth;
+- an explicit **wall-clock deadline**
+  (`local rb_deadline=$((SECONDS + 90))`), checked at the START of
+  every iteration -- `if [ "$SECONDS" -ge "$rb_deadline" ]; then
+  break; fi` -- before any command with its own runtime is invoked, so
+  no new probe round starts once the deadline has already passed.
+
+Every command inside an iteration also now carries a tight, finite
+timeout of its own: the direct and nginx health curls are each bounded
+to `--connect-timeout 1 --max-time 2`, and the three
+running/Docker-health/image-id reads are consolidated into a single
+`timeout 3`-wrapped `docker inspect` call (never assumes `docker`
+itself cannot block; a failed/timed-out read records narrow "unknown"
+state for that one iteration and lets the deadline/attempt-ceiling
+decide whether to continue, never a fatal exit on its own). Worst-case
+single-iteration probe budget is therefore `2s + 2s + 3s = 7s`, plus at
+most one trailing `sleep 2` before the next iteration's deadline check
+exits the loop -- so the real theoretical maximum is
+`90s (nominal deadline) + 7s (in-flight iteration) + 2s (trailing
+sleep) = 99s`, comfortably under a ~110s target and still close to the
+stated ~90s envelope, never the ~450s the untightened per-command
+timeouts could have produced. In the normal (healthy) case this still
+comfortably spans multiple 20s Docker healthcheck intervals.
+
+### Secondary API-state classification and git-rollback eligibility matrix
+
+The pre-Phase-4L exit trap nested `rollback_git()` inside a successful
+`rollback_api()` result -- if API rollback verification ever reported
+failure, git rollback was never even evaluated, regardless of the
+API's real state. This is the second Phase 4E-class gap: a genuinely
+restored API (bytes correct, running, but a health race still fails
+verification) would have left git stuck at the candidate SHA forever.
+
+Phase 4L never simply changes this to `rollback_api || true; rollback_git
+|| true` -- that could manufacture a NEW split state if the API is
+genuinely still on the unverified candidate image. Instead:
+
+1. `API_ROLLBACK_ATTEMPTED`/`API_ROLLBACK_CONFIRMED`/
+   `GIT_ROLLBACK_ATTEMPTED`/`GIT_ROLLBACK_CONFIRMED` are explicit state
+   variables, set immediately before/only-after their respective
+   rollback function is invoked/fully verified.
+2. If `rollback_api()` reports failure, a new read-only, non-mutating
+   `classify_api_state_after_failed_rollback()` inspects the CURRENT
+   api container's immutable image ID and running state (never the
+   `Config.Image` tag alone) and classifies it as exactly one of
+   `OLD_API_CONFIRMED`, `TARGET_API_CONFIRMED`, or `UNKNOWN_API_STATE`.
+3. Git-rollback eligibility: attempted when `rollback_api()` itself
+   succeeded, OR (the exact Phase 4E class) when it reported failure
+   but the secondary classification independently confirms
+   `OLD_API_CONFIRMED`. A `TARGET_API_CONFIRMED` or `UNKNOWN_API_STATE`
+   classification never triggers an automatic git rollback -- the
+   checkout is preserved as-is and a fatal message is emitted for
+   manual operator review, rather than guessing.
+4. The exit trap prints an explicit rollback summary
+   (`api_mutation_started`/`git_mutation_started`/
+   `api_rollback_attempted`/`api_rollback_confirmed`/
+   `api_state_after_failed_rollback`/`git_rollback_attempted`/
+   `git_rollback_confirmed`) so the two outcomes are always reported
+   independently -- a git rollback failure never overwrites or hides
+   the API rollback's own result.
+
+### Frontend activation: exact-SHA convergence, not a marker string
+
+Both the candidate/target activation check (main flow, after the git
+reset to the reviewed target SHA) and `rollback_git()`'s own restored-
+frontend check previously accepted, respectively, a marker string
+(`Open Poster Profile`) inside the response body, and a bare HTTP 200 --
+neither actually proves the exact reviewed bytes are being served.
+Both now call a shared `wait_for_live_frontend_sha()` helper: a bounded
+localhost-only poll that writes each response body to a temp file
+(never `BODY="$(curl ...)"`, which strips trailing newlines via command
+substitution and can silently change the byte stream), hashes that file
+with `sha256sum`, and requires exact equality against the already-
+derived immutable SHA-256 (`TARGET_FRONTEND_SHA256` for the main flow,
+`EXPECTED_CURRENT_FRONTEND_SHA256` for `rollback_git()`) before
+declaring the frontend live. A failed or unreadable `sha256sum` is
+never treated as a match -- it falls back to an empty comparison value,
+so the loop keeps polling within its bound instead of silently
+accepting a bad hash. Requests carry `Cache-Control:
+no-cache`/`Pragma: no-cache` as defense against any intermediate cache;
+the temp file is removed on every return path (success and bounded
+failure alike), never left behind under `/tmp`. The pre-existing `Open
+Poster Profile` marker check against the immutable target git object
+(run early, well before SSH, as a release-intent assertion) is
+unchanged and remains -- it is simply no longer the FINAL proof that
+localhost nginx is serving the reviewed content. Neither frontend check
+ever restarts or recreates the frontend container; if exact bytes never
+converge within the bound, the runner fails rollback validation rather
+than trying to force it.
+
+**Wall-clock bound correction (same independent review pass).** The
+first version of this helper used a 15-attempt ceiling with a 2s sleep
+and documented that as "15 x 2s = ~30s" -- the same category of error as
+`rollback_api()` above: the original curl bound was `--max-time 5`, so
+repeated slow or failing HTTP responses could make the real bound much
+larger than 30s. Fixed identically: an explicit wall-clock deadline
+(`local deadline=$((SECONDS + 30))`), checked at the start of every
+iteration before the curl runs, alongside the retained 15-attempt
+ceiling; the curl itself is tightened to `--connect-timeout 1
+--max-time 2` (this is localhost static HTML -- it never needs more).
+Worst-case single-iteration budget is `2s` (curl) `+ 2s` (one trailing
+sleep before the next iteration's deadline check exits the loop) beyond
+the nominal deadline, so the real theoretical maximum is `30s + 2s + 2s
+= 34s`, comfortably under a ~40s target.
+
+### What Phase 4L does not change
+
+- The rollback image model: `rollback_api()` still recreates the api
+  service via `docker compose ... up -d --no-build --no-deps api` on
+  the same run-scoped `ROLLBACK_TAG`, exactly once, never a second
+  recreation.
+- The service mutation matrix: only `api` is ever recreated; `db`,
+  `frontend`, and `tor` are never mutated by this runner.
+- The single production mutation semantics for a successful upgrade
+  (`git reset --hard "$TARGET_SHA"`, exactly once) or a rollback
+  (`git reset --hard "$EXPECTED_CURRENT_SHA"`, exactly once, only when
+  eligible per the matrix above).
+- Reference normalization: the API's `Config.Image` rollback alias
+  remains exactly as Phase 4K left it. Normalizing it is intentionally
+  a separate, later, reviewed production operation -- this PR does not
+  touch it.
+
+### Not authorized by Phase 4L
+
+Phase 4L is code/test/docs only -- it does not dispatch Production
+Direct Runtime Upgrade, Production Split-Release Recovery, Production
+Runtime Diagnostic, Production Neutral Canary, Deploy Production, or
+Build JobPulse API Image, and it does not SSH to or mutate production.
+Production remains on the Phase 4K functional f476 baseline described
+above, with the API `Config.Image` rollback alias intentionally left
+unnormalized, until a separately authorized dispatch or operation is
+made.
+

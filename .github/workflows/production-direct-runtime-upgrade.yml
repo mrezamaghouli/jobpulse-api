@@ -379,6 +379,17 @@ jobs:
           GIT_MUTATION_STARTED=false
           CANDIDATE_API_RECREATED=false
           GIT_RESET_DONE=false
+          # Explicit rollback outcome state (Phase 4L). *_ATTEMPTED is set
+          # immediately before the corresponding rollback function is
+          # invoked; *_CONFIRMED is set only once that function has fully
+          # verified its own success. API_STATE_CLASSIFICATION is set only
+          # when rollback_api reports failure -- see
+          # classify_api_state_after_failed_rollback() below.
+          API_ROLLBACK_ATTEMPTED=false
+          API_ROLLBACK_CONFIRMED=false
+          GIT_ROLLBACK_ATTEMPTED=false
+          GIT_ROLLBACK_CONFIRMED=false
+          API_STATE_CLASSIFICATION=""
           ROLLBACK_TAG=""
           TMP_DOCKER_CONFIG=""
           CYCLE_LOCK_FD=""
@@ -388,34 +399,87 @@ jobs:
             echo "ROLLBACK: recreating api with previous image (ID $API_IMAGE_ID_BEFORE) via $ROLLBACK_TAG" >&2
             JOBPULSE_API_IMAGE="$ROLLBACK_TAG" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps api
 
+            # Phase 4L: bounded CONVERGENCE loop, not two serialized
+            # endpoint-readiness loops followed by a single immediate
+            # Docker health inspect. The production compose API
+            # healthcheck interval is 20s, so an HTTP probe can succeed
+            # while the Docker health status still reports "starting" --
+            # the historical Phase 4E rollback false-negative pattern.
+            # Every attempt re-evaluates ALL FIVE conditions together and
+            # only declares convergence once they all agree in the SAME
+            # iteration; "starting" is tolerated until the bound below.
+            #
+            # Independent review correction: an attempt ceiling alone
+            # (attempts x sleep interval) is NOT a real wall-clock bound
+            # when every command inside the loop has its own runtime --
+            # 45 attempts of two 5s-max curls could theoretically consume
+            # ~450s. This loop therefore enforces TWO INDEPENDENT bounds
+            # -- an attempt ceiling (defense in depth) AND an explicit
+            # wall-clock deadline, checked at the START of every
+            # iteration -- and every command inside an iteration carries
+            # its own tight, finite timeout: the direct and nginx health
+            # curls are each bounded to 2s max, and the three
+            # running/health/image-id reads are consolidated into ONE
+            # `timeout 3`-wrapped docker inspect (never assumes docker
+            # itself cannot block). Worst-case single-iteration probe
+            # budget is therefore 2s + 2s + 3s = 7s, plus at most one
+            # trailing `sleep 2` before the next iteration's deadline
+            # check exits the loop -- so the real theoretical maximum is
+            # the nominal 90s deadline plus at most ~9s of in-flight
+            # overshoot from the one iteration already running when the
+            # deadline passed: ~99s total, comfortably under the ~110s
+            # target and still close to the stated ~90s envelope (never
+            # the ~450s the untightened per-command timeouts could have
+            # produced).
             local rb_healthy=false
-            local attempt
-            for attempt in $(seq 1 30); do
-              if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1; then
-                rb_healthy=true
-                break
-              fi
-              sleep 2
-            done
-
-            # Additional defense-in-depth check: bounded nginx-path
-            # health, same as the candidate's own two-path validation.
             local rb_nginx_healthy=false
-            for attempt in $(seq 1 30); do
-              if curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null 2>&1; then
-                rb_nginx_healthy=true
+            local rb_running=unknown
+            local rb_health=unknown
+            local rb_image_id=unknown
+            local rb_converged=false
+            local rb_state_line
+            local attempt
+            local rb_deadline=$((SECONDS + 90))
+            for attempt in $(seq 1 45); do
+              if [ "$SECONDS" -ge "$rb_deadline" ]; then
+                break
+              fi
+
+              rb_healthy=false
+              curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:8000/health > /dev/null 2>&1 && rb_healthy=true
+
+              rb_nginx_healthy=false
+              curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1/api/health > /dev/null 2>&1 && rb_nginx_healthy=true
+
+              # Single bounded read for all three fields -- never assumes
+              # docker itself cannot block; a timeout/failure records
+              # narrow "unknown" state for this iteration only and lets
+              # the deadline/attempt-ceiling decide whether to continue.
+              rb_state_line="$(timeout 3 docker inspect -f '{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.Image}}' jobpulse-api-prod 2>/dev/null)" || rb_state_line=""
+              if [ -n "$rb_state_line" ]; then
+                IFS='|' read -r rb_running rb_health rb_image_id <<< "$rb_state_line"
+              else
+                rb_running=unknown
+                rb_health=unknown
+                rb_image_id=unknown
+              fi
+
+              if [ "$rb_healthy" = "true" ] && [ "$rb_nginx_healthy" = "true" ] && [ "$rb_running" = "true" ] && [ "$rb_health" = "healthy" ] && [ "$rb_image_id" = "$API_IMAGE_ID_BEFORE" ]; then
+                rb_converged=true
                 break
               fi
               sleep 2
             done
 
-            local rb_running rb_health rb_image_id
-            rb_running="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
-            rb_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
-            rb_image_id="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+            # Narrow state only -- never a full docker inspect, full
+            # environment, or container logs dump -- so an operator can
+            # still distinguish health-still-starting from wrong-image
+            # from container-not-running from either health-endpoint
+            # failure, without leaking anything beyond these five fields.
+            echo "ROLLBACK: last observed state running=$rb_running health=$rb_health imageId=$rb_image_id directHealth=$rb_healthy nginxHealth=$rb_nginx_healthy" >&2
 
-            if [ "$rb_healthy" != "true" ] || [ "$rb_nginx_healthy" != "true" ] || [ "$rb_running" != "true" ] || [ "$rb_health" != "healthy" ] || [ "$rb_image_id" != "$API_IMAGE_ID_BEFORE" ]; then
-              echo "FATAL: API rollback did not restore expected running/healthy/image-id state" >&2
+            if [ "$rb_converged" != "true" ]; then
+              echo "FATAL: API rollback did not converge on expected running/healthy/image-id/health-endpoint state within the bounded window" >&2
               return 1
             fi
 
@@ -439,6 +503,100 @@ jobs:
 
             echo "ROLLBACK: API restored to previous image, running+healthy, direct/no-Tor invariant holds" >&2
             return 0
+          }
+
+          # Phase 4L: read-only, non-mutating secondary classification of
+          # the CURRENT api container's identity, called only when
+          # rollback_api has already reported failure. This is what
+          # closes the exact Phase 4E class of incident: rollback_api's
+          # own bounded convergence loop can still, in principle, exit
+          # without ever observing every condition true in the SAME
+          # iteration (e.g. a health probe that never stabilizes within
+          # the bound even though the image/running state is already
+          # correct); this is an independent, narrower re-check based
+          # solely on the immutable image ID and running state -- never
+          # inferred from the Config.Image tag alone -- so the EXIT trap
+          # can decide git-rollback eligibility without guessing. Sets
+          # the global API_STATE_CLASSIFICATION to exactly one of:
+          # OLD_API_CONFIRMED, TARGET_API_CONFIRMED, UNKNOWN_API_STATE.
+          classify_api_state_after_failed_rollback() {
+            local cur_image_id cur_running cur_health
+            cur_image_id="$(docker inspect -f '{{.Image}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+            cur_running="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+            cur_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod 2>/dev/null || echo unknown)"
+
+            echo "SECONDARY API CLASSIFICATION: imageId=$cur_image_id running=$cur_running health=$cur_health" >&2
+
+            if [ "$cur_image_id" = "$API_IMAGE_ID_BEFORE" ] && [ "$cur_running" = "true" ]; then
+              API_STATE_CLASSIFICATION="OLD_API_CONFIRMED"
+            elif [ "$cur_image_id" = "$TARGET_IMAGE_ID" ]; then
+              API_STATE_CLASSIFICATION="TARGET_API_CONFIRMED"
+            else
+              API_STATE_CLASSIFICATION="UNKNOWN_API_STATE"
+            fi
+            echo "SECONDARY API CLASSIFICATION RESULT: $API_STATE_CLASSIFICATION" >&2
+          }
+
+          # Phase 4L: shared bounded exact-SHA live-frontend convergence
+          # check, used both for the target frontend (main script flow,
+          # after the git reset to TARGET_SHA) and for rollback_git's own
+          # restored-frontend proof. Bytes are hashed from a temp file
+          # curl itself wrote (never `BODY="$(curl ...)"`, which would
+          # strip trailing newlines through command substitution and
+          # change the byte stream). Localhost only; Cache-Control/Pragma
+          # headers defend against any intermediate cache. The temp file
+          # is removed on every return path -- never left behind.
+          #
+          # Independent review correction: same two-independent-bounds
+          # fix as rollback_api() above -- an attempt ceiling alone is
+          # not a real wall-clock bound when the curl inside it has its
+          # own runtime. This adds an explicit wall-clock deadline
+          # (checked at the start of every iteration) and tightens the
+          # curl to connect-timeout 1s / max-time 2s (localhost static
+          # HTML never needs more). Worst case: nominal 30s deadline plus
+          # at most ~4s of in-flight overshoot (2s curl + 2s trailing
+          # sleep) from the one iteration already running when the
+          # deadline passed -- ~34s total, comfortably under the ~40s
+          # target.
+          wait_for_live_frontend_sha() {
+            local expected_sha="$1"
+            local tmp
+            tmp="$(mktemp /tmp/jobpulse_frontend_probe.XXXXXX)"
+
+            local attempt
+            local got_sha=""
+            local get_ok=false
+            local deadline=$((SECONDS + 30))
+            for attempt in $(seq 1 15); do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                break
+              fi
+              if curl --connect-timeout 1 --max-time 2 -fsS -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o "$tmp" http://127.0.0.1/ 2>/dev/null; then
+                get_ok=true
+                # A failed/unreadable hash must never be treated as a
+                # match -- fall back to empty so the comparison below
+                # fails closed and polling continues within the bound.
+                got_sha="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')" || got_sha=""
+                if [ -n "$got_sha" ] && [ "$got_sha" = "$expected_sha" ]; then
+                  echo "LIVE FRONTEND SHA MATCH: $got_sha" >&2
+                  rm -f "$tmp"
+                  return 0
+                fi
+                echo "LIVE FRONTEND SHA MISMATCH: got=${got_sha:-<unreadable>} expected=$expected_sha (attempt $attempt)" >&2
+              else
+                get_ok=false
+                echo "LIVE FRONTEND GET FAILED (attempt $attempt)" >&2
+              fi
+              sleep 2
+            done
+
+            rm -f "$tmp"
+            if [ "$get_ok" != "true" ]; then
+              echo "FATAL: live frontend localhost GET never succeeded within the bounded window" >&2
+            else
+              echo "FATAL: live frontend SHA-256 never converged to expected '$expected_sha' within the bounded window (last observed '${got_sha:-<unreadable>}')" >&2
+            fi
+            return 1
           }
 
           rollback_git() {
@@ -474,26 +632,19 @@ jobs:
             # Bind-mount semantics (docker-compose.prod.yml:
             # ./frontend:/usr/share/nginx/html:ro) mean the restored old
             # file is served live without any frontend container
-            # recreate/restart -- this bounded localhost probe proves
-            # nginx is actually serving it, not just that the file on
-            # disk is correct. A file-hash mismatch above is the primary
-            # rollback proof; this is defense in depth confirming the
-            # live serving path, not a replacement for it.
-            local rb_frontend_http_ok=false
-            local attempt
-            for attempt in $(seq 1 15); do
-              if curl --connect-timeout 3 --max-time 5 -fsS -o /dev/null http://127.0.0.1/ 2>/dev/null; then
-                rb_frontend_http_ok=true
-                break
-              fi
-              sleep 2
-            done
-            if [ "$rb_frontend_http_ok" != "true" ]; then
-              echo "FATAL: post-rollback localhost frontend HTTP probe never succeeded" >&2
+            # recreate/restart. Phase 4L: this must be exact-SHA
+            # convergence, not merely an HTTP 200 -- an HTTP 200 alone
+            # (the pre-Phase-4L check) cannot distinguish "serving the
+            # restored old content" from "serving stale/other content
+            # that also happens to return 200". The file-hash checks
+            # above are the primary rollback proof; this confirms the
+            # live serving path actually matches, not a replacement for
+            # them.
+            if ! wait_for_live_frontend_sha "$EXPECTED_CURRENT_FRONTEND_SHA256"; then
               return 1
             fi
 
-            echo "ROLLBACK: production git checkout restored to $EXPECTED_CURRENT_SHA, frontend/provider file provenance verified, frontend serving live" >&2
+            echo "ROLLBACK: production git checkout restored to $EXPECTED_CURRENT_SHA, frontend/provider file provenance verified, live frontend SHA-256 matches exactly." >&2
             return 0
           }
 
@@ -1187,16 +1338,55 @@ jobs:
               # exit non-zero, and in that case a success-only flag would
               # still read false even though production state changed.
               if [ "$API_MUTATION_STARTED" = "true" ]; then
+                API_ROLLBACK_ATTEMPTED=true
                 if rollback_api; then
-                  if [ "$GIT_MUTATION_STARTED" = "true" ]; then
-                    rollback_git || echo "FATAL: git rollback failed -- API is restored but git checkout may still be at $TARGET_SHA; manual operator review required" >&2
-                  fi
+                  API_ROLLBACK_CONFIRMED=true
                 else
+                  API_ROLLBACK_CONFIRMED=false
                   echo "FATAL: API rollback failed -- production may be running the unverified candidate image; manual operator review required" >&2
+                  echo "--- API rollback reported failure -- performing secondary read-only API state classification (no container mutation) ---" >&2
+                  classify_api_state_after_failed_rollback
+                fi
+
+                # Phase 4L: never blindly `rollback_api || true; rollback_git
+                # || true` -- that could manufacture a NEW split state if the
+                # API is genuinely still on the candidate image. Git rollback
+                # is eligible only when the API is independently confirmed
+                # restored to the OLD image: either rollback_api's own
+                # verification succeeded, or (the exact Phase 4E class) it
+                # reported failure but the secondary classification above
+                # still proves the API bytes are already old and running.
+                # A TARGET_API_CONFIRMED or UNKNOWN_API_STATE classification
+                # never triggers an automatic git rollback -- the checkout is
+                # preserved as-is for manual review rather than guessing.
+                if [ "$GIT_MUTATION_STARTED" = "true" ]; then
+                  if [ "$API_ROLLBACK_CONFIRMED" = "true" ]; then
+                    GIT_ROLLBACK_ATTEMPTED=true
+                    rollback_git && GIT_ROLLBACK_CONFIRMED=true
+                  elif [ "$API_STATE_CLASSIFICATION" = "OLD_API_CONFIRMED" ]; then
+                    echo "--- API rollback verification failed, but the secondary classification independently confirms the API is already back on the old image and running -- proceeding with git rollback ---" >&2
+                    GIT_ROLLBACK_ATTEMPTED=true
+                    rollback_git && GIT_ROLLBACK_CONFIRMED=true
+                  else
+                    echo "FATAL: API rollback failed and could not be independently confirmed old (classification=${API_STATE_CLASSIFICATION:-UNKNOWN_API_STATE}) -- refusing to touch the git checkout to avoid manufacturing a different split-release state; manual operator review required" >&2
+                  fi
+
+                  if [ "$GIT_ROLLBACK_ATTEMPTED" = "true" ] && [ "$GIT_ROLLBACK_CONFIRMED" != "true" ]; then
+                    echo "FATAL: git rollback failed -- API rollback state is reported separately above; manual operator review required" >&2
+                  fi
                 fi
               else
                 echo "No candidate API mutation had started -- nothing to roll back." >&2
               fi
+
+              echo "--- rollback summary ---" >&2
+              echo "api_mutation_started=$API_MUTATION_STARTED" >&2
+              echo "git_mutation_started=$GIT_MUTATION_STARTED" >&2
+              echo "api_rollback_attempted=$API_ROLLBACK_ATTEMPTED" >&2
+              echo "api_rollback_confirmed=$API_ROLLBACK_CONFIRMED" >&2
+              echo "api_state_after_failed_rollback=${API_STATE_CLASSIFICATION:-not_evaluated}" >&2
+              echo "git_rollback_attempted=$GIT_ROLLBACK_ATTEMPTED" >&2
+              echo "git_rollback_confirmed=$GIT_ROLLBACK_CONFIRMED" >&2
             fi
 
             [ -n "$TMP_DOCKER_CONFIG" ] && rm -rf "$TMP_DOCKER_CONFIG"
@@ -1689,32 +1879,24 @@ jobs:
           fi
           echo "Post-reset frontend/provider provenance verified: matches target commit exactly."
 
-          echo "--- live frontend validation (bounded localhost GET, no external network) ---"
+          echo "--- live frontend validation (bounded localhost GET, exact-SHA convergence, no external network) ---"
           # Proves the bind-mounted static frontend (docker-compose.prod.yml:
           # ./frontend:/usr/share/nginx/html:ro) is actually serving the
           # target checkout's content -- the file-hash check above proves
-          # what's on disk, this proves nginx is serving it. Uses the
-          # existing public localhost nginx path only; contacts no
-          # external domain; does not require any job row to contain
-          # poster data.
-          LIVE_FRONTEND_OK=false
-          LIVE_FRONTEND_BODY=""
-          for attempt in $(seq 1 15); do
-            if LIVE_FRONTEND_BODY="$(curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ 2>/dev/null)"; then
-              LIVE_FRONTEND_OK=true
-              break
-            fi
-            sleep 2
-          done
-          if [ "$LIVE_FRONTEND_OK" != "true" ]; then
-            echo "ERROR: live frontend localhost GET never succeeded" >&2
+          # what's on disk, this proves nginx is serving it. Phase 4L:
+          # exact SHA-256 equality against TARGET_FRONTEND_SHA256 (already
+          # derived from the immutable target commit), not merely a
+          # marker string inside the response -- the marker was already
+          # checked once, earlier, as a release-intent assertion directly
+          # against the immutable target git object (see "Verify Phase
+          # 4B target release-intent markers" above); it is never the
+          # final proof that localhost nginx is serving the target bytes.
+          # Uses the existing public localhost nginx path only; contacts
+          # no external domain.
+          if ! wait_for_live_frontend_sha "$TARGET_FRONTEND_SHA256"; then
             exit 1
           fi
-          if ! printf '%s' "$LIVE_FRONTEND_BODY" | grep -qF 'Open Poster Profile'; then
-            echo "ERROR: live frontend response does not contain the Phase 4B marker 'Open Poster Profile'" >&2
-            exit 1
-          fi
-          echo "Live frontend validated: serving target content (Phase 4B marker present)."
+          echo "Live frontend validated: exact SHA-256 matches target ($TARGET_FRONTEND_SHA256)."
 
           echo "--- frontend container invariant (must still be untouched after git reset) ---"
           FRONTEND_STATE_AFTER_RESET="$(capture_container_state jobpulse-frontend-prod)"
