@@ -3451,3 +3451,146 @@ above, with the API `Config.Image` rollback alias intentionally left
 unnormalized, until a separately authorized dispatch or operation is
 made.
 
+## Phase 4M: API reference normalization runner
+
+By this point the chain of prior phases has left production in a
+well-understood, purely cosmetic state of debt:
+
+- **Phase 4K** (Production Split-Release Recovery run `36238209271`)
+  restored the functional f476 baseline: production git is
+  `f4765f857355c6543f68cea0e481b7f20a917147`, the API is running the
+  correct old (f476) image bytes, healthy, `restart_count=0`.
+- **Phase 4L** repaired the general-purpose
+  `production-direct-runtime-upgrade.yml` rollback path (real
+  wall-clock bounds, git-rollback eligibility matrix, exact-SHA
+  frontend convergence) so the *next* upgrade/rollback on that runner
+  behaves correctly -- it did not touch production itself.
+- The **only** remaining debt is that the API container's
+  `Config.Image` is still the temporary local rollback alias
+  `jobpulse-api-rollback:bccbbd997ee8-1427495` that Phase 4E's rollback
+  left behind. The underlying image bytes are already exactly correct
+  (`sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`)
+  -- this is a reference-labeling problem, not a code or data problem.
+
+`.github/workflows/production-api-reference-normalization.yml` is a
+dedicated, one-time, incident-cleanup runner (`workflow_dispatch` only,
+confirmation token `NORMALIZE_F476_API_REFERENCE`) that closes this gap
+by recreating **only** the api container so Docker records its
+`Config.Image` as the canonical
+`ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147`
+reference -- while requiring the underlying image ID to remain **the
+exact same bytes** as before. There is no code/image upgrade and no git
+change; the container itself must still be recreated with
+`--force-recreate` because Docker stores `Config.Image` on the
+container's own configuration, not something editable in place. This
+PR adds and tests the runner only -- **it does not execute it**;
+production remains exactly on the Phase 4K/4L baseline, `Config.Image`
+alias included, until a separately authorized dispatch.
+
+### Design
+
+- **Shares** `production-direct-runtime-upgrade.yml`'s concurrency
+  group (`jobpulse-production-direct-runtime-upgrade`) since both
+  mutate the same production API runtime -- the two runners can never
+  overlap.
+- **Pinned one-time constants**: `EXPECTED_PRODUCTION_SHA` (f476),
+  `EXPECTED_CURRENT_CONFIG_IMAGE` (the rollback alias),
+  `CANONICAL_IMAGE` (the target GHCR reference),
+  `EXPECTED_IMAGE_ID`, and the exact API/DB/frontend/Tor container IDs
+  Phase 4K proved. Any drift from these exact values fails closed
+  before mutation.
+- **Canonical image provenance**: the remote host pulls
+  `CANONICAL_IMAGE` (isolated temporary `DOCKER_CONFIG`, optional
+  bounded non-interactive GHCR login via the same stdin-only token
+  model as `production-direct-runtime-upgrade.yml` -- anonymous public
+  pull is also accepted) and requires
+  `docker image inspect "$CANONICAL_IMAGE" --format '{{.Id}}'` to equal
+  `EXPECTED_IMAGE_ID` **exactly**, before the running container is ever
+  touched. If the registry ever resolves that tag to different bytes,
+  the run fails closed pre-mutation -- this is the runner's central
+  safety property, since a canonical-reference push that silently
+  moved would otherwise turn a "reference-only" operation into a real
+  byte upgrade.
+- **Scheduler provenance is reused, not reinvented**: the crontab/
+  systemd discovery section (own-crontab exact-line proof, `/etc/
+  crontab` and `/etc/cron.d` absence-only drift checks, bounded root-
+  crontab check, the Phase 4J semantic `*@.service` template-vs-
+  concrete-vs-loaded-unit systemd model, and the `.collection.env`
+  data-only internal-lock provenance) is copied as literally as
+  practical from the already-reviewed
+  `production-split-release-recovery.yml` version -- see
+  `tests/test_production_api_reference_normalization_workflow.py`'s
+  parity test, which diffs the two sections (modulo blank lines) and
+  fails if they ever drift apart. The same two collection-cycle locks
+  (outer then internal, both non-blocking) are acquired after
+  provenance passes and held across mutation, validation, and any
+  rollback, released only in the `EXIT` trap.
+- **Final pre-mutation revalidation**: immediately before
+  `API_MUTATION_STARTED=true`, every pinned value (git SHA, API/DB/
+  frontend/Tor container IDs, API `Config.Image`/image ID, compose
+  file hash, `SEARCH_TRANSPORT`/`TOR_ENABLED`) is re-read and compared
+  against the initial preflight snapshot, narrowing the race window
+  between preflight and mutation.
+- **The only mutation**: `JOBPULSE_API_IMAGE="$CANONICAL_IMAGE" docker
+  compose ... up -d --no-build --no-deps --force-recreate api`. `db`,
+  `frontend`, and `tor` are never recreated/restarted; production git
+  is never touched (no `git reset`/`checkout`/`pull`/`merge` anywhere
+  in this runner).
+- **Convergence reuses Phase 4L's wall-clock model exactly**: a shared
+  `wait_for_api_convergence()` helper enforces the same two independent
+  bounds (a 45-attempt ceiling *and* an explicit `SECONDS`-based ~90s
+  wall-clock deadline, checked before every iteration's probe) with the
+  same tightened per-command timeouts (health curls:
+  `--connect-timeout 1 --max-time 2`; the three running/health/image-id
+  reads consolidated into one `timeout 3`-wrapped `docker inspect`).
+  Docker health `starting` is tolerated within the bound. After
+  convergence, the same helper additionally requires the container's
+  `Config.Image` to equal a caller-supplied expected reference and
+  re-proves the direct/no-Tor invariant -- used for both candidate
+  normalization (`expected=$CANONICAL_IMAGE`) and rollback
+  (`expected=$EXPECTED_CURRENT_CONFIG_IMAGE`).
+- **Normalization-specific success conditions**: beyond convergence,
+  the new API container ID must differ from the pre-run ID (proving
+  `--force-recreate` actually recreated it), `restart_count` must be
+  `0`, and DB/frontend/Tor container IDs, image IDs, restart counts,
+  health, and the live frontend's exact f476 SHA-256 must all remain
+  completely unchanged. Production git must still be exactly f476 with
+  a clean tracked worktree.
+
+### Rollback design
+
+The underlying image bytes never change during this runner (the same
+`EXPECTED_IMAGE_ID` before and after), so rollback never needs a second
+pull -- it only needs to point the OLD logical reference back at those
+same bytes (`docker tag "$EXPECTED_IMAGE_ID"
+"$EXPECTED_CURRENT_CONFIG_IMAGE"`) and recreate the api service with
+that reference, using the identical `wait_for_api_convergence()`
+helper. There is no git rollback path at all -- this workflow never
+touches git, so there is nothing to revert on that axis. **A confirmed
+rollback does not make the workflow succeed**: the normalization
+attempt itself still failed, and the run concludes non-zero with the
+explicit classification
+`NORMALIZATION_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED`. If
+rollback itself cannot converge, the runner does not attempt a second
+rollback -- it emits narrow final evidence (container ID, `Config.Image`,
+image ID, running/health/both health paths, `SEARCH_TRANSPORT`/
+`TOR_ENABLED`, DB/frontend/Tor IDs) for manual operator review and exits
+non-zero.
+
+### What Phase 4M does not do
+
+This PR is code/test/docs only. It does not dispatch Production API
+Reference Normalization, Production Direct Runtime Upgrade, Production
+Split-Release Recovery, Production Runtime Diagnostic, Production
+Neutral Canary, Deploy Production, or Build JobPulse API Image, and it
+does not SSH to or mutate production. It does not delete or clean up
+any old image tags on a successful run (out of scope -- the only goal
+is the running container's `Config.Image`). Running the Production
+Runtime Diagnostic after a real normalization is deliberately left as a
+separate, later, reviewed step -- not automated by this runner --
+since the diagnostic already expects production git at f476 and the
+API `Config.Image` at the canonical GHCR reference once normalization
+has actually run. Production remains on the exact Phase 4K/4L baseline,
+`Config.Image` alias included, until a separately authorized dispatch
+of this runner is made.
+
