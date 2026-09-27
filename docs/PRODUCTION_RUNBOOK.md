@@ -3757,3 +3757,130 @@ has actually run. Production remains on the exact Phase 4K/4L baseline,
 `Config.Image` alias included, until a separately authorized dispatch
 of this runner is made.
 
+## Phase 4M: Pre-normalization read-only verification runner
+
+`.github/workflows/production-prenormalization-readonly-verification.yml`
+is a dedicated, `workflow_dispatch`-only, **read-only** companion to the
+normalization runner above. It exists because an operator deciding
+*whether* to dispatch normalization had, until now, no way to check its
+exact preconditions ahead of time without either guessing from stale
+diagnostic output or actually dispatching a mutating runner. This runner
+answers that one question -- does production still look exactly like
+the normalization runner assumes it looks? -- and nothing else.
+
+**Why it exists.** production-api-reference-normalization.yml's own
+pre-mutation preflight already proves its preconditions immediately
+before acting. This runner proves the same preconditions in advance,
+with zero mutation risk, so a human can make an informed go/no-go
+decision before ever touching the running container.
+
+**It is read-only by construction, not by convention.** Unlike a
+"dry-run" flag bolted onto a mutating runner, this workflow's source
+contains no production-mutation code path at all: no
+`docker compose up/down/create`, no `docker restart/stop/start/rm/tag/
+pull/push`, no `git reset/checkout/switch/pull/merge/clean/stash`, no
+production file write (the remote script is piped over SSH stdin, never
+scp'd to a temp file the way the mutating runners do), no cron/systemd
+mutation, no collector/queue/collection-cycle execution, no LinkedIn
+request, and no Tor/ControlPort/NEWNYM access. Every remote command is
+one of: `git rev-parse`/`git status` (read HEAD and worktree
+cleanliness, never touched), `sha256sum` (static Compose-file
+provenance), `docker inspect` (container identity/health/restart
+counts), `docker compose ... config`/`config --services` (render only,
+never `up`/`down`/`create`), exactly two narrow `docker exec ...
+printenv` calls (`SEARCH_TRANSPORT` and `TOR_ENABLED` only, never a full
+environment dump), `docker image inspect` against an already-present
+local image ID (never `docker pull`), `docker top` (observation only,
+never `docker kill`/`stop`), the same bounded `crontab -l`/`systemctl
+show|cat|list-*` scheduler-provenance reads the normalization runner
+uses, and two localhost-only `curl` health probes.
+
+**Reused, not reinvented.** The scheduler-provenance section and the
+effective-CURRENT Compose api-block/environment-block extraction are
+copied as literally as practical from the already-reviewed
+production-api-reference-normalization.yml -- see
+`tests/test_production_prenormalization_readonly_verification_workflow.py`'s
+parity tests, which diff those sections against that file and fail if
+they ever drift apart. Unlike that mutating runner, this workflow never
+acquires the two collection-cycle locks it checks provenance for -- it
+only observes; there is nothing here for a lock to protect.
+
+The runtime-vs-effective-CURRENT semantic environment equivalence proof
+(`render_current_env_json_pair()`/`compute_env_parity_hashes()` and the
+embedded Python stdlib `json`+`hashlib` helper) preserves the exact same
+comparison *model* as production-api-reference-normalization.yml
+(image-defaults-overlaid-by-Compose-environment "expected" env vs. the
+running container's "actual" env, both canonicalized and SHA-256-hashed)
+but is **not** byte-identical to it: that runner captures the three JSON
+documents into production-side temporary files before hashing them,
+which this dedicated read-only runner must never do (see "Secret
+hygiene / zero production file writes" below). The dedicated
+`tests/test_production_prenormalization_readonly_verification_workflow.py`
+tests for this section assert semantic/logical parity (the same
+comparison keys, the same canonicalization, the same failure modes) and
+separately assert the complete absence of `mktemp`, temporary-directory
+creation, or any `compose_current.json`/`image_env.json`/`runtime_env.json`
+path, rather than a byte-for-byte source diff against the mutating
+runner's file-based implementation.
+
+**What it checks, read-only:** production git HEAD is exactly f476 with
+a clean tracked worktree; the static `docker-compose.prod.yml` SHA-256
+matches the immutable hash derived from that same commit on the GitHub
+runner (never from mutable production state); the API container's ID,
+`Config.Image`, underlying image ID, running state, health, and
+`RestartCount` match the pinned Phase 4K baseline; the running
+container's `SEARCH_TRANSPORT`/`TOR_ENABLED` are direct/no-Tor; the
+effective CURRENT Compose config (rendered with
+`JOBPULSE_API_IMAGE=jobpulse-api-rollback:bccbbd997ee8-1427495`)
+resolves to the same alias, the same direct/no-Tor values, and the same
+`api`/`db`/`frontend` service topology; the running container's actual
+environment matches, semantically (image defaults overlaid by the
+effective CURRENT Compose environment, canonicalized and SHA-256-hashed
+-- never the `docker compose config --hash`/config-hash-label shortcut,
+which has had version-specific mismatch behavior with `env_file`), what
+Compose would produce today; the DB/frontend/Tor container IDs, running
+state, `RestartCount`, and health (Tor additionally publishes no host
+ports); scheduler provenance (crontab/systemd) shows no drift from the
+single historically-proven collection launcher; no active collector
+process is currently running (`docker top`, pattern-matched, never
+killed); and the two localhost API health endpoints plus a plain
+frontend reachability probe all respond.
+
+**Non-blocking by design.** Untracked-file presence is reported (count
+only) but never blocks. Canonical reference (`ghcr.io/mrezamaghouli/
+jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147`) local absence is
+explicitly non-blocking and reported as
+`canonical_reference_local_presence=false` -- the normalization runner
+has its own authenticated pull + exact image-ID provenance gate before
+it ever touches the running container, so this workflow never attempts
+one itself.
+
+**Success is not permission.** The exact marker
+`PHASE_4M_PRENORMALIZATION_READONLY_VERIFIED` is emitted only after
+every required invariant above has passed -- any failure exits non-zero
+before that line is ever reached, and the workflow never attempts repair
+or a second check of anything. Emitting the success marker does **not**
+dispatch normalization or any other production workflow; whether to
+actually run production-api-reference-normalization.yml remains a
+completely separate, later, explicitly authorized decision. If an
+active collector is detected, that is reported and the run fails
+closed for readiness -- an operator may re-dispatch this same read-only
+check later, but detecting activity is never permission to stop it.
+
+**Secret hygiene / zero production file writes.** `VM_SSH_KEY` is used
+only to establish the SSH transport (no GHCR token, no Tor secret). The
+environment-equivalence proof never creates a file on the production
+host at all: each of the three producers (`docker compose ... config
+--format json`, `docker image inspect`, `docker inspect`) is captured
+directly into a local, never-exported bash variable held only in this
+SSH session's memory, then streamed -- as a bounded, length-prefixed
+stdin protocol, never newline-delimited -- straight into a single
+`python3 -c` consumer's stdin. No `compose_current.json`,
+`image_env.json`, `runtime_env.json`, or any replacement path under
+`/tmp`, `/var/tmp`, `/opt/jobpulse`, `$HOME`, or `/dev/shm` is ever
+created; `production_file_writes=0` holds for the same reason it holds
+for the rest of this workflow -- there is no write, not merely no
+*persistent* write. Only hashes, counts, IDs, and boolean/enum
+classifications are ever printed -- never a raw environment value,
+`env_file` content, or full rendered Compose config.
+
