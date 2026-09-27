@@ -1,0 +1,921 @@
+name: Production Pre-Normalization Read-Only Verification
+
+# ============================================================================
+# PHASE 4M -- PRE-NORMALIZATION READ-ONLY PRODUCTION VERIFICATION.
+#
+# Context: PR #37 (merged) added
+# production-api-reference-normalization.yml, a workflow_dispatch-only
+# runner that recreates ONLY the production api container so Docker
+# records the canonical GHCR reference instead of the temporary Phase 4E
+# rollback alias, while requiring the underlying image ID to remain
+# EXACTLY the same bytes. That runner's own pre-mutation preflight
+# already proves its preconditions immediately before acting -- but an
+# operator deciding WHETHER to dispatch it at all has, until now, had no
+# way to check those exact preconditions ahead of time without either
+# guessing or actually dispatching a mutating runner.
+#
+# This workflow is that missing read-only step. It reuses the local
+# Claude/VS Code session's SSH access model (secrets.VM_SSH_KEY) and, as
+# literally as practical, the already-reviewed scheduler-provenance and
+# runtime-vs-effective-CURRENT semantic-environment-equivalence logic
+# from production-api-reference-normalization.yml -- never a materially
+# different comparison -- to answer one question: does production still
+# look exactly like the normalization runner assumes it looks?
+#
+# It is workflow_dispatch ONLY (no push/pull_request/schedule/
+# workflow_run trigger, so it can never fire as a side effect of anything
+# else) and its source contains NO production-mutation path at all --
+# not a "dry-run" flag bolted onto a mutating runner, but a dedicated
+# runner that never invokes `docker compose up/down/create`, `docker
+# restart/stop/start/rm/tag/pull/push`, `git reset/checkout/switch/pull/
+# merge/clean/stash`, any collector/queue/collection-cycle script, any
+# LinkedIn request, or any Tor/ControlPort/NEWNYM access. Every remote
+# command is read-only: `git rev-parse`/`git status`, `sha256sum`,
+# `docker inspect`, `docker compose ... config` (render only, never
+# `up`/`down`/`create`), a single narrow `docker exec ... printenv`
+# per key (never a full environment dump), `docker image inspect` against
+# an already-present local image ID (never `docker pull`), `docker top`
+# (never `docker kill`/`stop`), `crontab -l`/`systemctl show|cat|list-*`,
+# and two localhost-only `curl` health probes.
+#
+# Success (the exact marker PHASE_4M_PRENORMALIZATION_READONLY_VERIFIED)
+# does NOT dispatch anything -- normalization remains a completely
+# separate, explicitly authorized, later decision. Canonical-reference
+# local absence is explicitly non-blocking here, because
+# production-api-reference-normalization.yml has its own authenticated
+# pull + exact image-ID provenance gate before it ever touches the
+# running container.
+# ============================================================================
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-production-prenormalization-readonly-verification
+  cancel-in-progress: false
+
+env:
+  VM_HOST: "35.192.251.190"
+  VM_USER: "mrezamaghouli"
+  VM_PORT: "22"
+  # One-time-reviewed pinned constants -- see docs/PRODUCTION_RUNBOOK.md's
+  # Phase 4M section. Identical to the values pinned in
+  # production-api-reference-normalization.yml; this workflow proves the
+  # exact preconditions that runner assumes, so the constants must match.
+  EXPECTED_PRODUCTION_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  EXPECTED_CURRENT_CONFIG_IMAGE: "jobpulse-api-rollback:bccbbd997ee8-1427495"
+  EXPECTED_IMAGE_ID: "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+  EXPECTED_API_CONTAINER_ID: "ac66a4acef51c8ac3dc27b38a5559c5aa056ec033ceef43c9f8a0e4a8cbd3682"
+  EXPECTED_DB_CONTAINER_ID: "98f20abb30f4fdfe9473431370c3f6db29c39183d67f31d49638a493a1f605e9"
+  EXPECTED_FRONTEND_CONTAINER_ID: "fb949b779e80a53f4a9542d2eaa30945d1abbf357fbb2391b2422238371b7dd8"
+  EXPECTED_TOR_CONTAINER_ID: "e2210c3c47f7a73fca1d5b2faeb62b2eeec89526a56f5da4cb1a00a3298b1612"
+  CANONICAL_API_REFERENCE: "ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require dispatch from main
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${{ github.ref }}')" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive immutable Compose file hash from the pinned f476 commit
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git cat-file -e "${EXPECTED_PRODUCTION_SHA}^{commit}"
+
+          # Derived from the immutable f476 commit object in THIS
+          # checkout, never from mutable production state -- production's
+          # own copy is compared against this value read-only below.
+          COMPOSE_SHA256="$(git show "${EXPECTED_PRODUCTION_SHA}:docker-compose.prod.yml" | sha256sum | awk '{print $1}')"
+          echo "immutable f476 compose SHA-256: $COMPOSE_SHA256"
+          echo "COMPOSE_SHA256=$COMPOSE_SHA256" >> "$GITHUB_ENV"
+
+      - name: Validate VM_SSH_KEY secret is present
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VM_SSH_KEY:-}" ]; then
+            echo "ERROR: VM_SSH_KEY secret is missing" >&2
+            exit 1
+          fi
+
+      - name: Run pre-normalization read-only production verification
+        id: verify
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Piped over stdin (bash -s), never scp'd/written to the
+          # remote host -- there is no production-side temp file to
+          # clean up, and "production file writes = 0" holds trivially.
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/jobpulse_prenorm_verify_key
+          chmod 600 ~/.ssh/jobpulse_prenorm_verify_key
+          cleanup_runner() {
+            rm -f ~/.ssh/jobpulse_prenorm_verify_key
+          }
+          trap cleanup_runner EXIT
+          ssh-keyscan -T 10 -p "$VM_PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+
+          SSH_OPTS=(-o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes -o StrictHostKeyChecking=yes)
+
+          ssh "${SSH_OPTS[@]}" -i ~/.ssh/jobpulse_prenorm_verify_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
+            bash -s -- "$COMPOSE_SHA256" <<'REMOTE_SCRIPT'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          COMPOSE_SHA256="${1:?required}"
+
+          # Generic failure tracer: fires on any command that trips set
+          # -e, including inside functions (requires -E). Reports rc/line/
+          # command only -- never env or secret values. Commands below
+          # reference only variable NAMES/file paths in their own source
+          # text, never an inlined expanded secret value, so a trace can
+          # never surface one.
+          report_err() {
+            local rc=$?
+            local line="$1"
+            local cmd="$2"
+            echo "PRENORMALIZATION_ERROR_TRACE: rc=${rc} line=${line} cmd=${cmd}" >&2
+            return "$rc"
+          }
+          trap 'report_err "$LINENO" "$BASH_COMMAND"' ERR
+
+          fail() {
+            echo "PRENORMALIZATION_FAILED: $*" >&2
+            exit 1
+          }
+
+          # One-time pinned constants -- identical to
+          # production-api-reference-normalization.yml's remote script
+          # (see docs/PRODUCTION_RUNBOOK.md's Phase 4M section). Hardcoded
+          # here rather than threaded as extra positional arguments,
+          # exactly like that runner's own EXPECTED_* constants.
+          EXPECTED_PRODUCTION_SHA="f4765f857355c6543f68cea0e481b7f20a917147"
+          EXPECTED_CURRENT_CONFIG_IMAGE="jobpulse-api-rollback:bccbbd997ee8-1427495"
+          EXPECTED_IMAGE_ID="sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+          EXPECTED_API_CONTAINER_ID="ac66a4acef51c8ac3dc27b38a5559c5aa056ec033ceef43c9f8a0e4a8cbd3682"
+          EXPECTED_DB_CONTAINER_ID="98f20abb30f4fdfe9473431370c3f6db29c39183d67f31d49638a493a1f605e9"
+          EXPECTED_FRONTEND_CONTAINER_ID="fb949b779e80a53f4a9542d2eaa30945d1abbf357fbb2391b2422238371b7dd8"
+          EXPECTED_TOR_CONTAINER_ID="e2210c3c47f7a73fca1d5b2faeb62b2eeec89526a56f5da4cb1a00a3298b1612"
+          CANONICAL_API_REFERENCE="ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+          PRODUCTION_PROJECT="jobpulse"
+          COMPOSE_FILE="/opt/jobpulse/docker-compose.prod.yml"
+          # Same canonical internal lock path the Phase 4J/4M runners pin
+          # -- referenced here ONLY for the read-only
+          # /opt/jobpulse/.collection.env provenance check below. This
+          # workflow never opens, acquires, or otherwise touches this (or
+          # any) lock file.
+          INTERNAL_LOCK_PATH="/opt/jobpulse/state/run_collection_cycle.lock"
+
+          # Semantic environment-equivalence proof (rendered Compose
+          # environment, immutable f476 image default Env, running
+          # container Env). ZERO production filesystem writes: each
+          # producer's output is captured directly into a local, never-
+          # exported bash variable held only in this process's memory,
+          # then streamed -- length-prefixed, never newline-delimited --
+          # over a pipe straight into a single python3 consumer's stdin.
+          # No compose_current.json/image_env.json/runtime_env.json (or
+          # any replacement path under /tmp, /var/tmp, /opt/jobpulse,
+          # $HOME, or /dev/shm) is ever created on this host, so there is
+          # nothing here for an EXIT trap to remove. Only hashes/counts
+          # ever leave this process -- see compute_env_parity_hashes()
+          # below.
+
+          # Renders the effective CURRENT Compose config in JSON (never
+          # falls back to an unsafe YAML-value parser for this proof) and
+          # reads the immutable f476 image's own default Env, each
+          # captured straight into a local shell variable -- never a
+          # file. Never echoes their contents. Read-only; never mutates
+          # Docker; never pulls -- `docker image inspect` only ever
+          # inspects an already-present local image object. Each
+          # producer's exit status is checked immediately via an explicit
+          # `||` (never a same-line `local var=$(...)`, which would
+          # discard the command's own exit status under `local`'s own
+          # success) so a producer failure here can never be confused
+          # with a later pipeline failure.
+          render_current_env_json_pair() {
+            local compose_json
+            compose_json="$(JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config --format json)" || {
+              echo "FATAL: docker compose config --format json is unsupported or failed for the effective CURRENT config -- failing closed, never falling back to an unsafe YAML-value parser" >&2
+              return 1
+            }
+            ENV_PARITY_COMPOSE_JSON="$compose_json"
+
+            local image_env_json
+            image_env_json="$(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{json .Config.Env}}')" || {
+              echo "FATAL: the immutable f476 image object is not locally inspectable -- failing closed, never a registry pull inside this read-only verification" >&2
+              return 1
+            }
+            ENV_PARITY_IMAGE_ENV_JSON="$image_env_json"
+            return 0
+          }
+
+          # Bounded stdin framing protocol used to stream the three JSON
+          # documents directly into the python3 consumer below without
+          # ever touching disk: each record is `<decimal-byte-length>\n`
+          # followed by exactly that many raw bytes -- never a bare
+          # newline-delimited document. A length prefix cannot be
+          # confused by any byte sequence a JSON document could ever
+          # contain (embedded newlines, quotes, `=`, spaces, or
+          # multi-byte Unicode all count as ordinary payload bytes).
+          # Byte lengths are computed with `wc -c` (always byte-accurate,
+          # unlike bash's locale-sensitive `${#var}`). Three records, in
+          # this fixed order: effective CURRENT Compose environment JSON,
+          # immutable f476 image default Env JSON, running container Env
+          # JSON.
+          emit_env_parity_frame() {
+            local payload="$1" len
+            len="$(printf '%s' "$payload" | wc -c)"
+            printf '%s\n' "$len"
+            printf '%s' "$payload"
+          }
+
+          # Single narrow python3 (stdlib json+hashlib only, never PyYAML)
+          # helper -- same semantic model as
+          # production-api-reference-normalization.yml's
+          # compute_env_parity_hashes() (image-defaults-overlaid-by-
+          # Compose-environment "expected" env vs. the parsed "actual"
+          # env, each canonicalized as a sort_keys/compact-separator JSON
+          # object and SHA-256-hashed), but reads its three JSON
+          # documents from the bounded stdin framing protocol above
+          # instead of file paths, since this workflow never writes them
+          # to disk. Its own source is passed via `python3 -c`, never a
+          # heredoc on the invocation's stdin, so stdin is reserved
+          # exclusively for the framed protocol. Never prints an
+          # environment VALUE -- only hashes/counts, or on failure a
+          # narrow message naming at most a key NAME (never a value).
+          # Never mutates Docker.
+          ENV_PARITY_PY_SOURCE="$(cat <<'ENV_PARITY_PY'
+          import json
+          import sys
+          import hashlib
+
+          MAX_RECORD_BYTES = 16 * 1024 * 1024
+
+
+          def read_record(stream):
+              length_field = b""
+              while True:
+                  ch = stream.read(1)
+                  if not ch:
+                      raise ValueError("unexpected EOF while reading a record length")
+                  if ch == b"\n":
+                      break
+                  if not ch.isdigit():
+                      raise ValueError("malformed record length")
+                  length_field += ch
+                  if len(length_field) > 10:
+                      raise ValueError("record length field too long")
+              if not length_field:
+                  raise ValueError("empty record length")
+              length = int(length_field.decode("ascii"))
+              if length > MAX_RECORD_BYTES:
+                  raise ValueError("record length out of bounds")
+              payload = stream.read(length)
+              if len(payload) != length:
+                  raise ValueError("unexpected EOF while reading a record payload")
+              return payload
+
+
+          def stringify(value, ctx):
+              if value is None:
+                  raise ValueError(f"{ctx}: ambiguous null value")
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, (str, int, float)):
+                  return str(value)
+              raise ValueError(f"{ctx}: unexpected type {type(value).__name__}")
+
+
+          def parse_kv_list(entries, ctx):
+              result = {}
+              for entry in entries:
+                  if not isinstance(entry, str) or "=" not in entry:
+                      raise ValueError(f"{ctx}: malformed entry")
+                  key, _, value = entry.partition("=")
+                  if not key:
+                      raise ValueError(f"{ctx}: malformed entry (empty key)")
+                  if key in result:
+                      raise ValueError(f"{ctx}: duplicate key {key}")
+                  result[key] = value
+              return result
+
+
+          def canonical_hash(env_map):
+              canonical = json.dumps(env_map, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+              return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+          try:
+              stdin = sys.stdin.buffer
+
+              compose_bytes = read_record(stdin)
+              image_env_bytes = read_record(stdin)
+              runtime_env_bytes = read_record(stdin)
+
+              compose_config = json.loads(compose_bytes.decode("utf-8"))
+              services = compose_config.get("services")
+              if not isinstance(services, dict):
+                  raise ValueError("effective current config: 'services' missing or not an object")
+              api = services.get("api")
+              if not isinstance(api, dict):
+                  raise ValueError("effective current config: 'api' service missing or not an object")
+              environment = api.get("environment")
+              if not isinstance(environment, dict):
+                  raise ValueError("effective current config: api 'environment' missing or not an object")
+              compose_env = {
+                  key: stringify(value, f"effective current environment key {key}")
+                  for key, value in environment.items()
+              }
+
+              image_env_list = json.loads(image_env_bytes.decode("utf-8"))
+              if not isinstance(image_env_list, list):
+                  raise ValueError("image default Env is not a list")
+              image_env = parse_kv_list(image_env_list, "image default Env")
+
+              runtime_env_list = json.loads(runtime_env_bytes.decode("utf-8"))
+              if not isinstance(runtime_env_list, list):
+                  raise ValueError("running container Env is not a list")
+              runtime_env = parse_kv_list(runtime_env_list, "running container Env")
+
+              expected_env = dict(image_env)
+              expected_env.update(compose_env)
+
+              print(f"EXPECTED_RUNTIME_ENV_SHA256={canonical_hash(expected_env)}")
+              print(f"ACTUAL_RUNTIME_ENV_SHA256={canonical_hash(runtime_env)}")
+              print(f"EXPECTED_ENV_KEY_COUNT={len(expected_env)}")
+              print(f"ACTUAL_ENV_KEY_COUNT={len(runtime_env)}")
+          except Exception as exc:
+              print(f"ENV_PARITY_ERROR: {exc}", file=sys.stderr)
+              sys.exit(1)
+          ENV_PARITY_PY
+          )"
+
+          # Streams the three already-captured, in-memory JSON documents
+          # into the python3 consumer above via the bounded framing
+          # protocol -- a pure pipe, never a file. The three producer
+          # calls that fill $1/$2/$3 have ALREADY run and had their exit
+          # status checked explicitly (in render_current_env_json_pair()
+          # and at the runtime-Env call site below) before this function
+          # is ever invoked, so the only two commands left in the pipe
+          # below are this in-memory emitter (which cannot fail from a
+          # Docker/producer error -- there is none left to mask) and
+          # python3 itself. `set +e` plus an explicit
+          # `exit "${PIPESTATUS[1]}"` positively proves python3's own
+          # exit status is what determines success here, so neither
+          # command in this pipe can mask the other.
+          compute_env_parity_hashes() {
+            local compose_json="$1" image_env_json="$2" runtime_env_json="$3"
+            local py_output py_status
+            # `if ... ; else py_status=$?; fi` (never a bare
+            # `py_output=$(...); py_status=$?`) so that `set -e` cannot
+            # abort this assignment before py_status is captured --
+            # an `if` condition is one of the few contexts `set -e`
+            # exempts from triggering on a non-zero status.
+            if py_output="$(
+              set +e
+              { emit_env_parity_frame "$compose_json"; emit_env_parity_frame "$image_env_json"; emit_env_parity_frame "$runtime_env_json"; } \
+                | python3 -c "$ENV_PARITY_PY_SOURCE" 2>&1
+              exit "${PIPESTATUS[1]}"
+            )"; then
+              py_status=0
+            else
+              py_status=$?
+            fi
+            if [ "$py_status" -ne 0 ]; then
+              echo "FATAL: semantic environment comparison failed: $py_output" >&2
+              return 1
+            fi
+            while IFS='=' read -r env_parity_key env_parity_value; do
+              case "$env_parity_key" in
+                EXPECTED_RUNTIME_ENV_SHA256) EXPECTED_RUNTIME_ENV_SHA256="$env_parity_value" ;;
+                ACTUAL_RUNTIME_ENV_SHA256) ACTUAL_RUNTIME_ENV_SHA256="$env_parity_value" ;;
+                EXPECTED_ENV_KEY_COUNT) EXPECTED_ENV_KEY_COUNT="$env_parity_value" ;;
+                ACTUAL_ENV_KEY_COUNT) ACTUAL_ENV_KEY_COUNT="$env_parity_value" ;;
+              esac
+            done <<< "$py_output"
+            return 0
+          }
+
+          cd /opt/jobpulse || fail "cannot cd to /opt/jobpulse"
+
+          echo "===PRENORMALIZATION_READONLY_VERIFICATION_START==="
+          echo "== identity =="
+          hostname
+
+          echo "== 2. production git state (read-only; this workflow NEVER mutates git) =="
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          echo "production_git_sha=$CURRENT_SHA"
+          [ "$CURRENT_SHA" = "$EXPECTED_PRODUCTION_SHA" ] || fail "production git HEAD ($CURRENT_SHA) is not the expected f476 SHA ($EXPECTED_PRODUCTION_SHA)"
+
+          DIRTY_TRACKED="$(git status --porcelain | grep -v '^??' || true)"
+          [ -z "$DIRTY_TRACKED" ] || fail "production tracked worktree is not clean"
+          echo "tracked_worktree_clean=true"
+
+          UNTRACKED_COUNT="$(git status --porcelain | grep -c '^??' || true)"
+          echo "untracked_file_count=$UNTRACKED_COUNT"
+          echo "git_state=ok"
+
+          echo "== 3. static compose provenance (read-only; derived from the immutable f476 git object on the runner) =="
+          ACTUAL_COMPOSE_SHA256="$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')"
+          echo "expected_static_compose_sha256=$COMPOSE_SHA256"
+          echo "actual_static_compose_sha256=$ACTUAL_COMPOSE_SHA256"
+          [ "$ACTUAL_COMPOSE_SHA256" = "$COMPOSE_SHA256" ] || fail "compose file SHA-256 ($ACTUAL_COMPOSE_SHA256) does not match the immutable f476 hash ($COMPOSE_SHA256)"
+          echo "compose_provenance=confirmed_f476"
+
+          echo "== 4/7/9. API container identity =="
+          api_field() {
+            docker inspect jobpulse-api-prod --format "$1"
+          }
+          API_ID="$(api_field '{{.Id}}')"
+          API_CONFIG_IMAGE="$(api_field '{{.Config.Image}}')"
+          API_IMAGE_ID="$(api_field '{{.Image}}')"
+          API_RUNNING="$(api_field '{{.State.Running}}')"
+          API_HEALTH="$(api_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          API_RESTART_COUNT="$(api_field '{{.RestartCount}}')"
+
+          echo "api_container_id=$API_ID"
+          echo "api_config_image=$API_CONFIG_IMAGE"
+          echo "api_image_id=$API_IMAGE_ID"
+          echo "api_running=$API_RUNNING"
+          echo "api_health=$API_HEALTH"
+          echo "api_restart_count=$API_RESTART_COUNT"
+
+          [ "$API_ID" = "$EXPECTED_API_CONTAINER_ID" ] || fail "API container ID ($API_ID) does not match expected ($EXPECTED_API_CONTAINER_ID)"
+          [ "$API_CONFIG_IMAGE" = "$EXPECTED_CURRENT_CONFIG_IMAGE" ] || fail "API Config.Image ($API_CONFIG_IMAGE) does not match expected pre-normalization alias ($EXPECTED_CURRENT_CONFIG_IMAGE)"
+          [ "$API_IMAGE_ID" = "$EXPECTED_IMAGE_ID" ] || fail "API underlying image ID ($API_IMAGE_ID) does not match expected f476 image ($EXPECTED_IMAGE_ID)"
+          [ "$API_RUNNING" = "true" ] || fail "API container is not running"
+          [ "$API_HEALTH" = "none" ] || [ "$API_HEALTH" = "healthy" ] || fail "API container health is not healthy (got $API_HEALTH)"
+          [ "$API_RESTART_COUNT" = "0" ] || fail "API restart_count is not 0 (got $API_RESTART_COUNT)"
+          echo "api_identity=confirmed"
+
+          echo "== 5. direct / no-Tor runtime invariant (only these two keys, never a full environment dump) =="
+          SEARCH_TRANSPORT_RUNTIME="$(docker exec jobpulse-api-prod printenv SEARCH_TRANSPORT 2>/dev/null || echo UNSET)"
+          TOR_ENABLED_RUNTIME="$(docker exec jobpulse-api-prod printenv TOR_ENABLED 2>/dev/null || echo UNSET)"
+          echo "search_transport_runtime=$SEARCH_TRANSPORT_RUNTIME"
+          echo "tor_enabled_runtime=$TOR_ENABLED_RUNTIME"
+          if [ "$SEARCH_TRANSPORT_RUNTIME" != "UNSET" ] && [ "$SEARCH_TRANSPORT_RUNTIME" != "direct" ]; then
+            fail "runtime SEARCH_TRANSPORT is neither unset nor 'direct' (got $SEARCH_TRANSPORT_RUNTIME)"
+          fi
+          [ "$TOR_ENABLED_RUNTIME" = "false" ] || fail "runtime TOR_ENABLED is not exactly 'false' (got $TOR_ENABLED_RUNTIME)"
+
+          echo "== 6. effective CURRENT compose safety (read-only render, never up/down/create) =="
+          EFFECTIVE_CURRENT_CONFIG="$(JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)" || fail "failed to render effective CURRENT Compose config"
+
+          CURRENT_API_BLOCK_START_COUNT="$(grep -c '^  api:' <<< "$EFFECTIVE_CURRENT_CONFIG")"
+          [ "$CURRENT_API_BLOCK_START_COUNT" = "1" ] || fail "effective current Compose config does not have exactly one api service block (found $CURRENT_API_BLOCK_START_COUNT) -- refusing to guess, failing closed"
+          EFFECTIVE_CURRENT_API_BLOCK="$(printf '%s\n' "$EFFECTIVE_CURRENT_CONFIG" | awk '
+            /^  api:/ { in_api=1; next }
+            in_api && /^  [A-Za-z0-9_.-]+:/ { in_api=0 }
+            in_api { print }
+          ')"
+          CURRENT_API_IMAGE_LINE_COUNT="$(grep -c '^[[:space:]]*image:[[:space:]]*' <<< "$EFFECTIVE_CURRENT_API_BLOCK")"
+          [ "$CURRENT_API_IMAGE_LINE_COUNT" = "1" ] || fail "effective current Compose api block does not have exactly one image: line (found $CURRENT_API_IMAGE_LINE_COUNT) -- refusing to guess, failing closed"
+          EFFECTIVE_CURRENT_API_IMAGE="$(printf '%s\n' "$EFFECTIVE_CURRENT_API_BLOCK" | sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          [ "$EFFECTIVE_CURRENT_API_IMAGE" = "$EXPECTED_CURRENT_CONFIG_IMAGE" ] || fail "effective current Compose image is '$EFFECTIVE_CURRENT_API_IMAGE', expected exactly '$EXPECTED_CURRENT_CONFIG_IMAGE'"
+          echo "effective_current_api_image=$EFFECTIVE_CURRENT_API_IMAGE"
+
+          EFFECTIVE_CURRENT_ENV_BLOCK="$(printf '%s\n' "$EFFECTIVE_CURRENT_API_BLOCK" | awk '
+            /^    environment:/ { in_env=1; next }
+            in_env && /^    [A-Za-z0-9_.-]+:/ { in_env=0 }
+            in_env { print }
+          ')"
+          EFFECTIVE_CURRENT_SEARCH_TRANSPORT="$(printf '%s\n' "$EFFECTIVE_CURRENT_ENV_BLOCK" | sed -n 's/^[[:space:]]*SEARCH_TRANSPORT:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          if [ -n "$EFFECTIVE_CURRENT_SEARCH_TRANSPORT" ] && [ "$EFFECTIVE_CURRENT_SEARCH_TRANSPORT" != "direct" ]; then
+            fail "effective current Compose SEARCH_TRANSPORT is not unset/direct (got '$EFFECTIVE_CURRENT_SEARCH_TRANSPORT')"
+          fi
+          echo "effective_current_search_transport=${EFFECTIVE_CURRENT_SEARCH_TRANSPORT:-<unset>}"
+
+          EFFECTIVE_CURRENT_TOR_ENABLED="$(printf '%s\n' "$EFFECTIVE_CURRENT_ENV_BLOCK" | sed -n 's/^[[:space:]]*TOR_ENABLED:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+          [ "$EFFECTIVE_CURRENT_TOR_ENABLED" = "false" ] || fail "effective current Compose TOR_ENABLED is not exactly 'false' (got '${EFFECTIVE_CURRENT_TOR_ENABLED:-<unset>}')"
+          echo "effective_current_tor_enabled=$EFFECTIVE_CURRENT_TOR_ENABLED"
+
+          BASE_SERVICES_OUTPUT="$(docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config --services)" || fail "failed to enumerate base Compose service set"
+          BASE_SERVICES_SORTED="$(printf '%s\n' "$BASE_SERVICES_OUTPUT" | sort)"
+          EXPECTED_BASE_SERVICES_SORTED="$(printf 'api\ndb\nfrontend\n' | sort)"
+          [ "$BASE_SERVICES_SORTED" = "$EXPECTED_BASE_SERVICES_SORTED" ] || fail "base Compose service set is not exactly api/db/frontend (got: $(printf '%s' "$BASE_SERVICES_OUTPUT" | tr '\n' ','))"
+          echo "base_service_set=confirmed_api_db_frontend"
+          echo "effective_current_compose_safety=confirmed"
+
+          echo "== 7. runtime vs effective-CURRENT semantic environment equivalence (never prints values; never a registry pull) =="
+          command -v python3 > /dev/null 2>&1 || fail "python3 command unavailable -- cannot compute the semantic runtime/effective-current environment equivalence proof"
+
+          render_current_env_json_pair || exit 1
+
+          RUNTIME_ENV_JSON="$(docker inspect jobpulse-api-prod --format '{{json .Config.Env}}')" || fail "failed to read the running API container's actual environment"
+
+          # `if compute_env_parity_hashes ...; else ...; fi` (never a bare
+          # call followed by `ENV_PARITY_STATUS=$?`) for the same reason
+          # noted above compute_env_parity_hashes() -- `set -e` exempts
+          # an `if` condition from aborting on a non-zero status, so this
+          # is the only form that reliably reaches the status check below.
+          if compute_env_parity_hashes "$ENV_PARITY_COMPOSE_JSON" "$ENV_PARITY_IMAGE_ENV_JSON" "$RUNTIME_ENV_JSON"; then
+            ENV_PARITY_STATUS=0
+          else
+            ENV_PARITY_STATUS=$?
+          fi
+          [ "$ENV_PARITY_STATUS" -eq 0 ] || exit 1
+
+          echo "expected_environment_sha256=$EXPECTED_RUNTIME_ENV_SHA256"
+          echo "actual_environment_sha256=$ACTUAL_RUNTIME_ENV_SHA256"
+          echo "expected_environment_key_count=$EXPECTED_ENV_KEY_COUNT"
+          echo "actual_environment_key_count=$ACTUAL_ENV_KEY_COUNT"
+          if [ "$EXPECTED_RUNTIME_ENV_SHA256" != "$ACTUAL_RUNTIME_ENV_SHA256" ] || [ "$EXPECTED_ENV_KEY_COUNT" != "$ACTUAL_ENV_KEY_COUNT" ]; then
+            echo "environment_parity=false"
+            fail "runtime API environment does not match effective CURRENT Compose environment after applying immutable image defaults (expected_sha256=$EXPECTED_RUNTIME_ENV_SHA256 actual_sha256=$ACTUAL_RUNTIME_ENV_SHA256 expected_key_count=$EXPECTED_ENV_KEY_COUNT actual_key_count=$ACTUAL_ENV_KEY_COUNT)"
+          fi
+          echo "environment_parity=true"
+
+          echo "== 8. DB / frontend / Tor identity (read-only; never restarted/recreated) =="
+          db_field() { docker inspect jobpulse-postgres-prod --format "$1"; }
+          DB_ID="$(db_field '{{.Id}}')"
+          DB_IMAGE_ID="$(db_field '{{.Image}}')"
+          DB_RUNNING="$(db_field '{{.State.Running}}')"
+          DB_HEALTH="$(db_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          DB_RESTART_COUNT="$(db_field '{{.RestartCount}}')"
+          echo "db_container_id=$DB_ID"
+          echo "db_image_id=$DB_IMAGE_ID"
+          echo "db_running=$DB_RUNNING"
+          echo "db_health=$DB_HEALTH"
+          echo "db_restart_count=$DB_RESTART_COUNT"
+          [ "$DB_ID" = "$EXPECTED_DB_CONTAINER_ID" ] || fail "DB container ID mismatch ($DB_ID)"
+          [ "$DB_RUNNING" = "true" ] || fail "DB is not running"
+          [ "$DB_HEALTH" = "none" ] || [ "$DB_HEALTH" = "healthy" ] || fail "DB health is not healthy (got $DB_HEALTH)"
+          [ "$DB_RESTART_COUNT" = "0" ] || fail "DB restart_count is not 0 (got $DB_RESTART_COUNT)"
+
+          frontend_field() { docker inspect jobpulse-frontend-prod --format "$1"; }
+          FRONTEND_ID="$(frontend_field '{{.Id}}')"
+          FRONTEND_IMAGE_ID="$(frontend_field '{{.Image}}')"
+          FRONTEND_RUNNING="$(frontend_field '{{.State.Running}}')"
+          FRONTEND_HEALTH="$(frontend_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          FRONTEND_RESTART_COUNT="$(frontend_field '{{.RestartCount}}')"
+          echo "frontend_container_id=$FRONTEND_ID"
+          echo "frontend_image_id=$FRONTEND_IMAGE_ID"
+          echo "frontend_running=$FRONTEND_RUNNING"
+          echo "frontend_health=$FRONTEND_HEALTH"
+          echo "frontend_restart_count=$FRONTEND_RESTART_COUNT"
+          [ "$FRONTEND_ID" = "$EXPECTED_FRONTEND_CONTAINER_ID" ] || fail "frontend container ID mismatch ($FRONTEND_ID)"
+          [ "$FRONTEND_RUNNING" = "true" ] || fail "frontend is not running"
+          [ "$FRONTEND_HEALTH" = "none" ] || [ "$FRONTEND_HEALTH" = "healthy" ] || fail "frontend health is not healthy (got $FRONTEND_HEALTH)"
+          [ "$FRONTEND_RESTART_COUNT" = "0" ] || fail "frontend restart_count is not 0 (got $FRONTEND_RESTART_COUNT)"
+
+          tor_field() { docker inspect jobpulse-tor-prod --format "$1"; }
+          TOR_ID="$(tor_field '{{.Id}}')"
+          TOR_IMAGE_ID="$(tor_field '{{.Image}}')"
+          TOR_RUNNING="$(tor_field '{{.State.Running}}')"
+          TOR_HEALTH="$(tor_field '{{with (index .State "Health")}}{{.Status}}{{else}}none{{end}}')"
+          TOR_RESTART_COUNT="$(tor_field '{{.RestartCount}}')"
+          echo "tor_container_id=$TOR_ID"
+          echo "tor_image_id=$TOR_IMAGE_ID"
+          echo "tor_running=$TOR_RUNNING"
+          echo "tor_health=$TOR_HEALTH"
+          echo "tor_restart_count=$TOR_RESTART_COUNT"
+          [ "$TOR_ID" = "$EXPECTED_TOR_CONTAINER_ID" ] || fail "Tor container ID mismatch ($TOR_ID)"
+          [ "$TOR_RUNNING" = "true" ] || fail "Tor is not running"
+          [ "$TOR_HEALTH" = "none" ] || [ "$TOR_HEALTH" = "healthy" ] || fail "Tor health is not healthy (got $TOR_HEALTH)"
+          [ "$TOR_RESTART_COUNT" = "0" ] || fail "Tor restart_count is not 0 (got $TOR_RESTART_COUNT)"
+          TOR_PUBLISHED_PORTS="$(docker port jobpulse-tor-prod 2>/dev/null || true)"
+          [ -z "$TOR_PUBLISHED_PORTS" ] || fail "Tor publishes host ports (expected none): $TOR_PUBLISHED_PORTS"
+          echo "db_frontend_tor_identity=confirmed"
+
+          # ---------------------------------------------------------------
+          # 9. Scheduler provenance (bounded, read-only, non-executing).
+          #
+          # Copied as literally as practical from the already-reviewed
+          # production-api-reference-normalization.yml version (itself
+          # copied from the Phase 4J production-split-release-recovery.yml
+          # version) -- see
+          # tests/test_production_prenormalization_readonly_verification_workflow.py's
+          # parity test. Not reinvented. Unlike that mutating runner, this
+          # workflow never acquires the two collection-cycle locks it
+          # checks provenance for -- it only observes.
+          # ---------------------------------------------------------------
+          echo "== scheduler provenance: this account's own crontab (bounded, read-only, non-executing) =="
+          command -v timeout > /dev/null 2>&1 || fail "timeout utility unavailable -- cannot bound scheduler provenance checks"
+          command -v crontab > /dev/null 2>&1 || fail "crontab command unavailable -- cannot establish this account's own scheduled launcher"
+
+          CANONICAL_LAUNCHER_LINE='*/30 * * * * cd /opt/jobpulse && flock -n /tmp/jobpulse_collection_cycle.lock ./scripts/run_collection_cycle_safe.sh'
+
+          OWN_CRONTAB_STATUS=0
+          OWN_CRONTAB_OUTPUT="$(timeout 5 crontab -l 2>&1)" || OWN_CRONTAB_STATUS=$?
+          # Historical evidence (runs 34479326097 and 34679402811) proves
+          # this account HAS a scheduled launcher -- an unreadable or
+          # empty ("no crontab for this account") crontab is therefore
+          # itself scheduler drift, never an acceptable empty state.
+          if [ "$OWN_CRONTAB_STATUS" -ne 0 ]; then
+            # Never echo $OWN_CRONTAB_OUTPUT -- a crontab may contain
+            # unrelated sensitive commands or environment values. Report
+            # only a bounded classification, never the raw content.
+            OWN_CRONTAB_FAILURE_CATEGORY="read_error"
+            grep -qi 'no crontab for' <<< "$OWN_CRONTAB_OUTPUT" && OWN_CRONTAB_FAILURE_CATEGORY="no_crontab"
+            fail "cannot read this account's own crontab in a bounded way (exit $OWN_CRONTAB_STATUS, category=$OWN_CRONTAB_FAILURE_CATEGORY) -- historical evidence proves a scheduled launcher exists here, so this is scheduler drift, not an acceptable empty state"
+          fi
+
+          CANONICAL_MATCH_COUNT="$(grep -Fxc "$CANONICAL_LAUNCHER_LINE" <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          WRAPPER_MENTION_COUNT="$(grep -Fc 'run_collection_cycle_safe.sh' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          OWN_ROOT_VAR_COUNT="$(grep -Fc 'JOBPULSE_COLLECTION_ROOT' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+          OWN_LOCK_VAR_COUNT="$(grep -Fc 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$OWN_CRONTAB_OUTPUT" || true)"
+
+          [ "$CANONICAL_MATCH_COUNT" = "1" ] || fail "this account's crontab does not contain exactly one occurrence of the historically proven canonical launcher line (found $CANONICAL_MATCH_COUNT) -- refusing to proceed, scheduler may have drifted"
+          [ "$WRAPPER_MENTION_COUNT" = "1" ] || fail "this account's crontab mentions run_collection_cycle_safe.sh $WRAPPER_MENTION_COUNT time(s), expected exactly 1 -- refusing to proceed"
+          # Historical evidence proves the canonical launcher line itself,
+          # never an environment-variable override -- any such reference
+          # now would be unproven drift, not something to guess about.
+          [ "$OWN_ROOT_VAR_COUNT" = "0" ] || fail "this account's crontab references JOBPULSE_COLLECTION_ROOT, which historical evidence never proved -- refusing to guess, failing closed"
+          [ "$OWN_LOCK_VAR_COUNT" = "0" ] || fail "this account's crontab references JOBPULSE_COLLECTION_CYCLE_LOCK_PATH, which historical evidence never proved -- refusing to guess, failing closed"
+          echo "own_crontab_provenance=confirmed_canonical_launcher"
+
+          echo "== scheduler drift check: /etc/crontab (read-only, bounded, absence-only) =="
+          if [ -e /etc/crontab ]; then
+            [ -r /etc/crontab ] || fail "/etc/crontab exists but is not readable -- refusing to proceed without proven scheduler drift status"
+            ETC_CRONTAB_CONTENT="$(timeout 5 cat /etc/crontab)" || fail "timed out reading /etc/crontab"
+            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$ETC_CRONTAB_CONTENT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$ETC_CRONTAB_CONTENT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$ETC_CRONTAB_CONTENT"; then
+              fail "/etc/crontab now references the collection wrapper or its launcher variables -- unexpected scheduler drift from the historically proven single-launcher state (run 34679402811), refusing to proceed"
+            fi
+          fi
+          echo "etc_crontab_drift=none"
+
+          echo "== scheduler drift check: /etc/cron.d/* (read-only, bounded, absence-only) =="
+          if [ -d /etc/cron.d ]; then
+            CRON_D_FILES="$(timeout 5 find /etc/cron.d -maxdepth 1 -type f 2>&1)" || fail "could not list /etc/cron.d in a bounded way"
+            while IFS= read -r cron_d_file; do
+              [ -z "$cron_d_file" ] && continue
+              [ -r "$cron_d_file" ] || fail "$cron_d_file exists but is not readable -- refusing to proceed without proven scheduler drift status"
+              CRON_D_CONTENT="$(timeout 5 cat "$cron_d_file")" || fail "timed out reading $cron_d_file"
+              if grep -Fq 'run_collection_cycle_safe.sh' <<< "$CRON_D_CONTENT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$CRON_D_CONTENT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$CRON_D_CONTENT"; then
+                fail "$cron_d_file now references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+              fi
+            done <<< "$CRON_D_FILES"
+          fi
+          echo "cron_d_drift=none"
+
+          echo "== scheduler drift check: root crontab (bounded, non-interactive sudo, absence-only) =="
+          if command -v sudo > /dev/null 2>&1 && command -v crontab > /dev/null 2>&1; then
+            ROOT_CRONTAB_STATUS=0
+            ROOT_CRONTAB_OUTPUT="$(timeout 5 sudo -n crontab -u root -l 2>&1)" || ROOT_CRONTAB_STATUS=$?
+            if [ "$ROOT_CRONTAB_STATUS" -eq 0 ]; then
+              if grep -Fq 'run_collection_cycle_safe.sh' <<< "$ROOT_CRONTAB_OUTPUT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$ROOT_CRONTAB_OUTPUT" \
+                || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$ROOT_CRONTAB_OUTPUT"; then
+                fail "root's crontab now references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+              fi
+            elif grep -qi 'no crontab for' <<< "$ROOT_CRONTAB_OUTPUT"; then
+              :
+            else
+              # Never echo $ROOT_CRONTAB_OUTPUT -- root's crontab may
+              # contain unrelated sensitive commands or environment
+              # values. Report only source label and exit status.
+              fail "cannot establish root's crontab configuration read-only (source=sudo -n crontab -u root -l, exit $ROOT_CRONTAB_STATUS) -- refusing to proceed without proven root-cron provenance"
+            fi
+          else
+            fail "sudo or crontab command unavailable -- cannot establish root's crontab configuration, refusing to proceed without proven root-cron provenance"
+          fi
+          echo "root_crontab_drift=none"
+
+          echo "== scheduler drift check: systemd effective unit configuration (read-only, bounded, fail-closed, absence-only) =="
+          # Fail-closed: systemd state must be positively established --
+          # never silently skipped -- before this runner is allowed to
+          # proceed to mutation. Every enumeration/inspection step below
+          # captures its exit status explicitly via a dedicated STATUS
+          # variable (never a blanket fallback that would mask a
+          # nonzero exit), and none print the complete raw command
+          # output (bounded status code + source/action label only).
+          #
+          # Phase 4I (run 35846112545) proved this needs a two-level
+          # model, not a single blind `systemctl show` over every name
+          # `systemctl list-unit-files` returns: the live host's
+          # persistent unit-file inventory includes uninstantiated
+          # systemd TEMPLATE units (e.g. apport-coredump-hook@.service),
+          # and `systemctl show <template>@.service` is not a reliable
+          # operation for those -- it returned exit 1, which correctly
+          # fail-closed this runner before any mutation, but the
+          # enumeration/inspection model itself was too naive. Phase 4J
+          # distinguishes, semantically (never by hardcoded unit name):
+          #   - an uninstantiated template unit file (name matches
+          #     *@.service exactly) -> inspect its static definition via
+          #     `systemctl cat`, never `systemctl show`.
+          #   - every other (ordinary, concrete) unit-file name -> as
+          #     before, `systemctl show`.
+          # A currently-instantiated copy of a template (e.g.
+          # foo@instance.service) does not appear in the persistent
+          # unit-file inventory as such, so it is caught separately below
+          # via `systemctl list-units` (the loaded-unit inventory) and
+          # inspected via `systemctl show` like any other loaded unit.
+          command -v systemctl > /dev/null 2>&1 || fail "systemctl command unavailable -- cannot establish systemd scheduler state, refusing to proceed without proven systemd provenance"
+
+          UNIT_LIST_STATUS=0
+          UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-unit-files --type=service --no-legend --no-pager --full 2>&1)" || UNIT_LIST_STATUS=$?
+          [ "$UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-unit-files failed in a bounded read (source=systemctl list-unit-files, exit $UNIT_LIST_STATUS) -- refusing to proceed without proven systemd unit enumeration"
+          # `--full` so a long unit name is never ellipsized before
+          # semantic template detection; `NF {print $1}` so a blank
+          # record never yields an empty first field.
+          UNIT_NAMES="$(awk 'NF {print $1}' <<< "$UNIT_LIST_OUTPUT")"
+
+          while IFS= read -r unit; do
+            [ -z "$unit" ] && continue
+            # Defense in depth: if `systemctl list-unit-files` output
+            # ever shapes differently than expected (decoration,
+            # truncation, a future systemd version), refuse to guess and
+            # never let a malformed token reach `systemctl show`/`cat`.
+            case "$unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-unit-files output (token=$unit)" ;;
+            esac
+            case "$unit" in
+              *@.service)
+                # Uninstantiated systemd template unit -- `systemctl show`
+                # against a bare template name is not a reliable
+                # operation (this is the exact Phase 4I regression:
+                # apport-coredump-hook@.service returned exit 1). Inspect
+                # the template's static definition instead.
+                TEMPLATE_CAT_STATUS=0
+                TEMPLATE_CAT_OUTPUT="$(timeout 5 systemctl cat "$unit" --no-pager 2>&1)" || TEMPLATE_CAT_STATUS=$?
+                [ "$TEMPLATE_CAT_STATUS" -eq 0 ] || fail "systemctl cat failed in a bounded read (source=systemctl cat, unit=$unit, exit $TEMPLATE_CAT_STATUS) -- refusing to proceed without proven template unit definition"
+                [ -n "$TEMPLATE_CAT_OUTPUT" ] || fail "systemctl cat returned an unusable (empty) result for template unit $unit -- refusing to proceed without proven template unit definition"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$TEMPLATE_CAT_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$TEMPLATE_CAT_OUTPUT"; then
+                  fail "systemd template unit $unit definition references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+              *)
+                UNIT_SHOW_STATUS=0
+                UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || UNIT_SHOW_STATUS=$?
+                [ "$UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$unit, exit $UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+                [ -n "$UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $unit -- refusing to proceed without proven effective systemd state"
+                if grep -Fq 'run_collection_cycle_safe.sh' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$UNIT_SHOW_OUTPUT" \
+                  || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$UNIT_SHOW_OUTPUT"; then
+                  fail "systemd unit $unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+                fi
+                ;;
+            esac
+          done <<< "$UNIT_NAMES"
+          echo "systemd_unit_file_drift=none"
+
+          echo "== scheduler drift check: systemd loaded unit inventory (systemctl list-units, catches instantiated templates) =="
+          LOADED_UNIT_LIST_STATUS=0
+          # `--plain` is mandatory: without it, systemctl renders a
+          # leading status-circle glyph (e.g. "* broken.service ...") for
+          # a failed/degraded unit, which would otherwise become a
+          # pseudo-column and shift $1 away from the actual unit name.
+          # `--full` prevents a long unit name from being ellipsized
+          # before it is inspected.
+          LOADED_UNIT_LIST_OUTPUT="$(timeout 5 systemctl list-units --type=service --all --no-legend --no-pager --plain --full 2>&1)" || LOADED_UNIT_LIST_STATUS=$?
+          [ "$LOADED_UNIT_LIST_STATUS" -eq 0 ] || fail "systemctl list-units failed in a bounded read (source=systemctl list-units, exit $LOADED_UNIT_LIST_STATUS) -- refusing to proceed without proven loaded systemd unit enumeration"
+          LOADED_UNIT_NAMES="$(awk 'NF {print $1}' <<< "$LOADED_UNIT_LIST_OUTPUT")"
+
+          while IFS= read -r loaded_unit; do
+            [ -z "$loaded_unit" ] && continue
+            # Defense in depth: refuse to guess if a parsed record is not
+            # a `*.service` name (see the identical unit-file check
+            # above) -- never call `systemctl show` with an unexpected
+            # token such as a stray status-circle glyph.
+            case "$loaded_unit" in
+              *.service) ;;
+              *) fail "unexpected token while parsing systemctl list-units output (token=$loaded_unit)" ;;
+            esac
+            # Every loaded unit -- including an instantiated template
+            # such as foo@instance.service -- is inspected the same way
+            # as an ordinary concrete unit. A normal service may already
+            # have been inspected once above from the unit-file
+            # inventory; inspecting it again here is acceptable (simple,
+            # auditable logic beats premature deduplication).
+            LOADED_UNIT_SHOW_STATUS=0
+            LOADED_UNIT_SHOW_OUTPUT="$(timeout 5 systemctl show "$loaded_unit" --property=ExecStart,Environment,EnvironmentFiles,FragmentPath,DropInPaths --no-pager 2>&1)" || LOADED_UNIT_SHOW_STATUS=$?
+            [ "$LOADED_UNIT_SHOW_STATUS" -eq 0 ] || fail "systemctl show failed in a bounded read (source=systemctl show, unit=$loaded_unit, exit $LOADED_UNIT_SHOW_STATUS) -- refusing to proceed without proven effective systemd state"
+            [ -n "$LOADED_UNIT_SHOW_OUTPUT" ] || fail "systemctl show returned an unusable (empty) result for unit $loaded_unit -- refusing to proceed without proven effective systemd state"
+            if grep -Fq 'run_collection_cycle_safe.sh' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_ROOT' <<< "$LOADED_UNIT_SHOW_OUTPUT" \
+              || grep -Fq 'JOBPULSE_COLLECTION_CYCLE_LOCK_PATH' <<< "$LOADED_UNIT_SHOW_OUTPUT"; then
+              fail "systemd loaded unit $loaded_unit effective configuration references the collection wrapper or its launcher variables -- unexpected scheduler drift, refusing to proceed"
+            fi
+          done <<< "$LOADED_UNIT_NAMES"
+          echo "systemd_loaded_unit_drift=none"
+
+          echo "systemd_drift=none"
+
+          echo "== effective internal lock path provenance: /opt/jobpulse/.collection.env (parsed as data only, never sourced/eval'd) =="
+          COLLECTION_ENV_PATH="/opt/jobpulse/.collection.env"
+          if [ -e "$COLLECTION_ENV_PATH" ]; then
+            [ -r "$COLLECTION_ENV_PATH" ] || fail "$COLLECTION_ENV_PATH exists but is not readable -- refusing to proceed"
+            COLLECTION_ENV_CONTENT="$(timeout 5 cat "$COLLECTION_ENV_PATH")" || fail "timed out reading $COLLECTION_ENV_PATH"
+            LOCK_ASSIGNMENTS_FOUND=0
+            while IFS= read -r line; do
+              [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?JOBPULSE_COLLECTION_CYCLE_LOCK_PATH=(.*)$ ]]; then
+                RAW_VALUE="${BASH_REMATCH[2]}"
+                if [[ "$RAW_VALUE" =~ ^([^\#]*[^[:space:]\#])[[:space:]]+\#.*$ ]]; then
+                  RAW_VALUE="${BASH_REMATCH[1]}"
+                fi
+                RAW_VALUE="${RAW_VALUE%"${RAW_VALUE##*[![:space:]]}"}"
+                if [[ "$RAW_VALUE" =~ ^\'(.*)\'$ ]]; then
+                  LOCK_VALUE="${BASH_REMATCH[1]}"
+                elif [[ "$RAW_VALUE" =~ ^\"(.*)\"$ ]]; then
+                  LOCK_VALUE="${BASH_REMATCH[1]}"
+                  if [[ "$LOCK_VALUE" == *'$'* ]] || [[ "$LOCK_VALUE" == *'`'* ]]; then
+                    fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH using dynamic shell syntax -- refusing to guess, failing closed"
+                  fi
+                else
+                  LOCK_VALUE="$RAW_VALUE"
+                fi
+                if [[ "$LOCK_VALUE" == *'$'* ]] || [[ "$LOCK_VALUE" == *'`'* ]]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH using dynamic shell syntax -- refusing to guess, failing closed"
+                fi
+                LOCK_ASSIGNMENTS_FOUND=$((LOCK_ASSIGNMENTS_FOUND + 1))
+                if [ "$LOCK_ASSIGNMENTS_FOUND" -gt 1 ]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH more than once with potentially conflicting values -- refusing to guess which is authoritative, failing closed"
+                fi
+                if [ "$LOCK_VALUE" != "$INTERNAL_LOCK_PATH" ]; then
+                  fail "$COLLECTION_ENV_PATH sets JOBPULSE_COLLECTION_CYCLE_LOCK_PATH to '$LOCK_VALUE', not the expected '$INTERNAL_LOCK_PATH' -- refusing to proceed"
+                fi
+              elif [[ "$line" == *"JOBPULSE_COLLECTION_CYCLE_LOCK_PATH"* ]]; then
+                fail "$COLLECTION_ENV_PATH references JOBPULSE_COLLECTION_CYCLE_LOCK_PATH in a line that is not a recognizable assignment -- refusing to guess, failing closed"
+              fi
+            done <<< "$COLLECTION_ENV_CONTENT"
+          fi
+          # Absent file or absent assignment is acceptable: the wrapper's
+          # own source default already resolves to INTERNAL_LOCK_PATH,
+          # and run 34679402811 proved that is the live effective value.
+          echo "effective_internal_lock_provenance=confirmed_or_absent_default"
+          echo "scheduler_provenance=confirmed"
+
+          echo "== 10. active collector observation (read-only, docker top -- never kills/stops anything; lock files are never touched) =="
+          TOP_OUTPUT="$(docker top jobpulse-api-prod)"
+          echo "$TOP_OUTPUT"
+          ACTIVE_COLLECTOR=no
+          for pattern in linkedin_auth_preflight seed_priority_coverage_queue process_search_demand_queue linkedin_plan_collect collector_postgres reconcile_priority_coverage run_collection_cycle; do
+            if grep -q "$pattern" <<< "$TOP_OUTPUT"; then
+              ACTIVE_COLLECTOR=yes
+              echo "active_collector_pattern=$pattern"
+            fi
+          done
+          echo "active_collector=$ACTIVE_COLLECTOR"
+          [ "$ACTIVE_COLLECTOR" = "no" ] || fail "active collector process detected -- normalization requires quiescence, not a permission to stop it; retry this verification later"
+
+          echo "== 11. safe localhost health observations (never a job-search endpoint, never any external network contact, never Tor) =="
+          curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:8000/health > /dev/null || fail "API direct health check failed"
+          curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/api/health > /dev/null || fail "API nginx-proxied health check failed"
+          curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1/ > /dev/null || fail "frontend localhost reachability check failed"
+          echo "health_observations=confirmed"
+
+          echo "== 12. canonical reference local presence (read-only image inspection ONLY -- never a registry pull) =="
+          CANONICAL_REFERENCE_LOCAL_PRESENCE=false
+          CANONICAL_LOCAL_IMAGE_ID="$(docker image inspect "$CANONICAL_API_REFERENCE" --format '{{.Id}}' 2>/dev/null || true)"
+          if [ -n "$CANONICAL_LOCAL_IMAGE_ID" ]; then
+            CANONICAL_REFERENCE_LOCAL_PRESENCE=true
+            echo "canonical_reference_local_presence=true"
+            echo "canonical_reference_local_image_id=$CANONICAL_LOCAL_IMAGE_ID"
+            if [ "$CANONICAL_LOCAL_IMAGE_ID" = "$EXPECTED_IMAGE_ID" ]; then
+              echo "canonical_reference_verified_same_bytes=true"
+            else
+              echo "canonical_reference_verified_same_bytes=false"
+            fi
+          else
+            echo "canonical_reference_local_presence=false"
+          fi
+          # Absence is explicitly non-blocking: production-api-reference-
+          # normalization.yml has its own authenticated pull + exact
+          # image-ID provenance gate before it ever touches the running
+          # container.
+
+          echo "== 20. zero-mutation accounting for this task =="
+          echo "production_git_mutations=0"
+          echo "container_recreations=0"
+          echo "container_restarts=0"
+          echo "container_stops_starts=0"
+          echo "docker_pulls=0"
+          echo "docker_tags=0"
+          echo "production_file_writes=0"
+          echo "cron_systemd_mutations=0"
+          echo "database_mutations=0"
+          echo "linkedin_requests=0"
+          echo "tor_controlport_requests=0"
+
+          echo "===PRENORMALIZATION_READONLY_VERIFICATION_END==="
+          echo "PHASE_4M_PRENORMALIZATION_READONLY_VERIFIED"
+          REMOTE_SCRIPT
