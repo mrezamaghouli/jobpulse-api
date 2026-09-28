@@ -30,21 +30,31 @@ name: Production Pre-Normalization Read-Only Verification
 # restart/stop/start/rm/tag/pull/push`, `git reset/checkout/switch/pull/
 # merge/clean/stash`, any collector/queue/collection-cycle script, any
 # LinkedIn request, or any Tor/ControlPort/NEWNYM access. Every remote
-# command is read-only: `git rev-parse`/`git status`, `sha256sum`,
-# `docker inspect`, `docker compose ... config` (render only, never
-# `up`/`down`/`create`), a single narrow `docker exec ... printenv`
-# per key (never a full environment dump), `docker image inspect` against
-# an already-present local image ID (never `docker pull`), `docker top`
-# (never `docker kill`/`stop`), `crontab -l`/`systemctl show|cat|list-*`,
-# and two localhost-only `curl` health probes.
+# (production-side) command is read-only: `git rev-parse`/`git status`,
+# `sha256sum`, `docker inspect`, `docker compose ... config` (render
+# only, never `up`/`down`/`create`), a single narrow `docker exec ...
+# printenv` per key (never a full environment dump), `docker top` (never
+# `docker kill`/`stop`), `crontab -l`/`systemctl show|cat|list-*`, and
+# two localhost-only `curl` health probes. Production is never asked to
+# inspect or pull any image at all: the immutable f476 image's default
+# Env is instead derived on the GitHub Actions runner, before the SSH
+# session ever starts, via a fully content-addressed GHCR digest chain
+# (EXPECTED_IMAGE_ID -> verified OCI index -> verified linux/amd64
+# manifest -> verified config blob -> Config.Env, each hop re-hashed
+# against its parent-declared digest, never trusting the mutable
+# CANONICAL_API_REFERENCE tag or any server-reported digest header) and
+# passed in pre-verified -- see the "Derive immutable f476 image
+# Config.Env from GHCR by digest" step and
+# docs/PRODUCTION_RUNBOOK.md's Phase 4M section.
 #
 # Success (the exact marker PHASE_4M_PRENORMALIZATION_READONLY_VERIFIED)
 # does NOT dispatch anything -- normalization remains a completely
 # separate, explicitly authorized, later decision. Canonical-reference
-# local absence is explicitly non-blocking here, because
+# local absence on PRODUCTION is explicitly non-blocking here, because
 # production-api-reference-normalization.yml has its own authenticated
 # pull + exact image-ID provenance gate before it ever touches the
-# running container.
+# running container -- and, since the fix above, this is now the ONLY
+# place in this workflow where that local presence matters at all.
 # ============================================================================
 on:
   workflow_dispatch:
@@ -105,6 +115,310 @@ jobs:
           echo "immutable f476 compose SHA-256: $COMPOSE_SHA256"
           echo "COMPOSE_SHA256=$COMPOSE_SHA256" >> "$GITHUB_ENV"
 
+      - name: Derive immutable f476 image Config.Env from GHCR by digest (read-only, tag-independent)
+        run: |
+          set -euo pipefail
+
+          # ====================================================================
+          # Runner-side, registry-only provenance chain. Runs BEFORE the SSH
+          # step and needs no secret: the package is publicly readable, so an
+          # anonymous GHCR pull token is sufficient (see PR discussion / the
+          # Phase 4M runbook section for the live verification this mirrors).
+          #
+          # This NEVER trusts the mutable CANONICAL_API_REFERENCE tag. It
+          # starts from the pinned EXPECTED_IMAGE_ID digest and walks a fully
+          # content-addressed chain, re-hashing every hop's exact response
+          # bytes against the digest its own parent declared -- never the
+          # server's Docker-Content-Digest header, never HTTP status alone:
+          #
+          #   EXPECTED_IMAGE_ID (hardcoded)
+          #     -> fetch OCI index BY THIS DIGEST, verify index bytes hash to it
+          #     -> select the exactly-one linux/amd64 image manifest entry
+          #        (never the attestation-manifest entry)
+          #     -> fetch that manifest BY THE INDEX-DECLARED DIGEST, verify
+          #        manifest bytes hash to it
+          #     -> extract its config digest
+          #     -> fetch the config blob BY THAT DIGEST, verify config bytes
+          #        hash to it
+          #     -> only now read config.Env
+          #
+          # Fails closed (before the SSH step ever runs) on any non-2xx
+          # response, empty/oversized/malformed body, digest mismatch, wrong
+          # media type, or ambiguous/missing platform entry. Bounded 10 MiB
+          # per response and a single redirect hop (Authorization is dropped
+          # across that hop -- GHCR's blob storage redirect needs no bearer
+          # token). Never performs `docker pull`/`docker login` on the runner
+          # or on production -- registry access is raw HTTP only, and no
+          # image bytes/layers are ever fetched, only manifests and the small
+          # JSON config blob. Only hashes/counts/digests are ever printed;
+          # the raw Env list is captured via command substitution into a
+          # shell variable, never echoed to the step's own log output.
+          # ====================================================================
+          IMAGE_PROVENANCE_PY_SOURCE="$(cat <<'IMAGE_PROVENANCE_PY'
+          import hashlib
+          import json
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          REGISTRY = "https://ghcr.io"
+          REPOSITORY = "mrezamaghouli/jobpulse-api"
+          # One-time pinned constant -- identical to this workflow's own
+          # EXPECTED_IMAGE_ID (see docs/PRODUCTION_RUNBOOK.md's Phase 4M
+          # section). Hardcoded here rather than threaded as an argument,
+          # exactly like every other EXPECTED_* constant in this codebase.
+          EXPECTED_IMAGE_ID = "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+
+          MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+          TIMEOUT_SECONDS = 15
+          DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+          INDEX_MEDIA_TYPES = {
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+          }
+          MANIFEST_MEDIA_TYPES = {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }
+          CONFIG_MEDIA_TYPES = {
+              "application/vnd.oci.image.config.v1+json",
+              "application/vnd.docker.container.image.v1+json",
+          }
+
+
+          def fail(msg):
+              print(f"IMAGE_PROVENANCE_FAILED: {msg}", file=sys.stderr)
+              sys.exit(1)
+
+
+          def sha256_hex(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+
+          def require_digest_equals(data: bytes, expected_digest, ctx: str):
+              if not isinstance(expected_digest, str) or not DIGEST_RE.match(expected_digest):
+                  fail(f"{ctx}: malformed expected digest {expected_digest!r}")
+              actual = f"sha256:{sha256_hex(data)}"
+              if actual != expected_digest:
+                  fail(f"{ctx}: recomputed content hash does not match the expected digest -- never trusting HTTP status or any server-reported digest header alone")
+
+
+          class BoundedRedirectHandler(urllib.request.HTTPRedirectHandler):
+              """Follows at most one redirect hop and forwards only the
+              Accept header across it -- never Authorization (GHCR's blob
+              storage redirect needs no bearer token) and never Host/
+              User-Agent/any other original-request header. Blindly
+              forwarding the original Host header would send it to the
+              redirect target's own TLS-terminating edge (a different
+              host than the original request), which that edge correctly
+              rejects with 421 Misdirected Request -- reproduced and
+              confirmed while building this fix; forwarding only Accept
+              avoids it entirely."""
+
+              def __init__(self):
+                  self.hops = 0
+
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  self.hops += 1
+                  if self.hops > 1:
+                      fail(f"registry response redirected more than once (refusing hop {self.hops}) -- failing closed rather than following an unbounded redirect chain")
+                  new_req = urllib.request.Request(newurl, method="GET")
+                  accept = req.get_header("Accept")
+                  if accept:
+                      new_req.add_header("Accept", accept)
+                  return new_req
+
+
+          _OPENER = urllib.request.build_opener(BoundedRedirectHandler())
+
+
+          def bounded_fetch(url, headers, ctx: str) -> bytes:
+              req = urllib.request.Request(url, headers=headers, method="GET")
+              try:
+                  resp = _OPENER.open(req, timeout=TIMEOUT_SECONDS)
+              except urllib.error.HTTPError as exc:
+                  fail(f"{ctx}: GET {url} failed: HTTP {exc.code}")
+              except urllib.error.URLError as exc:
+                  fail(f"{ctx}: GET {url} failed: {exc.reason}")
+              try:
+                  status = resp.status
+                  if status != 200:
+                      fail(f"{ctx}: GET {url} returned unexpected status {status}")
+                  body = resp.read(MAX_RESPONSE_BYTES + 1)
+              finally:
+                  resp.close()
+              if len(body) == 0:
+                  fail(f"{ctx}: GET {url} returned an empty response body")
+              if len(body) > MAX_RESPONSE_BYTES:
+                  fail(f"{ctx}: GET {url} response exceeded the {MAX_RESPONSE_BYTES}-byte bound -- refusing to process an oversized registry response")
+              return body
+
+
+          def get_anonymous_pull_token() -> str:
+              url = f"{REGISTRY}/token?scope=repository:{REPOSITORY}:pull&service=ghcr.io"
+              body = bounded_fetch(url, headers={"Accept": "application/json"}, ctx="anonymous pull token")
+              try:
+                  data = json.loads(body.decode("utf-8"))
+              except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                  fail(f"anonymous pull token: malformed JSON response: {exc}")
+              token = data.get("token") if isinstance(data, dict) else None
+              if not isinstance(token, str) or not token:
+                  fail("anonymous pull token: response did not contain a usable token")
+              return token
+
+
+          def fetch_manifest_by_digest(digest: str, token: str, accept_types, ctx: str) -> dict:
+              if not DIGEST_RE.match(digest or ""):
+                  fail(f"{ctx}: refusing to fetch by malformed digest {digest!r}")
+              url = f"{REGISTRY}/v2/{REPOSITORY}/manifests/{digest}"
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": ", ".join(sorted(accept_types)),
+              }
+              body = bounded_fetch(url, headers, ctx=ctx)
+              # Recompute SHA-256 over the EXACT response bytes and require
+              # equality with the digest we asked for -- this is the binding
+              # to EXPECTED_IMAGE_ID (first call) and to each parent-declared
+              # child digest (subsequent calls). Never the Docker-Content-
+              # Digest response header, never HTTP status alone.
+              require_digest_equals(body, digest, ctx)
+              try:
+                  parsed = json.loads(body.decode("utf-8"))
+              except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                  fail(f"{ctx}: malformed JSON: {exc}")
+              if not isinstance(parsed, dict):
+                  fail(f"{ctx}: top-level JSON is not an object")
+              return parsed
+
+
+          def fetch_blob_by_digest(digest: str, token: str, ctx: str) -> bytes:
+              if not DIGEST_RE.match(digest or ""):
+                  fail(f"{ctx}: refusing to fetch by malformed digest {digest!r}")
+              url = f"{REGISTRY}/v2/{REPOSITORY}/blobs/{digest}"
+              headers = {"Authorization": f"Bearer {token}"}
+              body = bounded_fetch(url, headers, ctx=ctx)
+              require_digest_equals(body, digest, ctx)
+              return body
+
+
+          def select_amd64_manifest_digest(index: dict) -> str:
+              if index.get("schemaVersion") != 2:
+                  fail("index: unexpected schemaVersion")
+              if index.get("mediaType") not in INDEX_MEDIA_TYPES:
+                  fail(f"index: unexpected mediaType {index.get('mediaType')!r}")
+              manifests = index.get("manifests")
+              if not isinstance(manifests, list) or not manifests:
+                  fail("index: 'manifests' missing or empty")
+
+              candidates = []
+              for entry in manifests:
+                  if not isinstance(entry, dict):
+                      fail("index: a 'manifests' entry is not an object")
+                  platform = entry.get("platform")
+                  if not isinstance(platform, dict):
+                      continue
+                  annotations = entry.get("annotations") or {}
+                  if not isinstance(annotations, dict):
+                      annotations = {}
+                  # Explicit, defense-in-depth exclusion -- never select the
+                  # attestation manifest even if a future index ever labels
+                  # its platform fields ambiguously.
+                  if annotations.get("vnd.docker.reference.type") == "attestation-manifest":
+                      continue
+                  if platform.get("architecture") == "amd64" and platform.get("os") == "linux":
+                      if entry.get("mediaType") not in MANIFEST_MEDIA_TYPES:
+                          fail(f"index: linux/amd64 entry has unexpected mediaType {entry.get('mediaType')!r}")
+                      candidates.append(entry)
+
+              if len(candidates) == 0:
+                  fail("index: no linux/amd64 image manifest entry found")
+              if len(candidates) > 1:
+                  fail(f"index: ambiguous platform selection -- found {len(candidates)} linux/amd64 entries, expected exactly one")
+
+              digest = candidates[0].get("digest")
+              if not DIGEST_RE.match(digest or ""):
+                  fail(f"index: linux/amd64 entry has a missing/malformed digest: {digest!r}")
+              return digest
+
+
+          def extract_config_digest(manifest: dict) -> str:
+              if manifest.get("schemaVersion") != 2:
+                  fail("platform manifest: unexpected schemaVersion")
+              if manifest.get("mediaType") not in MANIFEST_MEDIA_TYPES:
+                  fail(f"platform manifest: unexpected mediaType {manifest.get('mediaType')!r}")
+              config_ref = manifest.get("config")
+              if not isinstance(config_ref, dict):
+                  fail("platform manifest: 'config' missing or not an object")
+              if config_ref.get("mediaType") not in CONFIG_MEDIA_TYPES:
+                  fail(f"platform manifest: unexpected config mediaType {config_ref.get('mediaType')!r}")
+              digest = config_ref.get("digest")
+              if not DIGEST_RE.match(digest or ""):
+                  fail(f"platform manifest: missing/malformed config digest: {digest!r}")
+              return digest
+
+
+          def extract_env_list(config: dict):
+              cfg = config.get("config")
+              if not isinstance(cfg, dict):
+                  fail("config blob: 'config' object missing")
+              env_list = cfg.get("Env")
+              if not isinstance(env_list, list) or not all(isinstance(e, str) for e in env_list):
+                  fail("config blob: 'config.Env' missing or not a list of strings")
+              return env_list
+
+
+          def main():
+              token = get_anonymous_pull_token()
+
+              # Step 1-2: fetch + verify the OCI index BY EXACT EXPECTED_IMAGE_ID.
+              index = fetch_manifest_by_digest(EXPECTED_IMAGE_ID, token, INDEX_MEDIA_TYPES, ctx="OCI index")
+
+              # Step 3-4: select exactly one linux/amd64 entry, never the
+              # attestation manifest, and take its digest from the
+              # already-verified parent index -- never from a tag.
+              amd64_digest = select_amd64_manifest_digest(index)
+
+              # Step 5-6: fetch + verify the platform manifest BY THAT DIGEST.
+              manifest = fetch_manifest_by_digest(amd64_digest, token, MANIFEST_MEDIA_TYPES, ctx="linux/amd64 manifest")
+
+              # Step 7: extract its config digest from the already-verified manifest.
+              config_digest = extract_config_digest(manifest)
+
+              # Step 8-9: fetch + verify the config blob BY THAT DIGEST.
+              config_bytes = fetch_blob_by_digest(config_digest, token, ctx="image config blob")
+              try:
+                  config = json.loads(config_bytes.decode("utf-8"))
+              except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                  fail(f"image config blob: malformed JSON: {exc}")
+              if not isinstance(config, dict):
+                  fail("image config blob: top-level JSON is not an object")
+
+              # Step 10: only now, after every hop in the chain has been
+              # independently digest-verified, may Config.Env be read.
+              env_list = extract_env_list(config)
+
+              canonical = json.dumps(env_list, separators=(",", ":"), ensure_ascii=True)
+              print(f"image_provenance_amd64_manifest_digest={amd64_digest}", file=sys.stderr)
+              print(f"image_provenance_config_digest={config_digest}", file=sys.stderr)
+              print(f"image_provenance_env_key_count={len(env_list)}", file=sys.stderr)
+              print(f"image_provenance_env_sha256={sha256_hex(canonical.encode('utf-8'))}", file=sys.stderr)
+              # Only the canonical Env JSON goes to stdout -- captured by the
+              # caller via command substitution, never echoed to the step's
+              # own log output.
+              print(canonical)
+
+
+          if __name__ == "__main__":
+              main()
+          IMAGE_PROVENANCE_PY
+          )"
+
+          IMAGE_DEFAULT_ENV_JSON="$(python3 -c "$IMAGE_PROVENANCE_PY_SOURCE")"
+          IMAGE_DEFAULT_ENV_JSON_B64="$(printf '%s' "$IMAGE_DEFAULT_ENV_JSON" | base64 -w0)"
+          echo "IMAGE_DEFAULT_ENV_JSON_B64=$IMAGE_DEFAULT_ENV_JSON_B64" >> "$GITHUB_ENV"
+
       - name: Validate VM_SSH_KEY secret is present
         env:
           VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
@@ -138,11 +452,20 @@ jobs:
           SSH_OPTS=(-o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes -o StrictHostKeyChecking=yes)
 
           ssh "${SSH_OPTS[@]}" -i ~/.ssh/jobpulse_prenorm_verify_key -p "$VM_PORT" "$VM_USER@$VM_HOST" \
-            bash -s -- "$COMPOSE_SHA256" <<'REMOTE_SCRIPT'
+            bash -s -- "$COMPOSE_SHA256" "$IMAGE_DEFAULT_ENV_JSON_B64" <<'REMOTE_SCRIPT'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
           COMPOSE_SHA256="${1:?required}"
+          # Pre-verified immutable f476 image default Env, base64-encoded --
+          # derived AND digest-chain-verified entirely on the GitHub Actions
+          # runner in the "Derive immutable f476 image Config.Env from GHCR
+          # by digest" step above, from GHCR alone, never from this or any
+          # production host. Not a secret (it is the default Env of a
+          # publicly-pullable image: base-image PATH/LANG/etc. plus whatever
+          # this repo's own committed Dockerfile declares) -- base64-encoded
+          # only to pass safely through argv, never echoed here or there.
+          IMAGE_DEFAULT_ENV_JSON_B64="${2:?required}"
 
           # Generic failure tracer: fires on any command that trips set
           # -e, including inside functions (requires -E). Reports rc/line/
@@ -202,16 +525,21 @@ jobs:
 
           # Renders the effective CURRENT Compose config in JSON (never
           # falls back to an unsafe YAML-value parser for this proof) and
-          # reads the immutable f476 image's own default Env, each
+          # decodes the immutable f476 image's own default Env, each
           # captured straight into a local shell variable -- never a
           # file. Never echoes their contents. Read-only; never mutates
-          # Docker; never pulls -- `docker image inspect` only ever
-          # inspects an already-present local image object. Each
-          # producer's exit status is checked immediately via an explicit
-          # `||` (never a same-line `local var=$(...)`, which would
-          # discard the command's own exit status under `local`'s own
-          # success) so a producer failure here can never be confused
-          # with a later pipeline failure.
+          # Docker; never inspects or pulls any image on this host -- the
+          # image default Env was already fetched AND digest-chain-
+          # verified entirely on the GitHub Actions runner, from GHCR,
+          # before this SSH session ever started (see the "Derive
+          # immutable f476 image Config.Env from GHCR by digest" step),
+          # so this production host never needs the image object to be
+          # locally present at all. The compose producer's exit status is
+          # checked immediately via an explicit `||` (never a same-line
+          # `local var=$(...)`, which would discard the command's own
+          # exit status under `local`'s own success) so a producer
+          # failure here can never be confused with a later pipeline
+          # failure.
           render_current_env_json_pair() {
             local compose_json
             compose_json="$(JOBPULSE_API_IMAGE="$EXPECTED_CURRENT_CONFIG_IMAGE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config --format json)" || {
@@ -221,8 +549,8 @@ jobs:
             ENV_PARITY_COMPOSE_JSON="$compose_json"
 
             local image_env_json
-            image_env_json="$(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{json .Config.Env}}')" || {
-              echo "FATAL: the immutable f476 image object is not locally inspectable -- failing closed, never a registry pull inside this read-only verification" >&2
+            image_env_json="$(printf '%s' "$IMAGE_DEFAULT_ENV_JSON_B64" | base64 -d)" || {
+              echo "FATAL: failed to decode the runner-supplied, digest-chain-verified immutable f476 image default Env -- failing closed, never falling back to a live production image inspect or a registry pull on this host" >&2
               return 1
             }
             ENV_PARITY_IMAGE_ENV_JSON="$image_env_json"
@@ -516,7 +844,7 @@ jobs:
           echo "base_service_set=confirmed_api_db_frontend"
           echo "effective_current_compose_safety=confirmed"
 
-          echo "== 7. runtime vs effective-CURRENT semantic environment equivalence (never prints values; never a registry pull) =="
+          echo "== 7. runtime vs effective-CURRENT semantic environment equivalence (never prints values; image defaults pre-verified by the runner from GHCR, never inspected/pulled on this host) =="
           command -v python3 > /dev/null 2>&1 || fail "python3 command unavailable -- cannot compute the semantic runtime/effective-current environment equivalence proof"
 
           render_current_env_json_pair || exit 1
@@ -901,7 +1229,13 @@ jobs:
           # Absence is explicitly non-blocking: production-api-reference-
           # normalization.yml has its own authenticated pull + exact
           # image-ID provenance gate before it ever touches the running
-          # container.
+          # container. Unlike before this fix, this is now genuinely the
+          # ONLY place in this workflow where local image presence matters
+          # at all -- section 7's environment-parity proof above no longer
+          # shares this dependency (it is sourced from a runner-side,
+          # digest-chain-verified GHCR fetch instead), so this check's
+          # absence can never again silently block the run before this
+          # section is even reached.
 
           echo "== 20. zero-mutation accounting for this task =="
           echo "production_git_mutations=0"
