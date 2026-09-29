@@ -585,10 +585,131 @@ def test_collect_jobs_inconclusive_returning_becomes_failed_persist_never_succes
 
 def test_insert_job_header_artifact_has_its_own_outcome_without_sql():
     cursor = FakeCursor()
-    job = cp.normalize_job({"title": "Engineer", "job_url": "https://linkedin.com/jobs/view/1"})
+    job = cp.normalize_job({
+        "title": "500+ Software Engineer Jobs in Germany",
+        "job_url": "https://linkedin.com/jobs/view/1",
+    })
     outcome = cp.insert_job(cursor, job)
     assert outcome == cr.ROW_OUTCOME_FILTERED_HEADER_ARTIFACT
     assert cursor.insert_calls == []
+
+
+# =====================================================================
+# Incident regression guard: a legitimate LinkedIn job with a missing
+# location/description must never be misclassified as a search-results
+# header artifact. Production evidence (existing linkedin_plan_collect_*
+# report stdout) showed real jobs being discarded by a since-removed
+# `location == "Unknown Location" and not description` branch:
+#   "Product Manager - Industrial Solutions" @ Ovivo
+#   "Production Director" @ BioWare
+#   "Project Manager, Water" @ Associated Engineering
+# =====================================================================
+
+_INCIDENT_LEGITIMATE_JOBS = [
+    pytest.param(
+        {
+            "title": "Product Manager - Industrial Solutions",
+            "company": "Ovivo",
+            "job_url": "https://www.linkedin.com/jobs/view/4111111111/",
+        },
+        id="ovivo-product-manager",
+    ),
+    pytest.param(
+        {
+            "title": "Production Director",
+            "company": "BioWare",
+            "job_url": "https://www.linkedin.com/jobs/view/4222222222/",
+        },
+        id="bioware-production-director",
+    ),
+    pytest.param(
+        {
+            "title": "Project Manager, Water",
+            "company": "Associated Engineering",
+            "job_url": "https://www.linkedin.com/jobs/view/4333333333/",
+        },
+        id="associated-engineering-project-manager",
+    ),
+]
+
+
+@pytest.mark.parametrize("raw_job", _INCIDENT_LEGITIMATE_JOBS)
+def test_legitimate_job_missing_location_and_description_is_not_a_header_artifact(raw_job):
+    """Proves A, B, C: each of the three production-evidence jobs, each
+    with location left unset (normalize_job() defaults it to "Unknown
+    Location") and no job_description/job_about, is NOT classified as a
+    header artifact by the predicate itself."""
+    job = cp.normalize_job(raw_job)
+    assert job["location"] == "Unknown Location"
+    assert not job.get("job_description")
+    assert not job.get("job_about")
+    assert cp.is_invalid_linkedin_search_header_job(job) is False
+
+
+@pytest.mark.parametrize("raw_job", _INCIDENT_LEGITIMATE_JOBS)
+def test_legitimate_job_missing_location_and_description_reaches_insert_path(raw_job):
+    """Proves E: the same jobs reach the normal identifier/upsert path
+    (a real INSERT statement is issued) instead of being filtered --
+    and, via the returned outcome, proves F: they are counted as a real
+    row-level outcome (inserted/updated), never
+    ROW_OUTCOME_FILTERED_HEADER_ARTIFACT."""
+    cursor = FakeCursor([True])
+    job = cp.normalize_job(raw_job)
+    outcome = cp.insert_job(cursor, job)
+    assert outcome != cr.ROW_OUTCOME_FILTERED_HEADER_ARTIFACT
+    assert outcome == cr.ROW_OUTCOME_INSERTED
+    assert len(cursor.insert_calls) == 1
+
+
+def test_genuine_header_style_titles_are_still_filtered():
+    """Proves D: representative genuine LinkedIn search-results header
+    titles are still classified as header artifacts after the fix --
+    the title-based protection is untouched."""
+    header_titles = [
+        "500+ Software Engineer Jobs in Germany",
+        "1,234 Data Analyst Jobs in United States",
+        "Backend Developer Jobs in Australia",
+        "Backend Developer Jobs in Canada",
+        "Backend Developer Jobs in Germany",
+        "Backend Developer Jobs in United Kingdom",
+    ]
+    for title in header_titles:
+        job = cp.normalize_job({
+            "title": title,
+            "job_url": "https://www.linkedin.com/jobs/view/999999999/",
+        })
+        assert cp.is_invalid_linkedin_search_header_job(job) is True
+
+
+def test_legitimate_job_missing_location_and_description_does_not_increment_header_artifact_counter(result_path):
+    """Proves F end-to-end through collect_jobs_to_postgres(): a batch of
+    the three incident jobs must yield jobs_filtered_header_artifact == 0
+    and must all be proven inserted."""
+    jobs = [dict(raw_job) for raw_job in (
+        {
+            "title": "Product Manager - Industrial Solutions",
+            "company": "Ovivo",
+            "job_url": "https://www.linkedin.com/jobs/view/4111111111/",
+        },
+        {
+            "title": "Production Director",
+            "company": "BioWare",
+            "job_url": "https://www.linkedin.com/jobs/view/4222222222/",
+        },
+        {
+            "title": "Project Manager, Water",
+            "company": "Associated Engineering",
+            "job_url": "https://www.linkedin.com/jobs/view/4333333333/",
+        },
+    )]
+    exit_code, conn = run_collect(jobs, inserted_sequence=[True, True, True])
+    result = cr.read_result(result_path)
+    assert exit_code == 0
+    assert result.outcome == cr.OUTCOME_SUCCESS_WITH_NEW_ROWS
+    assert result.jobs_discovered == 3
+    assert result.jobs_filtered_header_artifact == 0
+    assert result.rows_inserted == 3
+    assert len(conn._cursor.insert_calls) == 3
 
 
 def test_insert_job_missing_identifier_has_a_distinct_outcome_from_header_artifact():
@@ -607,7 +728,7 @@ def test_insert_job_missing_identifier_has_a_distinct_outcome_from_header_artifa
 def test_insert_job_never_returns_none():
     cursor = FakeCursor([True])
     cases = [
-        {"title": "Engineer", "job_url": "https://linkedin.com/jobs/view/1"},  # header artifact
+        {"title": "500+ Software Engineer Jobs in Germany", "job_url": "https://linkedin.com/jobs/view/1"},  # header artifact
         valid_job(),  # normal insert
     ]
     for raw in cases:
@@ -693,7 +814,7 @@ def test_zero_discovered_jobs_yields_success_no_results(result_path):
 def test_all_rows_filtered_yields_success_filtered_all_with_separated_reasons(result_path):
     jobs = [
         {"title": "", "job_url": "https://linkedin.com/jobs/view/1"},          # fails is_valid_job
-        {"title": "Engineer", "job_url": "https://linkedin.com/jobs/view/2"},  # header-artifact filtered
+        {"title": "500+ Software Engineer Jobs in Germany", "job_url": "https://linkedin.com/jobs/view/2"},  # header-artifact filtered
     ]
     exit_code, conn = run_collect(jobs)
     result = cr.read_result(result_path)
