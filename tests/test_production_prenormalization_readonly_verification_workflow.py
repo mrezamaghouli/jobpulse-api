@@ -170,6 +170,46 @@ def _extract_env_parity_python_source(remote_script: str) -> str:
     return "\n".join(lines[1:end_idx]) if lines and lines[0] == "" else "\n".join(lines[:end_idx])
 
 
+IMAGE_PROVENANCE_STEP_NAME = "Derive immutable f476 image Config.Env from GHCR by digest (read-only, tag-independent)"
+
+
+@pytest.fixture(scope="module")
+def image_provenance_step(steps):
+    return _step_by_name(steps, IMAGE_PROVENANCE_STEP_NAME)
+
+
+@pytest.fixture(scope="module")
+def image_provenance_step_text(image_provenance_step) -> str:
+    return image_provenance_step["run"]
+
+
+def _extract_image_provenance_python_source(step_text: str) -> str:
+    start_marker = "<<'IMAGE_PROVENANCE_PY'"
+    start = step_text.index(start_marker) + len(start_marker)
+    rest = step_text[start:]
+    lines = rest.splitlines()
+    end_idx = next(i for i, line in enumerate(lines) if line.strip() == "IMAGE_PROVENANCE_PY")
+    return "\n".join(lines[1:end_idx]) if lines and lines[0] == "" else "\n".join(lines[:end_idx])
+
+
+@pytest.fixture(scope="module")
+def image_provenance_py(image_provenance_step_text) -> str:
+    return _extract_image_provenance_python_source(image_provenance_step_text)
+
+
+@pytest.fixture(scope="module")
+def image_provenance_ns(image_provenance_py):
+    """Exec the extracted, syntax-checked provenance module in an
+    isolated namespace so behavioral tests can call its pure helper
+    functions directly (digest verification, platform selection, Env
+    extraction) against fabricated data -- without making any real
+    network call. `main()`/network I/O are never invoked by these tests;
+    only the pure functions are exercised."""
+    ns: dict = {"__name__": "image_provenance_under_test"}
+    exec(compile(image_provenance_py, "<image-provenance>", "exec"), ns)
+    return ns
+
+
 # =====================================================================
 # 1. Trigger, permissions, concurrency, structure
 # =====================================================================
@@ -582,9 +622,15 @@ def test_effective_current_compose_checks_parity_with_normalization_workflow(rem
 def test_render_current_env_json_pair_exists_and_never_pulls(remote_script):
     func_body = _extract_bash_function(remote_script, "render_current_env_json_pair")
     assert "config --format json" in func_body
-    assert "docker image inspect" in func_body
     assert "docker pull" not in func_body
     assert "docker image pull" not in func_body
+    # Regression guard: the image default Env is no longer sourced via a
+    # live production-side `docker image inspect` at all -- it is decoded
+    # from a pre-verified value the runner-side GHCR digest-chain step
+    # already supplied (see section 16 below).
+    assert "docker image inspect" not in func_body
+    assert "IMAGE_DEFAULT_ENV_JSON_B64" in func_body
+    assert "base64 -d" in func_body
 
 
 def test_compute_env_parity_hashes_semantic_model_matches_normalization_workflow(remote_script):
@@ -764,14 +810,18 @@ def test_env_parity_framing_is_length_prefixed_not_newline_delimited(remote_scri
 
 
 def test_env_parity_producer_status_checked_before_streaming(remote_script):
-    """Each docker producer's exit status must be checked, via an
+    """Each producer's exit/decode status must be checked, via an
     explicit `||`, immediately after it runs and BEFORE its output is
     ever fed into the pipe to python3 -- so a producer failure can never
-    be masked by a later pipeline status."""
+    be masked by a later pipeline status. The image-default-Env producer
+    is now a base64 decode of a runner-supplied, pre-verified value
+    rather than a live `docker image inspect`, but the same
+    checked-immediately discipline still applies to it."""
     func_body = _extract_bash_function(remote_script, "render_current_env_json_pair")
     assert func_body.count("|| {") == 2
     assert "docker compose -p" in func_body
-    assert "docker image inspect" in func_body
+    assert "base64 -d" in func_body
+    assert "docker image inspect" not in func_body
 
 
 def test_env_parity_pipe_status_explicitly_checked(remote_script):
@@ -1036,6 +1086,350 @@ def test_error_trap_never_leaks_secret_values(remote_script):
     # BASH_COMMAND reflects unexpanded command source text (variable
     # NAMES, never their expanded values) -- consistent with every other
     # reviewed Phase 4M workflow.
+
+
+# =====================================================================
+# 16. Runner-side GHCR digest-chain image provenance
+#
+# The image default Env is no longer read via `docker image inspect` on
+# production. Instead, a dedicated runner-side step fetches it from GHCR
+# through a fully content-addressed chain -- EXPECTED_IMAGE_ID (hardcoded)
+# -> verified OCI index -> verified linux/amd64 manifest -> verified
+# config blob -> Config.Env -- each hop re-hashed against its
+# parent-declared digest, never the mutable CANONICAL_API_REFERENCE tag
+# and never a server-reported digest header alone. Structural tests parse
+# the embedded python as text; behavioral tests exec the extracted,
+# syntax-checked module and call its pure helper functions directly
+# against fabricated (including deliberately tampered) data -- no real
+# network call is ever made by these tests.
+# =====================================================================
+
+def test_image_provenance_step_exists_before_ssh_key_validation(steps):
+    names = [s.get("name") for s in steps]
+    prov_idx = names.index(IMAGE_PROVENANCE_STEP_NAME)
+    ssh_idx = names.index("Validate VM_SSH_KEY secret is present")
+    verify_idx = names.index("Run pre-normalization read-only production verification")
+    assert prov_idx < ssh_idx < verify_idx
+
+
+def test_image_provenance_step_needs_no_secret(image_provenance_step):
+    assert "env" not in image_provenance_step or not image_provenance_step["env"]
+
+
+def test_image_provenance_python_syntax_valid(image_provenance_py):
+    compile(image_provenance_py, "<image-provenance>", "exec")
+
+
+def test_image_provenance_starts_from_expected_image_id_not_tag(image_provenance_py):
+    assert f'EXPECTED_IMAGE_ID = "{EXPECTED_IMAGE_ID}"' in image_provenance_py
+    # The mutable git-SHA tag must never appear in this provenance chain
+    # at all -- not as a manifest path, not as a fallback.
+    assert EXPECTED_PRODUCTION_SHA not in image_provenance_py
+    assert "CANONICAL_API_REFERENCE" not in image_provenance_py
+    assert 'fetch_manifest_by_digest(EXPECTED_IMAGE_ID, token, INDEX_MEDIA_TYPES' in image_provenance_py
+
+
+def test_image_provenance_never_trusts_content_digest_header_or_status_alone(image_provenance_py):
+    # The code itself must never read a server-reported digest header --
+    # digest equality is established exclusively by recomputing SHA-256
+    # over the exact response bytes.
+    assert "resp.headers" not in image_provenance_py
+    assert "getheader(" not in image_provenance_py
+    assert "def require_digest_equals" in image_provenance_py
+    assert "hashlib.sha256(data).hexdigest()" in image_provenance_py
+
+
+def test_image_provenance_manifest_fetch_verifies_digest_before_parsing(image_provenance_py):
+    # fetch_manifest_by_digest must call require_digest_equals BEFORE
+    # json.loads -- ordering, not just presence.
+    start = image_provenance_py.index("def fetch_manifest_by_digest")
+    end = image_provenance_py.index("def fetch_blob_by_digest")
+    body = image_provenance_py[start:end]
+    require_idx = body.index("require_digest_equals(body, digest, ctx)")
+    parse_idx = body.index("json.loads(body.decode")
+    assert require_idx < parse_idx
+
+
+def test_image_provenance_blob_fetch_verifies_digest(image_provenance_py):
+    start = image_provenance_py.index("def fetch_blob_by_digest")
+    end = image_provenance_py.index("def select_amd64_manifest_digest")
+    body = image_provenance_py[start:end]
+    assert "require_digest_equals(body, digest, ctx)" in body
+
+
+def test_image_provenance_excludes_attestation_manifest_explicitly(image_provenance_py):
+    assert 'annotations.get("vnd.docker.reference.type") == "attestation-manifest"' in image_provenance_py
+
+
+def test_image_provenance_requires_exactly_one_amd64_candidate(image_provenance_py):
+    assert "no linux/amd64 image manifest entry found" in image_provenance_py
+    assert "ambiguous platform selection" in image_provenance_py
+    assert "len(candidates) == 0" in image_provenance_py
+    assert "len(candidates) > 1" in image_provenance_py
+
+
+def test_image_provenance_config_digest_sourced_only_from_verified_manifest(image_provenance_py):
+    start = image_provenance_py.index("def extract_config_digest")
+    end = image_provenance_py.index("def extract_env_list")
+    body = image_provenance_py[start:end]
+    assert 'config_ref = manifest.get("config")' in body
+    assert 'digest = config_ref.get("digest")' in body
+
+
+def test_image_provenance_main_chain_ordering(image_provenance_py):
+    """Config.Env must not be consumed before every hop of the digest
+    chain has verified: index fetch, amd64 selection, manifest fetch,
+    config-digest extraction, blob fetch, THEN env extraction -- in that
+    exact order, all inside main()."""
+    start = image_provenance_py.index("def main():")
+    body = image_provenance_py[start:]
+    idx_index = body.index("fetch_manifest_by_digest(EXPECTED_IMAGE_ID")
+    idx_select = body.index("select_amd64_manifest_digest(index)")
+    idx_manifest = body.index("fetch_manifest_by_digest(amd64_digest")
+    idx_config_digest = body.index("extract_config_digest(manifest)")
+    idx_blob = body.index("fetch_blob_by_digest(config_digest")
+    idx_env = body.index("extract_env_list(config)")
+    assert idx_index < idx_select < idx_manifest < idx_config_digest < idx_blob < idx_env
+
+
+def test_image_provenance_bounded_response_size(image_provenance_py):
+    assert "MAX_RESPONSE_BYTES" in image_provenance_py
+    assert "len(body) > MAX_RESPONSE_BYTES" in image_provenance_py
+    assert "fail(" in image_provenance_py
+
+
+def test_image_provenance_empty_response_fails_closed(image_provenance_py):
+    assert "len(body) == 0" in image_provenance_py
+    assert "returned an empty response body" in image_provenance_py
+
+
+def test_image_provenance_redirect_bounded_and_drops_sensitive_headers(image_provenance_py):
+    assert "class BoundedRedirectHandler" in image_provenance_py
+    assert "self.hops > 1" in image_provenance_py
+    # Only Accept is forwarded across a redirect hop -- not Authorization,
+    # not Host (see the regression note in the handler's own docstring:
+    # forwarding Host caused a live, reproduced 421 Misdirected Request).
+    assert 'new_req.add_header("Accept", accept)' in image_provenance_py
+    assert "req.header_items()" not in image_provenance_py
+
+
+def test_image_provenance_no_docker_cli_usage(image_provenance_step_text):
+    # Registry access is raw HTTP (urllib) only -- no `docker` CLI
+    # invocation anywhere in this step's actual code (comments may
+    # legitimately name forbidden docker subcommands to explain what is
+    # NOT done, so only non-comment lines are checked).
+    code = _code_only(image_provenance_step_text)
+    for forbidden in ("docker pull", "docker image pull", "docker login", "docker image inspect", "docker compose", "docker "):
+        assert forbidden not in code, forbidden
+
+
+def test_image_provenance_no_new_secret_or_permission(image_provenance_step, workflow):
+    assert "secrets." not in image_provenance_step["run"]
+    assert workflow["permissions"] == {"contents": "read"}
+
+
+def test_image_provenance_only_canonical_json_on_stdout_never_logged(image_provenance_step_text, image_provenance_py):
+    # The step captures stdout via command substitution -- never echoed
+    # directly to the step's own log output.
+    assert 'IMAGE_DEFAULT_ENV_JSON="$(python3 -c "$IMAGE_PROVENANCE_PY_SOURCE")"' in image_provenance_step_text
+    # Diagnostics (hashes/counts/digests) go to stderr; only the final
+    # canonical Env JSON is ever printed to stdout, and only once.
+    assert image_provenance_py.count("print(canonical)") == 1
+    stdout_prints = [
+        line.strip() for line in image_provenance_py.splitlines()
+        if line.strip().startswith("print(") and "file=sys.stderr" not in line
+    ]
+    assert stdout_prints == ["print(canonical)"]
+
+
+def test_image_provenance_b64_transport_never_echoed(image_provenance_step_text, runner_script, remote_script):
+    for script in (image_provenance_step_text, runner_script, remote_script):
+        assert 'echo "$IMAGE_DEFAULT_ENV_JSON"' not in script
+        assert 'echo "$IMAGE_DEFAULT_ENV_JSON_B64"' not in script
+
+
+def test_image_provenance_b64_env_written_to_github_env(image_provenance_step_text):
+    assert 'echo "IMAGE_DEFAULT_ENV_JSON_B64=$IMAGE_DEFAULT_ENV_JSON_B64" >> "$GITHUB_ENV"' in image_provenance_step_text
+
+
+def test_image_provenance_ssh_invocation_passes_b64_positionally(remote_script, runner_script):
+    assert 'bash -s -- "$COMPOSE_SHA256" "$IMAGE_DEFAULT_ENV_JSON_B64"' in runner_script
+    assert 'IMAGE_DEFAULT_ENV_JSON_B64="${2:?required}"' in remote_script
+
+
+# --- Behavioral tests: exec the extracted module, call pure functions ---
+
+def test_behavioral_digest_mismatch_fails_closed(image_provenance_ns):
+    require_digest_equals = image_provenance_ns["require_digest_equals"]
+    data = b'{"some": "bytes"}'
+    wrong_digest = "sha256:" + ("0" * 64)
+    with pytest.raises(SystemExit):
+        require_digest_equals(data, wrong_digest, "test ctx")
+
+
+def test_behavioral_digest_match_passes(image_provenance_ns):
+    import hashlib as _hashlib
+
+    require_digest_equals = image_provenance_ns["require_digest_equals"]
+    data = b'{"some": "bytes"}'
+    correct_digest = f"sha256:{_hashlib.sha256(data).hexdigest()}"
+    require_digest_equals(data, correct_digest, "test ctx")  # must not raise
+
+
+def test_behavioral_malformed_expected_digest_fails_closed(image_provenance_ns):
+    require_digest_equals = image_provenance_ns["require_digest_equals"]
+    with pytest.raises(SystemExit):
+        require_digest_equals(b"anything", "not-a-real-digest", "test ctx")
+
+
+def test_behavioral_select_amd64_excludes_attestation_and_requires_exactly_one(image_provenance_ns):
+    select_amd64_manifest_digest = image_provenance_ns["select_amd64_manifest_digest"]
+    MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+    good_digest = "sha256:" + ("a" * 64)
+    attestation_digest = "sha256:" + ("b" * 64)
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": MANIFEST_MEDIA_TYPE, "digest": good_digest, "platform": {"architecture": "amd64", "os": "linux"}},
+            {
+                "mediaType": MANIFEST_MEDIA_TYPE,
+                "digest": attestation_digest,
+                "platform": {"architecture": "amd64", "os": "linux"},
+                "annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+            },
+        ],
+    }
+    assert select_amd64_manifest_digest(index) == good_digest
+
+
+def test_behavioral_select_amd64_zero_candidates_fails_closed(image_provenance_ns):
+    select_amd64_manifest_digest = image_provenance_ns["select_amd64_manifest_digest"]
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:" + ("c" * 64), "platform": {"architecture": "arm64", "os": "linux"}},
+        ],
+    }
+    with pytest.raises(SystemExit):
+        select_amd64_manifest_digest(index)
+
+
+def test_behavioral_select_amd64_ambiguous_candidates_fails_closed(image_provenance_ns):
+    select_amd64_manifest_digest = image_provenance_ns["select_amd64_manifest_digest"]
+    MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": MANIFEST_MEDIA_TYPE, "digest": "sha256:" + ("d" * 64), "platform": {"architecture": "amd64", "os": "linux"}},
+            {"mediaType": MANIFEST_MEDIA_TYPE, "digest": "sha256:" + ("e" * 64), "platform": {"architecture": "amd64", "os": "linux"}},
+        ],
+    }
+    with pytest.raises(SystemExit):
+        select_amd64_manifest_digest(index)
+
+
+def test_behavioral_malformed_index_fails_closed(image_provenance_ns):
+    select_amd64_manifest_digest = image_provenance_ns["select_amd64_manifest_digest"]
+    with pytest.raises(SystemExit):
+        select_amd64_manifest_digest({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": []})
+    with pytest.raises(SystemExit):
+        select_amd64_manifest_digest({"schemaVersion": 1, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [{}]})
+
+
+def test_behavioral_missing_config_env_fails_closed(image_provenance_ns):
+    extract_env_list = image_provenance_ns["extract_env_list"]
+    with pytest.raises(SystemExit):
+        extract_env_list({"config": {}})
+    with pytest.raises(SystemExit):
+        extract_env_list({"config": {"Env": "not-a-list"}})
+    with pytest.raises(SystemExit):
+        extract_env_list({})
+
+
+def test_behavioral_extract_env_list_happy_path(image_provenance_ns):
+    extract_env_list = image_provenance_ns["extract_env_list"]
+    assert extract_env_list({"config": {"Env": ["A=1", "B=2"]}}) == ["A=1", "B=2"]
+
+
+def test_behavioral_extract_config_digest_validates_media_type_and_digest(image_provenance_ns):
+    extract_config_digest = image_provenance_ns["extract_config_digest"]
+    good = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:" + ("f" * 64)},
+    }
+    assert extract_config_digest(good) == "sha256:" + ("f" * 64)
+
+    bad_media = dict(good, config={"mediaType": "text/plain", "digest": "sha256:" + ("f" * 64)})
+    with pytest.raises(SystemExit):
+        extract_config_digest(bad_media)
+
+    bad_digest = dict(good, config={"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "not-a-digest"})
+    with pytest.raises(SystemExit):
+        extract_config_digest(bad_digest)
+
+
+def test_behavioral_bounded_fetch_rejects_oversized_response(image_provenance_ns, monkeypatch):
+    import io
+
+    bounded_fetch = image_provenance_ns["bounded_fetch"]
+    MAX_RESPONSE_BYTES = image_provenance_ns["MAX_RESPONSE_BYTES"]
+    oversized = b"x" * (MAX_RESPONSE_BYTES + 10)
+
+    class FakeResp:
+        status = 200
+
+        def read(self, n):
+            return oversized[:n]
+
+        def close(self):
+            pass
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            return FakeResp()
+
+    image_provenance_ns["_OPENER"] = FakeOpener()
+    with pytest.raises(SystemExit):
+        bounded_fetch("https://example.invalid/x", {}, "test ctx")
+
+
+def test_behavioral_bounded_fetch_rejects_empty_response(image_provenance_ns):
+    bounded_fetch = image_provenance_ns["bounded_fetch"]
+
+    class FakeResp:
+        status = 200
+
+        def read(self, n):
+            return b""
+
+        def close(self):
+            pass
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            return FakeResp()
+
+    image_provenance_ns["_OPENER"] = FakeOpener()
+    with pytest.raises(SystemExit):
+        bounded_fetch("https://example.invalid/x", {}, "test ctx")
+
+
+def test_behavioral_bounded_fetch_rejects_non_200(image_provenance_ns):
+    import urllib.error
+
+    bounded_fetch = image_provenance_ns["bounded_fetch"]
+
+    class FakeOpener:
+        def open(self, req, timeout):
+            raise urllib.error.HTTPError("https://example.invalid/x", 404, "Not Found", {}, None)
+
+    image_provenance_ns["_OPENER"] = FakeOpener()
+    with pytest.raises(SystemExit):
+        bounded_fetch("https://example.invalid/x", {}, "test ctx")
 
 
 # =====================================================================

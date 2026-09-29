@@ -3782,18 +3782,65 @@ pull/push`, no `git reset/checkout/switch/pull/merge/clean/stash`, no
 production file write (the remote script is piped over SSH stdin, never
 scp'd to a temp file the way the mutating runners do), no cron/systemd
 mutation, no collector/queue/collection-cycle execution, no LinkedIn
-request, and no Tor/ControlPort/NEWNYM access. Every remote command is
-one of: `git rev-parse`/`git status` (read HEAD and worktree
-cleanliness, never touched), `sha256sum` (static Compose-file
-provenance), `docker inspect` (container identity/health/restart
-counts), `docker compose ... config`/`config --services` (render only,
-never `up`/`down`/`create`), exactly two narrow `docker exec ...
-printenv` calls (`SEARCH_TRANSPORT` and `TOR_ENABLED` only, never a full
-environment dump), `docker image inspect` against an already-present
-local image ID (never `docker pull`), `docker top` (observation only,
-never `docker kill`/`stop`), the same bounded `crontab -l`/`systemctl
-show|cat|list-*` scheduler-provenance reads the normalization runner
-uses, and two localhost-only `curl` health probes.
+request, and no Tor/ControlPort/NEWNYM access. Every remote (production
+SSH-session) command is one of: `git rev-parse`/`git status` (read HEAD
+and worktree cleanliness, never touched), `sha256sum` (static
+Compose-file provenance), `docker inspect` (container
+identity/health/restart counts), `docker compose ... config`/`config
+--services` (render only, never `up`/`down`/`create`), exactly two
+narrow `docker exec ... printenv` calls (`SEARCH_TRANSPORT` and
+`TOR_ENABLED` only, never a full environment dump), `docker top`
+(observation only, never `docker kill`/`stop`), the same bounded
+`crontab -l`/`systemctl show|cat|list-*` scheduler-provenance reads the
+normalization runner uses, and two localhost-only `curl` health probes.
+Production is never asked to inspect or pull any image at all -- see
+"Immutable image Config.Env provenance" below.
+
+**Immutable image Config.Env provenance (GHCR digest chain, runner-side,
+tag-independent).** `EXPECTED_IMAGE_ID`
+(`sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`)
+is the **OCI image index (manifest-list) digest** that
+`docker-build.yml`'s single build of commit
+`f4765f857355c6543f68cea0e481b7f20a917147` (run `33968934946`) exported
+and pushed to GHCR under both the `main` and the git-SHA tags -- not a
+per-platform config-blob digest. A dedicated runner-side step, "Derive
+immutable f476 image Config.Env from GHCR by digest," runs before the
+SSH session starts and derives the image's default `Env` through a
+fully content-addressed chain, never trusting the mutable
+`CANONICAL_API_REFERENCE` tag or any server-reported digest header:
+`EXPECTED_IMAGE_ID` (hardcoded) -> fetch the OCI index **by that exact
+digest**, recompute SHA-256 over the raw response bytes and require
+equality -> select the exactly-one `linux/amd64` image-manifest entry
+(never the attestation-manifest entry, excluded explicitly by its
+`vnd.docker.reference.type` annotation) -> fetch that manifest **by the
+digest the already-verified index declared for it**, recompute and
+require equality -> extract its config digest -> fetch the config blob
+**by that digest**, recompute and require equality -> only then read
+`config.Env`. Each hop's exact response bytes are re-hashed against the
+digest its own verified parent declared; HTTP status and any
+`Docker-Content-Digest` header are never trusted alone. The package is
+publicly readable, so this uses only an anonymous GHCR pull token --
+no new secret or elevated GitHub Actions permission was needed
+(`permissions: contents: read` is unchanged). Registry access is raw
+HTTP (Python's `urllib`, stdlib only) against manifests and the small
+JSON config blob only -- never `docker pull`, never a full image layer,
+on the runner or on production. Responses are bounded to 10 MiB and at
+most one redirect hop, with `Authorization` dropped across that hop.
+The derived `Env` list is captured via command substitution (never
+echoed to the step's own log output), base64-encoded only to pass
+safely through the SSH command's argv, and decoded inside the existing
+SSH session's `render_current_env_json_pair()` in place of the former
+`docker image inspect "$EXPECTED_IMAGE_ID"` call -- the rest of the
+semantic parity proof (overlay with the effective CURRENT Compose
+environment, canonical JSON, SHA-256 comparison, exact-equality gate)
+is unchanged.
+
+As of this fix, live verification confirmed GHCR still serves the
+original, unmodified f476 index/manifest/config exactly as built (the
+tag never moved) -- so this change closes the operational gap where a
+transient absence of that image object from *production's own* local
+Docker image store could block this read-only proof, without weakening
+what is proven.
 
 **Reused, not reinvented.** The scheduler-provenance section and the
 effective-CURRENT Compose api-block/environment-block extraction are
@@ -3848,12 +3895,17 @@ frontend reachability probe all respond.
 
 **Non-blocking by design.** Untracked-file presence is reported (count
 only) but never blocks. Canonical reference (`ghcr.io/mrezamaghouli/
-jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147`) local absence is
-explicitly non-blocking and reported as
+jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147`) local absence
+*on production* is explicitly non-blocking and reported as
 `canonical_reference_local_presence=false` -- the normalization runner
 has its own authenticated pull + exact image-ID provenance gate before
 it ever touches the running container, so this workflow never attempts
-one itself.
+one itself. This is now genuinely the only place in this workflow where
+production's local image presence matters at all: the semantic
+environment-parity proof no longer shares this dependency (its image
+defaults come from the runner-side GHCR digest chain described above),
+so a locally-absent image object on production can no longer silently
+fail the run before this check is even reached, the way it once did.
 
 **Success is not permission.** The exact marker
 `PHASE_4M_PRENORMALIZATION_READONLY_VERIFIED` is emitted only after
