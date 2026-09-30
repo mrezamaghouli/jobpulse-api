@@ -257,9 +257,21 @@ def is_invalid_linkedin_search_header_job(job):
     import re
 
     title = str(job.get("title") or "").strip()
-    location = str(job.get("location") or "").strip()
-    description = str(job.get("job_description") or job.get("job_about") or "").strip()
 
+    # Deliberately title-only: this predicate exists to catch LinkedIn's
+    # own search-results header/filler rows (e.g. "500+ Software Engineer
+    # Jobs in Germany"), which are identifiable from their title text
+    # alone. It previously also treated `location == "Unknown Location"
+    # and no description` as header-artifact evidence, but that condition
+    # is just "the provider failed to scrape location/description for
+    # this row" -- true of any legitimate job when LinkedIn's markup
+    # changes underneath the scraper, not evidence the row is a header
+    # artifact. Production incident: real jobs (e.g. "Product Manager -
+    # Industrial Solutions" @ Ovivo, "Production Director" @ BioWare)
+    # were being silently discarded by that branch. A real job must never
+    # be rejected solely for missing location/description -- see
+    # is_valid_job() and is_linkedin_job() for the fields that are
+    # actually required.
     if re.match(r"^\d+\s+.+\s+Jobs\s+in\s+.+$", title, re.IGNORECASE):
         return True
 
@@ -276,9 +288,6 @@ def is_invalid_linkedin_search_header_job(job):
         return True
 
     if title.lower().endswith(" jobs in united kingdom"):
-        return True
-
-    if location.lower() == "unknown location" and not description:
         return True
 
     return False
