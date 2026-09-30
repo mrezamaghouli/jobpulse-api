@@ -3936,3 +3936,88 @@ for the rest of this workflow -- there is no write, not merely no
 classifications are ever printed -- never a raw environment value,
 `env_file` content, or full rendered Compose config.
 
+
+## Incident: LinkedIn header-artifact false positives -- exact-source image builder
+
+**Incident.** Production (f476, `f4765f857355c6543f68cea0e481b7f20a917147`)
+silently discarded legitimate LinkedIn jobs (e.g. "Product Manager -
+Industrial Solutions" @ Ovivo, "Production Director" @ BioWare) because
+`is_invalid_linkedin_search_header_job()` treated `location == "Unknown
+Location"` plus an empty description as header-artifact evidence. The fix
+is `259c507e10def1cae5a4f10cd718811981233f0d` (PR #40), whose sole parent
+is f476 and whose only change beyond tests is
+`scripts/collector_postgres.py`.
+
+**Why main (`b63cb54d64832c0ba47df4ebbef944995f285cca`) is intentionally
+not deployed.** main merges 259c507 on top of 2f599, which also carries
+the Phase 4B LinkedIn poster-profile provider change
+(`scripts/providers/linkedin_browser_provider.py`) and its frontend block
+-- the same change whose Phase 4E rollout failed and was rolled back, and
+which is not part of this incident remediation. The `Build JobPulse API
+Image` run for b63cb54 (`36696524741`) also moved the floating `:main` tag
+to that image (`sha256:0ee9a54a5997706fab2a1bec6b23e53aa5c7d336a76e3e2f1a6685fe5493c144`);
+its automatic deploy was skipped (`PRODUCTION_AUTO_DEPLOY_ENABLED` gate).
+**Do not run `deploy.yml`**: its manual path deploys `:main` and resets
+production git to `origin/main`.
+
+**Why an exact-source incident artifact is required.** No image of 259c507
+exists: `docker-build.yml` builds only main, so the incident branch was
+never built (GHCR tag `259c507…` does not exist).
+`.github/workflows/production-incident-259c507-image-build.yml` (manual
+`workflow_dispatch` only, from `main`, confirmation token
+`BUILD_259C507_INCIDENT_IMAGE`) builds exactly one image from exactly that
+commit:
+
+- The source commit (259c507) and parent (f476) are hard-pinned; there is
+  no SHA/ref input. The checkout is verified: `HEAD` equals the pin, its
+  single parent is f476, it is merged into `origin/main`, and the worktree
+  is clean.
+- The `f476..259c507` delta must be exactly `M scripts/collector_postgres.py`
+  and `M tests/test_collector_outcomes.py` (`--no-renames`). Dockerfile,
+  both requirements files, and `.dockerignore` must be byte-identical to
+  f476. Anything else fails the run before building.
+- A differential behavior check extracts the predicate from both f476 and
+  259c507 via the Python AST. f476 must reject the incident jobs and
+  259c507 must accept them. Both must still reject every title-based
+  search-header pattern, and the 259c507 predicate must no longer reference
+  location or description fields.
+- 259c507's own `tests/test_collector_outcomes.py` runs, including the four
+  named incident regressions, from the 259c507 checkout only.
+- Build: `linux/amd64` only, `no-cache` (no shared GHA cache with main),
+  pushed only as
+  `ghcr.io/mrezamaghouli/jobpulse-api:incident-259c507e10def1cae5a4f10cd718811981233f0d`.
+  It is never pushed as `:main`, `:latest`, f476, or any raw commit SHA;
+  raw-SHA tags are `docker-build.yml`'s main-build convention. The run
+  refuses to start if that tag already exists. GHCR tags are mutable, so
+  any consumer must pin the recorded digest, never the tag.
+- After the push, the pushed image is verified entirely through
+  content-addressed registry reads. The chain: tag → built index digest →
+  exactly one `linux/amd64` runtime manifest, where every other index entry
+  must be a Buildx attestation manifest referencing it → config blob. Each
+  hop is re-hashed. The revision and parent labels must match the pins.
+- The image is compared against the historical f476 image (index
+  `sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`).
+  Any difference in `Cmd`/`Entrypoint`/`WorkingDir`/`ExposedPorts`/`User`
+  fails the run. `Env`/label/layer differences are reported.
+- The provenance record goes to the job summary and to the
+  `incident-259c507-image-provenance` artifact. It contains: commit,
+  parent, tree, collector blob, Dockerfile/requirements/.dockerignore
+  SHA-256, index/manifest/config digests, and the f476 comparison.
+
+**Reproducibility limitation (not a claim of byte identity).** The
+Dockerfile uses a floating `python:3.12-slim` base, a fully unpinned
+`requirements.prod.txt` (only torch is pinned), and a floating Playwright
+Chromium install. This artifact is a **fresh build** of the exact 259c507
+source tree. It is **not** byte-identical to the historical f476 image
+plus one changed file, and nothing in this workflow claims otherwise. For
+scale: b63cb54's fresh build shares 0 of 13 filesystem layers with the
+f476 image. The recorded f476 comparison is the evidence for review.
+
+**Building does not authorize deployment.** Dispatching this workflow
+pushes an image and nothing else. It never uses SSH, never touches
+production, never runs `docker compose`, never runs a collector, and
+never dispatches another workflow. Deploying the image (API-only, pinned
+by digest, with its own preflight/validation/rollback) is a separate,
+later, reviewed change and a separately authorized operation. **Phase 4M
+remains paused**: neither the reference-normalization runner nor its
+read-only verifier is part of this remediation.

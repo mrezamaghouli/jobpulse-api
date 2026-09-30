@@ -197,6 +197,7 @@ jobs:
           PYTHONPATH=. python -m pytest \
             tests/test_production_neutral_canary_workflow.py \
             tests/test_production_direct_runtime_upgrade_workflow.py \
+            tests/test_production_incident_259c507_image_build_workflow.py \
             tests/test_ci_workflow_structure.py \
             -q
 
