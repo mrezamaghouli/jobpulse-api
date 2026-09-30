@@ -1,0 +1,846 @@
+name: Production Incident 259c507 Image Build
+
+# Manual-only, one-time incident artifact builder. There is deliberately no
+# push/pull_request/workflow_run/schedule/repository_dispatch trigger --
+# the ONLY way this workflow can run is an operator explicitly dispatching
+# it from main and typing the exact confirmation token below.
+#
+# Purpose: build and push ONE API image from EXACTLY source commit
+# 259c507e10def1cae5a4f10cd718811981233f0d ("Fix LinkedIn header artifact
+# false positives"), whose sole parent is the current production baseline
+# f4765f857355c6543f68cea0e481b7f20a917147 (f476). main
+# (b63cb54d64832c0ba47df4ebbef944995f285cca and its :main image) also
+# carries the Phase 4B LinkedIn poster-profile provider change, which is
+# NOT part of this incident remediation -- so the ordinary
+# docker-build.yml (main-only, tags :main and the main commit SHA) cannot
+# produce the required artifact.
+#
+# What this workflow NEVER does: SSH anywhere, deploy, run docker compose,
+# touch production, run a collector, dispatch any other workflow (Phase 4M
+# included), or push any tag other than the single incident-specific tag
+# below. Building/pushing this image does NOT authorize deploying it.
+#
+# Reproducibility, stated plainly: the Dockerfile uses a floating base
+# image (python:3.12-slim), unpinned requirements, and a floating
+# Playwright/Chromium install. This build is a FRESH build of the exact
+# 259c507 source tree -- it is NOT, and is never claimed to be,
+# byte-identical to the historical f476 image plus one changed file. The
+# workflow instead records full, content-addressed provenance and reports
+# every configuration difference from the historical f476 image.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: >-
+          Type exactly BUILD_259C507_INCIDENT_IMAGE to confirm. Builds and
+          pushes ONLY ghcr.io/mrezamaghouli/jobpulse-api:incident-259c507e10def1cae5a4f10cd718811981233f0d
+          from exact source commit 259c507e10def1cae5a4f10cd718811981233f0d
+          (never main, never an operator-supplied SHA). Never deploys.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobpulse-incident-259c507-image-build
+  cancel-in-progress: false
+
+env:
+  # The one and only source commit this workflow will ever build. There is
+  # deliberately no SHA input -- a different commit requires a separately
+  # reviewed workflow change.
+  TARGET_SOURCE_SHA: "259c507e10def1cae5a4f10cd718811981233f0d"
+  # The one and only allowed parent: the live production baseline.
+  TARGET_PARENT_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  # Historical f476 OCI image index digest (docker-build.yml run
+  # 33968934946), used only as a read-only comparison baseline.
+  BASELINE_INDEX_DIGEST: "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+  IMAGE_REPOSITORY: "ghcr.io/mrezamaghouli/jobpulse-api"
+  # Incident-specific tag. Deliberately NOT the raw commit SHA: raw-SHA
+  # tags are docker-build.yml's convention for ordinary main builds, and
+  # this artifact must never be mistaken for one.
+  INCIDENT_IMAGE_TAG: "incident-259c507e10def1cae5a4f10cd718811981233f0d"
+  CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  verify-source:
+    name: Verify exact incident source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      source_tree_sha: ${{ steps.source_delta.outputs.source_tree_sha }}
+      collector_blob_sha: ${{ steps.source_delta.outputs.collector_blob_sha }}
+      dockerfile_sha256: ${{ steps.source_delta.outputs.dockerfile_sha256 }}
+      requirements_sha256: ${{ steps.source_delta.outputs.requirements_sha256 }}
+      requirements_prod_sha256: ${{ steps.source_delta.outputs.requirements_prod_sha256 }}
+      dockerignore_sha256: ${{ steps.source_delta.outputs.dockerignore_sha256 }}
+
+    steps:
+      - name: Require exact confirmation token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${CONFIRMATION:-}" != "BUILD_259C507_INCIDENT_IMAGE" ]; then
+            echo "ERROR: confirmation input must be exactly BUILD_259C507_INCIDENT_IMAGE" >&2
+            exit 1
+          fi
+
+      - name: Require dispatch from main
+        # The workflow definition itself must be the reviewed, merged
+        # version -- a dispatch from any other branch could run an
+        # unreviewed copy of this file.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${GITHUB_REF:-}')" >&2
+            exit 1
+          fi
+
+      - name: Checkout exact incident source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact checkout and parent
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" != "$TARGET_SOURCE_SHA" ]; then
+            echo "ERROR: checked-out HEAD is $head_sha, expected exactly $TARGET_SOURCE_SHA" >&2
+            exit 1
+          fi
+
+          # Exactly one parent, and it must be the production baseline.
+          parents="$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
+          if [ "$parents" != "$TARGET_PARENT_SHA" ]; then
+            echo "ERROR: $TARGET_SOURCE_SHA parents are '$parents', expected exactly '$TARGET_PARENT_SHA'" >&2
+            exit 1
+          fi
+
+          # The incident fix must already be reviewed and merged.
+          git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}" >/dev/null || {
+            echo "ERROR: origin/main is not available in the checkout" >&2
+            exit 1
+          }
+          if ! git merge-base --is-ancestor "$TARGET_SOURCE_SHA" refs/remotes/origin/main; then
+            echo "ERROR: $TARGET_SOURCE_SHA is not an ancestor of origin/main (not merged)" >&2
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "ERROR: checkout worktree is not clean" >&2
+            git status --porcelain --untracked-files=all >&2
+            exit 1
+          fi
+
+          echo "Exact checkout verified: HEAD=$head_sha parent=$parents (merged into origin/main)"
+
+      - name: Verify source delta from f476 is exactly the incident allowlist
+        id: source_delta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --no-renames so a rename can never hide as a single path; every
+          # add/delete/modify/type-change is listed individually.
+          actual="$(git diff --no-renames --name-status "$TARGET_PARENT_SHA" "$TARGET_SOURCE_SHA" | LC_ALL=C sort)"
+          expected="$(printf 'M\tscripts/collector_postgres.py\nM\ttests/test_collector_outcomes.py')"
+
+          if [ "$actual" != "$expected" ]; then
+            echo "ERROR: source delta $TARGET_PARENT_SHA..$TARGET_SOURCE_SHA is not exactly the reviewed incident allowlist" >&2
+            echo "--- expected ---" >&2
+            printf '%s\n' "$expected" >&2
+            echo "--- actual ---" >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+          # Build inputs must be unchanged from f476 (implied by the
+          # allowlist above; asserted explicitly so a future edit to the
+          # allowlist can never silently let them drift).
+          for path in Dockerfile requirements.txt requirements.prod.txt .dockerignore; do
+            parent_blob="$(git rev-parse "${TARGET_PARENT_SHA}:${path}")"
+            target_blob="$(git rev-parse "${TARGET_SOURCE_SHA}:${path}")"
+            if [ "$parent_blob" != "$target_blob" ]; then
+              echo "ERROR: build input $path differs between f476 and $TARGET_SOURCE_SHA" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "source_tree_sha=$(git rev-parse "${TARGET_SOURCE_SHA}^{tree}")"
+            echo "collector_blob_sha=$(git rev-parse "${TARGET_SOURCE_SHA}:scripts/collector_postgres.py")"
+            echo "dockerfile_sha256=$(sha256sum Dockerfile | awk '{print $1}')"
+            echo "requirements_sha256=$(sha256sum requirements.txt | awk '{print $1}')"
+            echo "requirements_prod_sha256=$(sha256sum requirements.prod.txt | awk '{print $1}')"
+            echo "dockerignore_sha256=$(sha256sum .dockerignore | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Source delta verified: exactly scripts/collector_postgres.py (+ reviewed tests/test_collector_outcomes.py)."
+
+      - name: Verify incident predicate behavior (differential, f476 vs 259c507)
+        # Extracts is_invalid_linkedin_search_header_job() from BOTH the
+        # f476 and 259c507 sources via the Python AST (no runtime
+        # dependencies imported) and proves:
+        #   - the f476 version rejects the incident's legitimate jobs
+        #     ("Unknown Location" + no description), the 259c507 one does not;
+        #   - both still reject every title-based search-header artifact;
+        #   - the 259c507 predicate no longer references location or
+        #     description fields at all.
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_path="$RUNNER_TEMP/baseline_collector_postgres.py"
+          git show "${TARGET_PARENT_SHA}:scripts/collector_postgres.py" > "$baseline_path"
+          BASELINE_PATH="$baseline_path" TARGET_PATH="scripts/collector_postgres.py" python3 - <<'BEHAVIOR_PY'
+          import ast
+          import os
+          import re
+          import sys
+
+          FUNCTION_NAME = "is_invalid_linkedin_search_header_job"
+          FORBIDDEN_CONSTANTS = {"location", "unknown location", "job_description", "job_about"}
+
+          HEADER_TITLES = [
+              "500+ Software Engineer Jobs in Germany",
+              "500 Software Engineer Jobs in Germany",
+              "1,234 Data Analyst Jobs in United States",
+              "Backend Developer Jobs in Australia",
+              "Backend Developer Jobs in Canada",
+              "Backend Developer Jobs in Germany",
+              "Backend Developer Jobs in United Kingdom",
+              "Backend Developer Jobs in United States",
+          ]
+
+          INCIDENT_JOBS = [
+              {"title": "Product Manager - Industrial Solutions", "company": "Ovivo"},
+              {"title": "Production Director", "company": "BioWare"},
+              {"title": "Project Manager, Water", "company": "Associated Engineering"},
+          ]
+
+
+          def fail(message):
+              print(f"BEHAVIOR_CHECK_FAILED: {message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          def load_predicate(path):
+              with open(path, encoding="utf-8") as handle:
+                  tree = ast.parse(handle.read(), filename=path)
+              matches = [
+                  node for node in tree.body
+                  if isinstance(node, ast.FunctionDef) and node.name == FUNCTION_NAME
+              ]
+              if len(matches) != 1:
+                  fail(f"{path}: expected exactly one top-level {FUNCTION_NAME}, found {len(matches)}")
+              module = ast.Module(body=[matches[0]], type_ignores=[])
+              namespace = {"re": re}
+              exec(compile(module, path, "exec"), namespace)
+              return matches[0], namespace[FUNCTION_NAME]
+
+
+          def forbidden_constants(function_node):
+              found = set()
+              for node in ast.walk(function_node):
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                      if node.value.strip().lower() in FORBIDDEN_CONSTANTS:
+                          found.add(node.value)
+              return found
+
+
+          baseline_node, baseline = load_predicate(os.environ["BASELINE_PATH"])
+          target_node, target = load_predicate(os.environ["TARGET_PATH"])
+
+          for title in HEADER_TITLES:
+              job = {"title": title, "location": "Unknown Location", "job_description": ""}
+              if baseline(job) is not True:
+                  fail(f"baseline no longer rejects header title {title!r}")
+              if target(job) is not True:
+                  fail(f"target does not reject header title {title!r}")
+
+          for raw in INCIDENT_JOBS:
+              job = dict(raw, location="Unknown Location", job_description="", job_about="")
+              if baseline(job) is not True:
+                  fail(f"baseline does not reproduce the incident for {raw['title']!r}")
+              if target(job) is not False:
+                  fail(f"target still rejects legitimate job {raw['title']!r}")
+              located = dict(raw, location="Berlin, Germany", job_description="Real job.")
+              if baseline(located) is not False or target(located) is not False:
+                  fail(f"ordinary located job {raw['title']!r} is rejected")
+
+          leftovers = forbidden_constants(target_node)
+          if leftovers:
+              fail(f"target predicate still references location/description fields: {sorted(leftovers)}")
+          if not forbidden_constants(baseline_node):
+              fail("baseline predicate unexpectedly has no location/description reference")
+
+          print("INCIDENT_PREDICATE_BEHAVIOR_VERIFIED")
+          BEHAVIOR_PY
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies from the exact incident source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run incident regression tests from the exact incident source
+        # These are the tests AT 259c507 (the only tree checked out) --
+        # never tests from current main run against old source.
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m pytest -p no:cacheprovider \
+            tests/test_collector_outcomes.py \
+            -q
+          # Named incident regressions: pytest exits non-zero if any node
+          # id is missing, so these cannot be silently skipped/renamed.
+          PYTHONPATH=. python -m pytest -p no:cacheprovider \
+            "tests/test_collector_outcomes.py::test_legitimate_job_missing_location_and_description_is_not_a_header_artifact" \
+            "tests/test_collector_outcomes.py::test_legitimate_job_missing_location_and_description_reaches_insert_path" \
+            "tests/test_collector_outcomes.py::test_genuine_header_style_titles_are_still_filtered" \
+            "tests/test_collector_outcomes.py::test_legitimate_job_missing_location_and_description_does_not_increment_header_artifact_counter" \
+            -v
+
+  build-and-push:
+    name: Build and push incident image
+    needs: verify-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Require exact confirmation token and dispatch from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${CONFIRMATION:-}" != "BUILD_259C507_INCIDENT_IMAGE" ]; then
+            echo "ERROR: confirmation input must be exactly BUILD_259C507_INCIDENT_IMAGE" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
+            echo "ERROR: this workflow may only be dispatched from refs/heads/main (got '${GITHUB_REF:-}')" >&2
+            exit 1
+          fi
+          if [ "$INCIDENT_IMAGE_TAG" != "incident-${TARGET_SOURCE_SHA}" ]; then
+            echo "ERROR: INCIDENT_IMAGE_TAG is not incident-<TARGET_SOURCE_SHA>" >&2
+            exit 1
+          fi
+
+      - name: Checkout exact incident source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-verify exact checkout and build inputs
+        shell: bash
+        env:
+          VERIFIED_TREE_SHA: ${{ needs.verify-source.outputs.source_tree_sha }}
+          VERIFIED_DOCKERFILE_SHA256: ${{ needs.verify-source.outputs.dockerfile_sha256 }}
+          VERIFIED_REQUIREMENTS_SHA256: ${{ needs.verify-source.outputs.requirements_sha256 }}
+          VERIFIED_REQUIREMENTS_PROD_SHA256: ${{ needs.verify-source.outputs.requirements_prod_sha256 }}
+          VERIFIED_DOCKERIGNORE_SHA256: ${{ needs.verify-source.outputs.dockerignore_sha256 }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          if [ "$head_sha" != "$TARGET_SOURCE_SHA" ]; then
+            echo "ERROR: checked-out HEAD is $head_sha, expected exactly $TARGET_SOURCE_SHA" >&2
+            exit 1
+          fi
+          parents="$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
+          if [ "$parents" != "$TARGET_PARENT_SHA" ]; then
+            echo "ERROR: $TARGET_SOURCE_SHA parents are '$parents', expected exactly '$TARGET_PARENT_SHA'" >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "ERROR: checkout worktree is not clean" >&2
+            exit 1
+          fi
+
+          check() {
+            local label="$1" expected="$2" actual="$3"
+            if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+              echo "ERROR: $label '$actual' != verified '$expected'" >&2
+              exit 1
+            fi
+          }
+          check tree "$VERIFIED_TREE_SHA" "$(git rev-parse 'HEAD^{tree}')"
+          check Dockerfile "$VERIFIED_DOCKERFILE_SHA256" "$(sha256sum Dockerfile | awk '{print $1}')"
+          check requirements.txt "$VERIFIED_REQUIREMENTS_SHA256" "$(sha256sum requirements.txt | awk '{print $1}')"
+          check requirements.prod.txt "$VERIFIED_REQUIREMENTS_PROD_SHA256" "$(sha256sum requirements.prod.txt | awk '{print $1}')"
+          check .dockerignore "$VERIFIED_DOCKERIGNORE_SHA256" "$(sha256sum .dockerignore | awk '{print $1}')"
+
+          echo "Build job checkout matches the verify-source job exactly."
+
+      - name: Write registry provenance helper
+        # Stdlib-only (urllib/hashlib/json). Every registry object is
+        # fetched BY DIGEST and re-hashed against the digest its verified
+        # parent declared; HTTP status and Docker-Content-Digest headers
+        # are never trusted alone. Written to RUNNER_TEMP, outside the
+        # build context.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/incident_registry.py" <<'REGISTRY_PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          REGISTRY_HOST = "ghcr.io"
+          REPOSITORY = "mrezamaghouli/jobpulse-api"
+          MAX_BYTES = 10 * 1024 * 1024
+          SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+          INDEX_MEDIA_TYPES = {
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+          }
+          MANIFEST_MEDIA_TYPES = {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }
+          ACCEPT = ",".join(sorted(INDEX_MEDIA_TYPES | MANIFEST_MEDIA_TYPES))
+          ATTESTATION_REFERENCE_TYPE = "attestation-manifest"
+          # Runtime contract: a difference here from the f476 baseline is fatal.
+          FATAL_CONFIG_KEYS = ("Cmd", "Entrypoint", "WorkingDir", "ExposedPorts", "User")
+          SUCCESS_MARKER = "INCIDENT_IMAGE_PROVENANCE_VERIFIED"
+
+
+          class ProvenanceError(Exception):
+              pass
+
+
+          class _NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          def _read_bounded(response):
+              data = response.read(MAX_BYTES + 1)
+              if len(data) > MAX_BYTES:
+                  raise ProvenanceError("registry response exceeds the size bound")
+              return data
+
+
+          class Registry:
+              """Minimal GHCR client: at most one redirect hop, https only,
+              Authorization never forwarded across the hop."""
+
+              def __init__(self, token):
+                  self.token = token
+                  self.opener = urllib.request.build_opener(_NoRedirect)
+
+              def _request(self, url, headers):
+                  request = urllib.request.Request(url, headers=headers)
+                  try:
+                      with self.opener.open(request, timeout=60) as response:
+                          return response.status, _read_bounded(response), None
+                  except urllib.error.HTTPError as error:
+                      if error.code in (301, 302, 303, 307, 308):
+                          return error.code, b"", error.headers.get("Location")
+                      return error.code, b"", None
+
+              def get(self, path):
+                  url = f"https://{REGISTRY_HOST}/v2/{REPOSITORY}/{path}"
+                  headers = {"Authorization": f"Bearer {self.token}", "Accept": ACCEPT}
+                  status, body, location = self._request(url, headers)
+                  if location:
+                      target = urllib.parse.urljoin(url, location)
+                      if urllib.parse.urlparse(target).scheme != "https":
+                          raise ProvenanceError("registry redirect is not https")
+                      status, body, second = self._request(target, {"Accept": ACCEPT})
+                      if second:
+                          raise ProvenanceError("registry issued more than one redirect hop")
+                  return status, body
+
+
+          def pull_token(username, password):
+              credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+              query = urllib.parse.urlencode(
+                  {"service": REGISTRY_HOST, "scope": f"repository:{REPOSITORY}:pull"}
+              )
+              request = urllib.request.Request(
+                  f"https://{REGISTRY_HOST}/token?{query}",
+                  headers={"Authorization": f"Basic {credentials}"},
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  token = json.loads(_read_bounded(response)).get("token")
+              if not token:
+                  raise ProvenanceError("registry did not return a pull token")
+              return token
+
+
+          def sha256_digest(body):
+              return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+          def require_digest(value, context):
+              if not isinstance(value, str) or not SHA256_DIGEST_RE.match(value):
+                  raise ProvenanceError(f"{context}: not a sha256 digest: {value!r}")
+              return value
+
+
+          def parse_json_object(body, context):
+              try:
+                  value = json.loads(body)
+              except ValueError as error:
+                  raise ProvenanceError(f"{context}: invalid JSON ({error})") from None
+              if not isinstance(value, dict):
+                  raise ProvenanceError(f"{context}: expected a JSON object")
+              return value
+
+
+          def fetch_verified(registry, kind, digest):
+              require_digest(digest, kind)
+              status, body = registry.get(f"{kind}/{digest}")
+              if status != 200:
+                  raise ProvenanceError(f"{kind}/{digest}: HTTP {status}")
+              actual = sha256_digest(body)
+              if actual != digest:
+                  raise ProvenanceError(f"{kind}/{digest}: content hashes to {actual}")
+              return body
+
+
+          def select_runtime_manifest(index):
+              """Exactly one linux/amd64 runtime manifest; every other entry
+              must be a Buildx attestation manifest that references it."""
+              if index.get("mediaType") not in INDEX_MEDIA_TYPES:
+                  raise ProvenanceError(f"top-level object is not an image index: {index.get('mediaType')!r}")
+              entries = index.get("manifests")
+              if not isinstance(entries, list) or not entries:
+                  raise ProvenanceError("image index has no manifests")
+
+              runtime, attestations = [], []
+              for entry in entries:
+                  if not isinstance(entry, dict):
+                      raise ProvenanceError("malformed image index entry")
+                  require_digest(entry.get("digest"), "index entry")
+                  annotations = entry.get("annotations") or {}
+                  platform = entry.get("platform") or {}
+                  reference_type = annotations.get("vnd.docker.reference.type")
+                  if reference_type == ATTESTATION_REFERENCE_TYPE:
+                      attestations.append(entry)
+                      continue
+                  if reference_type is not None:
+                      raise ProvenanceError(f"unexpected index reference type {reference_type!r}")
+                  if (
+                      platform.get("os") == "linux"
+                      and platform.get("architecture") == "amd64"
+                      and not platform.get("variant")
+                      and entry.get("mediaType") in MANIFEST_MEDIA_TYPES
+                  ):
+                      runtime.append(entry)
+                      continue
+                  raise ProvenanceError(f"unexpected image index entry for platform {platform!r}")
+
+              if len(runtime) != 1:
+                  raise ProvenanceError(f"expected exactly one linux/amd64 runtime manifest, found {len(runtime)}")
+              selected = runtime[0]
+              for attestation in attestations:
+                  referenced = (attestation.get("annotations") or {}).get("vnd.docker.reference.digest")
+                  if referenced != selected["digest"]:
+                      raise ProvenanceError("attestation manifest does not reference the runtime manifest")
+              return selected, attestations
+
+
+          def describe_image(registry, index_digest):
+              index = parse_json_object(fetch_verified(registry, "manifests", index_digest), "index")
+              selected, attestations = select_runtime_manifest(index)
+
+              manifest = parse_json_object(
+                  fetch_verified(registry, "manifests", selected["digest"]), "runtime manifest"
+              )
+              if manifest.get("mediaType", selected["mediaType"]) not in MANIFEST_MEDIA_TYPES:
+                  raise ProvenanceError("runtime manifest has an unexpected media type")
+              config_descriptor = manifest.get("config")
+              layers = manifest.get("layers")
+              if not isinstance(config_descriptor, dict) or not isinstance(layers, list) or not layers:
+                  raise ProvenanceError("runtime manifest is missing config or layers")
+              config_digest = require_digest(config_descriptor.get("digest"), "config")
+
+              config = parse_json_object(fetch_verified(registry, "blobs", config_digest), "image config")
+              if config.get("os") != "linux" or config.get("architecture") != "amd64":
+                  raise ProvenanceError("image config is not linux/amd64")
+              container_config = config.get("config") or {}
+              rootfs = config.get("rootfs") or {}
+
+              return {
+                  "index_digest": index_digest,
+                  "runtime_manifest_digest": selected["digest"],
+                  "attestation_manifest_digests": [entry["digest"] for entry in attestations],
+                  "config_digest": config_digest,
+                  "os": config["os"],
+                  "architecture": config["architecture"],
+                  "created": config.get("created"),
+                  "layer_digests": [layer.get("digest") for layer in layers],
+                  "diff_ids": list(rootfs.get("diff_ids") or []),
+                  "container_config": {
+                      key: container_config.get(key)
+                      for key in FATAL_CONFIG_KEYS + ("Env", "Labels")
+                  },
+              }
+
+
+          def _env_map(env):
+              result = {}
+              for item in env or []:
+                  key, _, value = item.partition("=")
+                  result[key] = value
+              return result
+
+
+          def compare_images(target, baseline):
+              fatal, informational = [], []
+              for key in FATAL_CONFIG_KEYS:
+                  if target["container_config"][key] != baseline["container_config"][key]:
+                      fatal.append({
+                          "field": key,
+                          "baseline": baseline["container_config"][key],
+                          "target": target["container_config"][key],
+                      })
+
+              target_env = _env_map(target["container_config"]["Env"])
+              baseline_env = _env_map(baseline["container_config"]["Env"])
+              for key in sorted(set(target_env) | set(baseline_env)):
+                  if target_env.get(key) != baseline_env.get(key):
+                      informational.append({
+                          "field": f"Env.{key}",
+                          "baseline": baseline_env.get(key),
+                          "target": target_env.get(key),
+                      })
+
+              if target["container_config"]["Labels"] != baseline["container_config"]["Labels"]:
+                  informational.append({
+                      "field": "Labels",
+                      "baseline": baseline["container_config"]["Labels"],
+                      "target": target["container_config"]["Labels"],
+                  })
+
+              shared = 0
+              for target_id, baseline_id in zip(target["diff_ids"], baseline["diff_ids"]):
+                  if target_id != baseline_id:
+                      break
+                  shared += 1
+
+              return {
+                  "fatal_differences": fatal,
+                  "informational_differences": informational,
+                  "baseline_layer_count": len(baseline["diff_ids"]),
+                  "target_layer_count": len(target["diff_ids"]),
+                  "identical_leading_layers": shared,
+                  "byte_identical_to_baseline": target["config_digest"] == baseline["config_digest"],
+                  "baseline_created": baseline["created"],
+                  "target_created": target["created"],
+              }
+
+
+          def check_tag_absent(registry, tag):
+              status, _ = registry.get(f"manifests/{tag}")
+              if status == 404:
+                  return
+              if status == 200:
+                  raise ProvenanceError(f"tag {tag} already exists in {REPOSITORY}; refusing to overwrite")
+              raise ProvenanceError(f"could not prove tag {tag} is absent (HTTP {status})")
+
+
+          def verify_tag_resolves(registry, tag, index_digest):
+              status, body = registry.get(f"manifests/{tag}")
+              if status != 200:
+                  raise ProvenanceError(f"tag {tag}: HTTP {status}")
+              actual = sha256_digest(body)
+              if actual != index_digest:
+                  raise ProvenanceError(f"tag {tag} resolves to {actual}, not the built digest {index_digest}")
+
+
+          def build_provenance(registry, env):
+              source_sha = env["TARGET_SOURCE_SHA"]
+              parent_sha = env["TARGET_PARENT_SHA"]
+              tag = env["INCIDENT_IMAGE_TAG"]
+              if tag != f"incident-{source_sha}":
+                  raise ProvenanceError("incident tag is not incident-<TARGET_SOURCE_SHA>")
+              index_digest = require_digest(env.get("BUILT_INDEX_DIGEST"), "built index digest")
+              baseline_digest = require_digest(env["BASELINE_INDEX_DIGEST"], "baseline index digest")
+              if index_digest == baseline_digest:
+                  raise ProvenanceError("built digest equals the f476 baseline digest")
+
+              verify_tag_resolves(registry, tag, index_digest)
+              target = describe_image(registry, index_digest)
+              labels = target["container_config"]["Labels"] or {}
+              if labels.get("org.opencontainers.image.revision") != source_sha:
+                  raise ProvenanceError("image revision label does not match the source commit")
+              if labels.get("io.jobpulse.incident.parent") != parent_sha:
+                  raise ProvenanceError("image parent label does not match the source parent")
+
+              baseline = describe_image(registry, baseline_digest)
+              comparison = compare_images(target, baseline)
+              if comparison["fatal_differences"]:
+                  raise ProvenanceError(
+                      "runtime contract differs from f476: "
+                      + json.dumps(comparison["fatal_differences"], sort_keys=True)
+                  )
+
+              repository = env["IMAGE_REPOSITORY"]
+              return {
+                  "source_commit": source_sha,
+                  "source_parent": parent_sha,
+                  "source_tree": env["SOURCE_TREE_SHA"],
+                  "collector_postgres_blob": env["COLLECTOR_BLOB_SHA"],
+                  "dockerfile_sha256": env["DOCKERFILE_SHA256"],
+                  "requirements_txt_sha256": env["REQUIREMENTS_SHA256"],
+                  "requirements_prod_txt_sha256": env["REQUIREMENTS_PROD_SHA256"],
+                  "dockerignore_sha256": env["DOCKERIGNORE_SHA256"],
+                  "image_tag_reference": f"{repository}:{tag}",
+                  "image_digest_reference": f"{repository}@{index_digest}",
+                  "oci_index_digest": index_digest,
+                  "linux_amd64_manifest_digest": target["runtime_manifest_digest"],
+                  "attestation_manifest_digests": target["attestation_manifest_digests"],
+                  "image_config_digest": target["config_digest"],
+                  "image_id_note": (
+                      "Docker's image ID is the OCI index digest under the containerd image "
+                      "store and the image config digest under the classic image store."
+                  ),
+                  "buildx_reported_image_id": env.get("BUILT_IMAGE_ID") or None,
+                  "layer_digests": target["layer_digests"],
+                  "container_config": target["container_config"],
+                  "build_run_id": env.get("GITHUB_RUN_ID"),
+                  "reproducibility": (
+                      "Fresh build of the exact source tree with floating base image and "
+                      "unpinned dependencies. NOT claimed to be byte-identical to the "
+                      "historical f476 image plus one changed file."
+                  ),
+                  "baseline": {
+                      "commit": parent_sha,
+                      "oci_index_digest": baseline["index_digest"],
+                      "linux_amd64_manifest_digest": baseline["runtime_manifest_digest"],
+                      "image_config_digest": baseline["config_digest"],
+                  },
+                  "comparison_with_f476": comparison,
+                  "deployment_authorized": False,
+              }
+
+
+          def main(argv):
+              if len(argv) != 2 or argv[1] not in ("check-tag-absent", "verify"):
+                  raise ProvenanceError("usage: incident_registry.py check-tag-absent|verify")
+              env = os.environ
+              registry = Registry(pull_token(env["GHCR_USERNAME"], env["GHCR_PASSWORD"]))
+              if argv[1] == "check-tag-absent":
+                  check_tag_absent(registry, env["INCIDENT_IMAGE_TAG"])
+                  print(f"Tag {env['INCIDENT_IMAGE_TAG']} is absent; safe to push once.")
+                  return 0
+              provenance = build_provenance(registry, env)
+              with open(env["PROVENANCE_PATH"], "w", encoding="utf-8") as handle:
+                  json.dump(provenance, handle, indent=2, sort_keys=True)
+                  handle.write("\n")
+              print(json.dumps(provenance, indent=2, sort_keys=True))
+              print(SUCCESS_MARKER)
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main(sys.argv))
+              except ProvenanceError as error:
+                  print(f"PROVENANCE_ERROR: {error}", file=sys.stderr)
+                  sys.exit(1)
+          REGISTRY_PY
+
+      - name: Refuse to overwrite an existing incident tag
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/incident_registry.py" check-tag-absent
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push incident image (linux/amd64 only)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          # Exactly one tag. Never :main, :latest, or any raw commit SHA.
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ env.INCIDENT_IMAGE_TAG }}
+          # No shared GHA cache: this artifact must not reuse or poison
+          # the main build's cache.
+          no-cache: true
+          pull: true
+          provenance: mode=min
+          sbom: false
+          labels: |
+            org.opencontainers.image.revision=${{ env.TARGET_SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/mrezamaghouli/jobpulse-api
+            io.jobpulse.incident.parent=${{ env.TARGET_PARENT_SHA }}
+            io.jobpulse.incident.purpose=linkedin-header-artifact-false-positive-fix
+            io.jobpulse.incident.build-run-id=${{ github.run_id }}
+
+      - name: Verify pushed image provenance and compare with f476
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          BUILT_INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILT_IMAGE_ID: ${{ steps.build.outputs.imageid }}
+          SOURCE_TREE_SHA: ${{ needs.verify-source.outputs.source_tree_sha }}
+          COLLECTOR_BLOB_SHA: ${{ needs.verify-source.outputs.collector_blob_sha }}
+          DOCKERFILE_SHA256: ${{ needs.verify-source.outputs.dockerfile_sha256 }}
+          REQUIREMENTS_SHA256: ${{ needs.verify-source.outputs.requirements_sha256 }}
+          REQUIREMENTS_PROD_SHA256: ${{ needs.verify-source.outputs.requirements_prod_sha256 }}
+          DOCKERIGNORE_SHA256: ${{ needs.verify-source.outputs.dockerignore_sha256 }}
+        run: |
+          set -euo pipefail
+          export PROVENANCE_PATH="$RUNNER_TEMP/incident-259c507-image-provenance.json"
+          python3 "$RUNNER_TEMP/incident_registry.py" verify
+          {
+            echo "## Incident 259c507 image provenance"
+            echo
+            echo "Building this image does NOT authorize deploying it."
+            echo "This is a fresh build; it is NOT claimed to be byte-identical to the historical f476 image."
+            echo
+            echo '```json'
+            cat "$PROVENANCE_PATH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload provenance record
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-259c507-image-provenance
+          path: ${{ runner.temp }}/incident-259c507-image-provenance.json
+          if-no-files-found: error
