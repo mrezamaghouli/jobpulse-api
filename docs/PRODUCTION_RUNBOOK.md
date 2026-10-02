@@ -4021,3 +4021,152 @@ by digest, with its own preflight/validation/rollback) is a separate,
 later, reviewed change and a separately authorized operation. **Phase 4M
 remains paused**: neither the reference-normalization runner nor its
 read-only verifier is part of this remediation.
+
+## Incident 259c507: API-only deployment runner
+
+**Root cause.** Production collection at f476 discarded legitimate LinkedIn
+jobs. `is_invalid_linkedin_search_header_job()` treated
+`location == "Unknown Location"` plus an empty description as
+header-artifact evidence. The fix,
+`259c507e10def1cae5a4f10cd718811981233f0d`, has f476 as its only parent.
+It changes only `scripts/collector_postgres.py` (plus tests).
+
+**Why the API container is what changes.** Cron runs
+`scripts/run_collection_cycle_safe.sh` from the host checkout. The wrapper
+runs every collection step inside the API container (`docker compose
+exec -T api ...`):
+
+- `linkedin_auth_preflight`
+- `seed_priority_coverage_queue`
+- `process_search_demand_queue` (which calls `linkedin_plan_collect` and
+  `collector_postgres`)
+- `reconcile_priority_coverage`
+
+So the fix only takes effect when the API container runs an image built
+from 259c507. Production git stays at f476.
+
+**Verified artifact.** Build run `36858099909` produced:
+
+- `ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4`
+- tag `incident-259c507e10def1cae5a4f10cd718811981233f0d`
+- linux/amd64 manifest `sha256:24d18483e82bac1932bf4ddd6eaf3d1f7cca321e0247bba6fe06220e09e07316`
+- config `sha256:b905231fe790bc21c12c89303986c76a94c329b5d1b53b54d49265a62b08d1f7`
+
+It is a fresh build, not byte-identical to f476 plus one file.
+
+**Why current main / b63cb54 / 370562b / `:main` are excluded.** main
+also carries the Phase 4B LinkedIn poster-profile provider and frontend
+change. That change failed its Phase 4E rollout and is not part of this
+remediation. Deploying `:main`, a main-commit image, or `deploy.yml`
+(which resets production git to `origin/main`) is out of scope. The
+runner proves `scripts/providers/linkedin_browser_provider.py`,
+`frontend/index.html`, and `docker-compose.prod.yml` are byte-identical
+between f476 and 259c507. It also checks the provider inside the running
+container before and after deployment.
+
+**Runner.** `.github/workflows/production-incident-259c507-deploy.yml`
+is manual `workflow_dispatch` only and must be run from `main`. It
+requires the exact confirmation token `DEPLOY_259C507_INCIDENT_IMAGE`. It
+has no image, SHA, or target input, and every value above is hard-pinned.
+**Building the artifact did not authorize deployment**: dispatching this
+runner is a separate, explicit decision.
+
+**Preconditions (all fail closed, before any mutation):**
+
+1. **Runner side, before SSH:**
+   - The source pins are checked as git objects: 259c507's sole parent is
+     f476, and it is merged into main.
+   - The GHCR chain is re-hashed at every hop: tag → index → the single
+     linux/amd64 manifest → config. All three digests must match the pins.
+   - The config's revision, parent, purpose, and build-run-id labels must
+     match exactly.
+   - The f476 baseline chain must match: index `sha256:7739628f…b753`,
+     manifest `sha256:75207004…0907`, config `sha256:fd9f1eed…9801`.
+   - The runtime contract must be identical to f476, and so must any
+     transport/Tor/proxy image Env keys.
+2. **Production git and compose:** HEAD is exactly f476, the tracked
+   tree is clean, and the compose file matches f476. The compose project
+   must be `jobpulse` at `/opt/jobpulse/docker-compose.prod.yml`.
+3. **API runtime identity:**
+   - The running image ID must be the f476 index digest. This is decided
+     by bytes, not by reference text.
+   - `Config.Image` may be the Phase 4E rollback alias
+     `jobpulse-api-rollback:bccbbd997ee8-1427495` or the canonical f476
+     tag. Any other value fails.
+   - The container must be running and healthy with restart count 0.
+     `/health` must return `status=ok` and `database=connected` on both the
+     direct and nginx paths.
+   - The in-container collector and provider must be the f476 versions.
+4. **Transport:** `SEARCH_TRANSPORT` is unset (the documented direct
+   default) or `direct`, and `TOR_ENABLED=false`. This is checked in the
+   running container and in the effective Compose config.
+5. **Other services:** DB (healthy), frontend, and Tor (running, no
+   published ports) are captured by Id, image, restart count, health,
+   and StartedAt. The live frontend must serve the f476 bytes.
+6. **Scheduler and collection:**
+   - The canonical cron launcher is proven with the Phase 4M provenance
+     section, verbatim.
+   - The outer `/tmp/jobpulse_collection_cycle.lock` and the internal
+     `state/run_collection_cycle.lock` are held for the whole run, so a
+     cron cycle skips.
+   - No collector process may be running.
+   - A shared concurrency group prevents overlap with other API-mutating
+     runners.
+7. **Inputs:** the effective current and candidate Compose configs must
+   differ only in the image reference. The running env must equal the
+   f476 image defaults overlaid by the Compose env.
+8. **Candidate on host:** production pulls only by digest. The pulled
+   image ID and labels must match.
+9. **Rollback prepared, immediately before mutation:** the f476 image
+   object is present by ID, the pre-deployment reference still resolves
+   to it, and the drift snapshots are recorded.
+
+**Mutation.** The runner does exactly one thing:
+`JOBPULSE_API_IMAGE=<incident digest ref> docker compose -p jobpulse -f
+/opt/jobpulse/docker-compose.prod.yml up -d --no-build --no-deps
+--force-recreate api`.
+
+It never touches git, DB, frontend, Tor, cron, env files, or secrets, and
+never takes a Phase 4M action.
+
+**Post-deploy verification:**
+
+- Phase 4L-style bounded convergence: all conditions must hold in the
+  same iteration, with both an attempt ceiling and a wall-clock deadline.
+- A new container ID, restart count 0, and `StartedAt` unchanged over a
+  stability window.
+- The image ID equals the incident index digest, and the incident labels
+  are present.
+- The in-container collector is 259c507's, and the provider is still
+  f476's (no Phase 4B).
+- `get_search_transport_mode()` returns `direct` and `TOR_ENABLED=false`.
+- The env equals the incident image defaults overlaid by the unchanged
+  Compose env.
+- DB, frontend, Tor, the live frontend bytes, git (f476), and the
+  scheduler fingerprint are unchanged.
+
+Success prints `INCIDENT_259C507_API_DEPLOYED`.
+
+**Rollback.** Any failure after the mutation marker triggers exactly one
+API-only rollback:
+
+1. It re-checks compose, config, and env for drift.
+2. It re-points the exact pre-deployment reference at the f476 image ID.
+3. It recreates only the API.
+4. It verifies the result with the same bounded convergence: f476 image
+   ID, pre-deployment reference, f476 collector, exact pre-deployment env
+   hash, and unchanged DB, frontend, Tor, and git.
+
+The run still fails and reports one of:
+
+- `INCIDENT_DEPLOY_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED`
+- `INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED`,
+  plus a read-only API classification decided by image ID.
+
+Rollback never touches git.
+
+**Deployment does not authorize a collection run.** The runner never runs a
+collection cycle, a collector or queue script, or a LinkedIn request.
+Collection verification on the new image is the next, separately
+authorized task. **Phase 4M remains paused**: no normalization and no
+read-only verifier dispatch.
