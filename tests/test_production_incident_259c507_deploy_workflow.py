@@ -53,6 +53,7 @@ INCIDENT_PURPOSE_LABEL = "linkedin-header-artifact-false-positive-fix"
 INCIDENT_IMAGE_DIGEST_REFERENCE = f"ghcr.io/mrezamaghouli/jobpulse-api@{INCIDENT_IMAGE_INDEX_DIGEST}"
 KNOWN_F476_ROLLBACK_ALIAS = "jobpulse-api-rollback:bccbbd997ee8-1427495"
 CANONICAL_F476_REFERENCE = "ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+F476_IMAGE_DIGEST_REFERENCE = f"ghcr.io/mrezamaghouli/jobpulse-api@{'sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753'}"
 MAIN_B63_SHA = "b63cb54d64832c0ba47df4ebbef944995f285cca"
 MAIN_370_SHA = "370562b6ac241aa4530f3cd2ad2299c3cb73b06f"
 
@@ -248,6 +249,7 @@ PINS = {
     "EXPECTED_F476_AMD64_MANIFEST_DIGEST": EXPECTED_F476_AMD64_MANIFEST_DIGEST,
     "EXPECTED_F476_CONFIG_DIGEST": EXPECTED_F476_CONFIG_DIGEST,
     "INCIDENT_PURPOSE_LABEL": INCIDENT_PURPOSE_LABEL,
+    "F476_IMAGE_DIGEST_REFERENCE": F476_IMAGE_DIGEST_REFERENCE,
 }
 ENV_ONLY_PINS = {
     "TARGET_PARENT_SHA": EXPECTED_PRODUCTION_GIT_SHA,
@@ -331,7 +333,10 @@ def test_other_production_workflows_untouched_vs_main(path):
 def test_production_never_pulls_or_deploys_by_tag(remote_script):
     code = _code_only(remote_script)
     pulls = [line.strip() for line in code.splitlines() if re.search(r"\bdocker pull\b", line)]
-    assert pulls == ['DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$INCIDENT_IMAGE_DIGEST_REFERENCE"']
+    assert pulls == [
+        'DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$INCIDENT_IMAGE_DIGEST_REFERENCE"',
+        'DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$F476_IMAGE_DIGEST_REFERENCE" || fail "could not pull the f476 rollback artifact $F476_IMAGE_DIGEST_REFERENCE -- rollback cannot be prepared, no mutation"',
+    ]
     assert "$INCIDENT_IMAGE_REFERENCE" not in code
 
 
@@ -384,7 +389,8 @@ def _run_derive(steps, clone, tmp_path, **env_overrides):
     github_env.write_text("")
     env = dict(os.environ, GITHUB_ENV=str(github_env), TARGET_SOURCE_SHA=TARGET_SOURCE_SHA,
                EXPECTED_PRODUCTION_GIT_SHA=EXPECTED_PRODUCTION_GIT_SHA, TARGET_PARENT_SHA=EXPECTED_PRODUCTION_GIT_SHA,
-               INCIDENT_IMAGE=INCIDENT_IMAGE_DIGEST_REFERENCE, INCIDENT_IMAGE_INDEX_DIGEST=INCIDENT_IMAGE_INDEX_DIGEST)
+               INCIDENT_IMAGE=INCIDENT_IMAGE_DIGEST_REFERENCE, INCIDENT_IMAGE_INDEX_DIGEST=INCIDENT_IMAGE_INDEX_DIGEST,
+               F476_IMAGE_DIGEST_REFERENCE=F476_IMAGE_DIGEST_REFERENCE, EXPECTED_F476_IMAGE_ID=EXPECTED_F476_IMAGE_ID)
     env.update(env_overrides)
     result = sp.run(["bash", "-c", script], cwd=clone, env=env, capture_output=True, text=True)
     return result, github_env.read_text()
@@ -400,6 +406,13 @@ def test_derive_step_on_real_commits(steps, derive_clone, tmp_path):
     assert values["INCIDENT_COLLECTOR_SHA256"] == hashlib.sha256(show(f"{TARGET_SOURCE_SHA}:scripts/collector_postgres.py")).hexdigest()
     assert values["F476_COLLECTOR_SHA256"] != values["INCIDENT_COLLECTOR_SHA256"]
     assert values["F476_PROVIDER_SHA256"] == hashlib.sha256(show(f"{TARGET_SOURCE_SHA}:scripts/providers/linkedin_browser_provider.py")).hexdigest()
+
+
+def test_derive_step_rejects_inconsistent_f476_digest_pin(steps, derive_clone, tmp_path):
+    result, exported = _run_derive(steps, derive_clone, tmp_path,
+                                   F476_IMAGE_DIGEST_REFERENCE="ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147")
+    assert result.returncode != 0 and exported == ""
+    assert "F476_IMAGE_DIGEST_REFERENCE" in result.stderr
 
 
 def test_derive_step_rejects_inconsistent_image_pin(steps, derive_clone, tmp_path):
@@ -664,7 +677,7 @@ def test_known_rollback_alias_accepted_only_by_image_id(remote_script):
 def test_exactly_two_api_compose_up_sites(remote_script):
     ups = [line.strip() for line in _code_only(remote_script).splitlines() if re.search(r"docker compose .*\bup\b", line)]
     assert len(ups) == 2, ups
-    assert ups[0].startswith('JOBPULSE_API_IMAGE="$API_CONFIG_IMAGE_BEFORE" docker compose')  # rollback (function defined first)
+    assert ups[0].startswith('JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose')  # rollback (function defined first)
     assert ups[1] == ('JOBPULSE_API_IMAGE="$INCIDENT_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" '
                       '-f "$COMPOSE_FILE" up -d --no-build --no-deps --force-recreate api')
     for up in ups:
@@ -684,10 +697,60 @@ def test_no_db_frontend_tor_or_other_container_mutation(remote_script, pattern):
     assert not re.search(pattern, _code_only(remote_script), re.MULTILINE), pattern
 
 
-def test_docker_tag_only_restores_the_f476_rollback_reference(remote_script):
-    tags = [line.strip() for line in _code_only(remote_script).splitlines() if re.search(r"\bdocker tag\b", line)]
-    assert tags == ['docker tag "$EXPECTED_F476_IMAGE_ID" "$API_CONFIG_IMAGE_BEFORE" || {']
-    assert "docker tag" in _extract_bash_function(remote_script, "rollback_api")
+def test_no_tagging_and_no_image_removal_anywhere(remote_script):
+    """K: the runner never tags (the vanished alias is not recreated) and
+    never removes an image, so the f476 rollback artifact stays locally
+    available after the run for operator recovery."""
+    code = _code_only(remote_script)
+    for forbidden in (r"\bdocker tag\b", r"\bdocker rmi\b", r"\bdocker image (rm|remove|prune)\b", r"\bdocker (system|builder) prune\b"):
+        assert not re.search(forbidden, code), forbidden
+    trap = _extract_bash_function(remote_script, "final_exit_trap")
+    assert "F476_IMAGE_DIGEST_REFERENCE" not in trap and "INCIDENT_IMAGE_DIGEST_REFERENCE" not in trap
+
+
+def test_f476_rollback_artifact_pinned_by_digest_and_pulled_only_by_digest(remote_script):
+    """B: the rollback artifact is the constant f476 digest reference; it is
+    pulled only by that digest, after the incident pull, and never by tag."""
+    assert f'F476_IMAGE_DIGEST_REFERENCE="{F476_IMAGE_DIGEST_REFERENCE}"' in remote_script
+    code = _code_only(remote_script)
+    assert code.count('docker pull "$F476_IMAGE_DIGEST_REFERENCE"') == 1
+    assert '"$CANONICAL_F476_REFERENCE"' not in code.replace('"$CANONICAL_F476_REFERENCE")', "")
+    assert 'docker pull "$KNOWN_F476_ROLLBACK_ALIAS"' not in code and 'docker pull "$API_CONFIG_IMAGE_BEFORE"' not in code
+
+
+def test_old_alias_is_never_required_to_resolve_or_used_for_rollback(remote_script):
+    """F/H: Config.Image is observational only."""
+    code = _code_only(remote_script)
+    assert 'docker image inspect "$API_CONFIG_IMAGE_BEFORE"' not in code
+    assert 'JOBPULSE_API_IMAGE="$API_CONFIG_IMAGE_BEFORE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up' not in code
+    func = _extract_bash_function(remote_script, "rollback_api")
+    assert "API_CONFIG_IMAGE_BEFORE" not in _code_only(func).replace('pre-deployment Config.Image was $API_CONFIG_IMAGE_BEFORE', "")
+
+
+def test_f476_pull_follows_identity_and_idle_checks_and_precedes_mutation(remote_script):
+    """G + ordering: the running API's f476 identity, runtime source,
+    transport, health, scheduler and idle checks all happen before the f476
+    pull, and the pull (plus its ID/platform verification) precedes the
+    deploy-inputs proof and the mutation marker."""
+    body = _main_body(remote_script)
+    pull = body.index('docker pull "$F476_IMAGE_DIGEST_REFERENCE"')
+    for earlier in ('[ "$API_IMAGE_ID_BEFORE" = "$EXPECTED_F476_IMAGE_ID" ]', '[ "$COLLECTOR_SHA_BEFORE" = "$F476_COLLECTOR_SHA256" ]',
+                    '[ "$PROVIDER_SHA_BEFORE" = "$F476_PROVIDER_SHA256" ]', '[ "$TOR_ENABLED_BEFORE" = "false" ]',
+                    "own_crontab_provenance=confirmed_canonical_launcher", 'flock -n "$INTERNAL_LOCK_FD"',
+                    '[ "$ACTIVE_COLLECTOR" = "no" ]', 'docker pull "$INCIDENT_IMAGE_DIGEST_REFERENCE"'):
+        assert body.index(earlier) < pull, earlier
+    for later in ('[ "$F476_PULLED_ID" = "$EXPECTED_F476_IMAGE_ID" ]', '[ "$F476_PULLED_PLATFORM" = "linux/amd64" ]',
+                  '[ "$F476_PULLED_ID" = "$API_IMAGE_ID_BEFORE" ]'):
+        assert pull < body.index(later) < body.index("prove_deploy_inputs") < body.index("API_MUTATION_STARTED=true"), later
+
+
+def test_runner_side_f476_chain_verification_precedes_production_pull(steps):
+    """The f476 GHCR chain (index -> amd64 manifest -> config) is verified by
+    the runner in a step that strictly precedes the SSH/deploy step."""
+    verify_idx = _step_index(steps, "Verify incident image digest chain on GHCR (tag -> index -> amd64 manifest -> config -> labels)")
+    assert verify_idx < _step_index(steps, DEPLOY_STEP)
+    source = _heredoc(_step(steps, REGISTRY_STEP)["run"], "REGISTRY_PY")
+    assert "f476 = describe_image(registry, F476_INDEX_DIGEST)" in source
 
 
 @pytest.mark.parametrize("verb", ["reset", "checkout", "switch", "pull", "merge", "clean", "stash", "fetch", "commit", "push", "rebase", "restore", "am", "apply"])
@@ -745,7 +808,6 @@ def test_no_normalization_or_phase4m_or_dispatch(workflow_text, remote_script):
     # never a deploy/normalization target.
     remote_code = _code_only(remote_script)
     assert 'JOBPULSE_API_IMAGE="$CANONICAL_F476_REFERENCE"' not in remote_code
-    assert 'docker tag "$EXPECTED_F476_IMAGE_ID" "$CANONICAL_F476_REFERENCE"' not in remote_code
     assert remote_code.count("$CANONICAL_F476_REFERENCE") == 1
 
 
@@ -776,7 +838,7 @@ def test_mutation_marker_set_once_immediately_before_candidate_up(remote_script)
         '[ "$ACTUAL_COMPOSE_SHA256" = "$COMPOSE_SHA256" ]',
         '[ "$API_IMAGE_ID_BEFORE" = "$EXPECTED_F476_IMAGE_ID" ]',
         '[ "$API_HEALTH_BEFORE" = "healthy" ]',
-        '[ "$ROLLBACK_REFERENCE_IMAGE_ID" = "$EXPECTED_F476_IMAGE_ID" ]',
+        '[ "$F476_PULLED_ID" = "$EXPECTED_F476_IMAGE_ID" ]',
         '[ "$TOR_ENABLED_BEFORE" = "false" ]',
         '[ "$COLLECTOR_SHA_BEFORE" = "$F476_COLLECTOR_SHA256" ]',
         '[ "$PROVIDER_SHA_BEFORE" = "$F476_PROVIDER_SHA256" ]',
@@ -874,7 +936,7 @@ def test_rollback_only_from_exit_trap_after_mutation(remote_script):
 
 def test_rollback_refuses_unless_prepared_before_mutation(remote_script):
     func = _extract_bash_function(remote_script, "rollback_api")
-    assert func.index('[ "$ROLLBACK_PREPARED" != "true" ]') < func.index("docker tag")
+    assert func.index('[ "$ROLLBACK_PREPARED" != "true" ]') < func.index("docker compose")
     code = _code_only(remote_script)
     assert code.count("ROLLBACK_PREPARED=true") == 1
     body = _main_body(remote_script)
@@ -883,9 +945,11 @@ def test_rollback_refuses_unless_prepared_before_mutation(remote_script):
 
 def test_rollback_restores_exact_prestate_reference_and_image(remote_script):
     func = _extract_bash_function(remote_script, "rollback_api")
-    assert 'docker tag "$EXPECTED_F476_IMAGE_ID" "$API_CONFIG_IMAGE_BEFORE"' in func
-    assert 'JOBPULSE_API_IMAGE="$API_CONFIG_IMAGE_BEFORE" docker compose' in func
-    assert 'wait_for_api_convergence "$API_CONFIG_IMAGE_BEFORE" "$EXPECTED_F476_IMAGE_ID"' in func
+    assert 'JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose' in func
+    assert 'wait_for_api_convergence "$F476_IMAGE_DIGEST_REFERENCE" "$EXPECTED_F476_IMAGE_ID"' in func
+    assert '"$rb_provider_sha" != "$F476_PROVIDER_SHA256"' in func
+    assert '"$(scheduler_fingerprint)" != "$SCHEDULER_FINGERPRINT_BEFORE"' in func
+    assert func.index('rb_local_id="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE"') < func.index('JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up')
     assert '"$rb_collector_sha" != "$F476_COLLECTOR_SHA256"' in func
     assert '"$ACTUAL_RUNTIME_ENV_SHA256" != "$FINAL_EXPECTED_CURRENT_ENV_SHA256"' in func
     assert "verify_other_services_unchanged" in func and "verify_git_unchanged" in func
@@ -894,8 +958,8 @@ def test_rollback_restores_exact_prestate_reference_and_image(remote_script):
 
 def test_rollback_input_drift_guards_precede_recreation(remote_script):
     func = _extract_bash_function(remote_script, "rollback_api")
-    tag_idx = func.index("docker tag")
-    for needle in ('!= "$COMPOSE_SHA256"', '!= "$FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256"',
+    tag_idx = func.index('JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up')
+    for needle in ('!= "$COMPOSE_SHA256"', '!= "$FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256"',
                    '"$EXPECTED_RUNTIME_ENV_SHA256" != "$FINAL_EXPECTED_CURRENT_ENV_SHA256"'):
         assert func.index(needle) < tag_idx
 
@@ -1000,13 +1064,17 @@ class Scenario:
             api_restart_before="0",
             api_running_before="true",
             api_health_before="healthy",
-            before_ref_local_id=EXPECTED_F476_IMAGE_ID,
             health_body_before=HEALTH_OK,
             search_transport_before="",
             tor_enabled_before="false",
             collector_before=F476_COLLECTOR,
             provider_before=F476_PROVIDER,
-            f476_image_local=True,
+            # Production reality (2026-10-02): no local f476 image object at start.
+            f476_local_at_start=False,
+            f476_pull_exit=0,
+            f476_pulled_id=EXPECTED_F476_IMAGE_ID,
+            f476_pulled_platform="linux/amd64",
+            f476_vanishes_before_rollback=False,
             runtime_env_extra_before=None,
             db_state="d" * 64 + "|sha256:db|0|true|healthy|2026-09-01T00:00:00Z|postgres:16-alpine",
             frontend_state="f" * 64 + "|sha256:fe|0|true|none|2026-09-01T00:00:00Z|nginx:alpine",
@@ -1036,7 +1104,8 @@ class Scenario:
             candidate_tor_enabled="false",
             candidate_env_extra=None,
             rollback_up_exit=0,
-            rollback_tag_exit=0,
+            rollback_provider=F476_PROVIDER,
+            rollback_config_image=F476_IMAGE_DIGEST_REFERENCE,
             rollback_sequence=(dict(running="true", health="healthy", image=EXPECTED_F476_IMAGE_ID, direct=True, nginx=True),),
             rollback_collector=F476_COLLECTOR,
         )
@@ -1048,7 +1117,7 @@ class Scenario:
             self.mount_line = f"bind|{self.root}/frontend|false"
         self.candidate_marker = tmp_path / "candidate_up"
         self.rollback_marker = tmp_path / "rollback_up"
-        self.tag_marker = tmp_path / "tagged"
+        self.f476_pulled_marker = tmp_path / "f476_pulled"
 
     q = staticmethod(lambda v: shlex.quote(str(v)))
 
@@ -1173,7 +1242,7 @@ api_state() {{
       local r_dir={q(self.tmp / "candidate_restart")} r_max r_idx
       r_max=$(ls "$r_dir" | sort -n | tail -1); r_idx=$(cat "$ROUND_FILE"); [ "$r_idx" -gt "$r_max" ] && r_idx=$r_max
       echo "{"c" * 64}|$(seq_value candidate image)|$(cat "$r_dir/$r_idx")|$(seq_value candidate running)|$(seq_value candidate health)|2026-10-02T00:00:00Z|"{q(self.candidate_config_image)} ;;
-    rollback) echo "{"r" * 64}|$(seq_value rollback image)|0|$(seq_value rollback running)|$(seq_value rollback health)|2026-10-02T00:01:00Z|"{q(self.api_config_image_before)} ;;
+    rollback) echo "{"r" * 64}|$(seq_value rollback image)|0|$(seq_value rollback running)|$(seq_value rollback health)|2026-10-02T00:01:00Z|"{q(self.rollback_config_image)} ;;
   esac
   echo $(( $(cat "$ROUND_FILE") + 1 )) > "$ROUND_FILE"
 }}
@@ -1218,8 +1287,10 @@ case "$cmd" in
     case "$ref|$fmt" in
       {q(INCIDENT_IMAGE_DIGEST_REFERENCE)}"|{{{{.Id}}}}") echo {q(self.pulled_image_id)} ;;
       {q(INCIDENT_IMAGE_DIGEST_REFERENCE)}"|$LABELS_FMT") echo {q(self.pulled_labels)} ;;
-      {q(self.api_config_image_before)}"|{{{{.Id}}}}") echo {q(self.before_ref_local_id)} ;;
-      {q(EXPECTED_F476_IMAGE_ID)}"|{{{{.Id}}}}") {"echo " + q(EXPECTED_F476_IMAGE_ID) if self.f476_image_local else "exit 1"} ;;
+      {q(F476_IMAGE_DIGEST_REFERENCE)}"|{{{{.Id}}}}")
+        if [ "$PHASE" != before ] && [ {int(self.f476_vanishes_before_rollback)} -eq 1 ]; then exit 1; fi
+        if [ -e {q(self.f476_pulled_marker)} ]; then echo {q(self.f476_pulled_id)}; elif [ {int(self.f476_local_at_start)} -eq 1 ]; then echo {q(EXPECTED_F476_IMAGE_ID)}; else exit 1; fi ;;
+      {q(F476_IMAGE_DIGEST_REFERENCE)}"|{{{{.Os}}}}/{{{{.Architecture}}}}") [ -e {q(self.f476_pulled_marker)} ] && echo {q(self.f476_pulled_platform)} || exit 1 ;;
       *) exit 1 ;;
     esac ;;
   exec)
@@ -1237,7 +1308,11 @@ case "$cmd" in
       printf '%s' "$c" | {q(_REAL["sha256sum"])} | cut -d' ' -f1; exit 0
     fi
     if [ "$1" = python ] && [[ "$3" == *linkedin_browser_provider.py* ]]; then
-      if [ "$PHASE" = candidate ]; then c={q(self.candidate_provider)}; else c={q(self.provider_before)}; fi
+      case "$PHASE" in
+        candidate) c={q(self.candidate_provider)} ;;
+        rollback) c={q(self.rollback_provider)} ;;
+        *) c={q(self.provider_before)} ;;
+      esac
       printf '%s' "$c" | {q(_REAL["sha256sum"])} | cut -d' ' -f1; exit 0
     fi
     if [ "$1" = python ] && [[ "$3" == *get_search_transport_mode* ]]; then echo {q(self.candidate_transport_mode)}; exit 0; fi
@@ -1245,8 +1320,13 @@ case "$cmd" in
   top) printf '%s\\n' {q(self.docker_top)} ;;
   port) printf '%s' {q(self.tor_ports)} ;;
   login) cat > /dev/null ;;
-  pull) [ "$1" = {q(INCIDENT_IMAGE_DIGEST_REFERENCE)} ] || exit 1 ;;
-  tag) [ {int(self.rollback_tag_exit)} -eq 0 ] || exit {int(self.rollback_tag_exit)}; touch {q(self.tag_marker)} ;;
+  pull)
+    if [ "$1" = {q(INCIDENT_IMAGE_DIGEST_REFERENCE)} ]; then exit 0; fi
+    if [ "$1" = {q(F476_IMAGE_DIGEST_REFERENCE)} ]; then
+      [ {int(self.f476_pull_exit)} -eq 0 ] || exit {int(self.f476_pull_exit)}
+      touch {q(self.f476_pulled_marker)}; exit 0
+    fi
+    echo "FAKE_UNEXPECTED_PULL $1" >> "$LOG"; exit 1 ;;
   compose)
     sub=""; services=no; json=no; up=no; prev=""
     for a in "$@"; do
@@ -1276,7 +1356,7 @@ case "$cmd" in
       if [ "$JOBPULSE_API_IMAGE" = {q(INCIDENT_IMAGE_DIGEST_REFERENCE)} ]; then
         echo candidate > {q(self.phase_file)}; echo 0 > "$ROUND_FILE"; touch {q(self.candidate_marker)}
         exit {int(self.candidate_up_exit)}
-      elif [ "$JOBPULSE_API_IMAGE" = {q(self.api_config_image_before)} ]; then
+      elif [ "$JOBPULSE_API_IMAGE" = {q(F476_IMAGE_DIGEST_REFERENCE)} ]; then
         [ {int(self.rollback_up_exit)} -eq 0 ] || exit {int(self.rollback_up_exit)}
         echo rollback > {q(self.phase_file)}; echo 0 > "$ROUND_FILE"; touch {q(self.rollback_marker)}
         exit 0
@@ -1355,7 +1435,7 @@ def _assert_aborted_before_mutation(r, s, needle):
     assert r.returncode != 0, _out(r)
     assert needle in r.stderr, _out(r)
     assert "INCIDENT_DEPLOY_ABORTED_BEFORE_MUTATION" in r.stdout, _out(r)
-    assert not s.candidate_marker.exists() and not s.rollback_marker.exists() and not s.tag_marker.exists(), _out(r)
+    assert not s.candidate_marker.exists() and not s.rollback_marker.exists(), _out(r)
     assert " up " not in r.log and not r.log.startswith("up "), _out(r)
 
 
@@ -1374,7 +1454,14 @@ def test_b01_happy_path_from_known_rollback_alias_state(remote_script, tmp_path)
     assert r.returncode == 0, _out(r)
     assert "INCIDENT_259C507_API_DEPLOYED" in r.stdout
     assert "api_config_image_before=known_f476_rollback_alias" in r.stdout
-    assert s.candidate_marker.exists() and not s.rollback_marker.exists() and not s.tag_marker.exists()
+    assert s.candidate_marker.exists() and not s.rollback_marker.exists()
+    # A/C: f476 absent at start, pulled by digest, verified, preflight continued.
+    assert "f476_rollback_artifact_locally_present_before_pull=no" in r.stdout
+    assert f"f476_rollback_artifact=confirmed id={EXPECTED_F476_IMAGE_ID}" in r.stdout
+    assert "api_config_image_before_local_resolution=not_required" in r.stdout
+    assert f"rollback_prepared=yes source={F476_IMAGE_DIGEST_REFERENCE}" in r.stdout
+    assert "effective_rollback_config_parity=confirmed_image_reference_only" in r.stdout
+    assert "rollback_env_parity=confirmed" in r.stdout
     _assert_no_forbidden_calls(r)
     ups = [line for line in r.log.splitlines() if line.startswith("compose") and " up " in line]
     assert len(ups) == 1
@@ -1382,7 +1469,8 @@ def test_b01_happy_path_from_known_rollback_alias_state(remote_script, tmp_path)
         "up -d --no-build --no-deps --force-recreate api")
     assert f"JOBPULSE_API_IMAGE={INCIDENT_IMAGE_DIGEST_REFERENCE}" in ups[0]
     pulls = [line for line in r.log.splitlines() if line.startswith("pull ")]
-    assert [p.split(" JOBPULSE_API_IMAGE")[0] for p in pulls] == [f"pull {INCIDENT_IMAGE_DIGEST_REFERENCE}"]
+    assert [p.split(" JOBPULSE_API_IMAGE")[0] for p in pulls] == [f"pull {INCIDENT_IMAGE_DIGEST_REFERENCE}", f"pull {F476_IMAGE_DIGEST_REFERENCE}"]
+    assert not re.search(r"^(tag|rmi|image rm)", r.log, re.MULTILINE)
     for marker in ("runtime_env_parity=confirmed", "effective_config_parity=confirmed_image_reference_only",
                    "in_container_collector=f476", "in_container_collector=259c507", "post_deploy_env_parity=confirmed",
                    "db_frontend_tor_unchanged=confirmed", "git_invariant=confirmed_f476", "scheduler_unchanged=confirmed",
@@ -1409,10 +1497,13 @@ def test_b02_happy_path_from_canonical_f476_reference_state(remote_script, tmp_p
         (dict(api_labels="api|otherproject"), "compose labels"),
         (dict(api_image_before="sha256:" + "8" * 64), "API underlying image ID"),
         (dict(api_image_before="sha256:" + "8" * 64, api_config_image_before=CANONICAL_F476_REFERENCE), "API underlying image ID"),
-        (dict(api_config_image_before="ghcr.io/mrezamaghouli/jobpulse-api:main", before_ref_local_id=EXPECTED_F476_IMAGE_ID), "neither the known f476 rollback alias"),
+        (dict(api_config_image_before="ghcr.io/mrezamaghouli/jobpulse-api:main"), "neither the known f476 rollback alias"),
         (dict(api_config_image_before="jobpulse-api-rollback:other"), "neither the known f476 rollback alias"),
-        (dict(before_ref_local_id="sha256:" + "9" * 64), "exact-prestate rollback cannot be proven"),
-        (dict(before_ref_local_id=""), "exact-prestate rollback cannot be proven"),
+        # E: f476 pull failure; D: wrong f476 ID; wrong platform.
+        (dict(f476_pull_exit=1), "could not pull the f476 rollback artifact"),
+        (dict(f476_pulled_id="sha256:" + "9" * 64), "f476 rollback artifact resolved to ID"),
+        (dict(f476_pulled_id=INCIDENT_IMAGE_INDEX_DIGEST), "f476 rollback artifact resolved to ID"),
+        (dict(f476_pulled_platform="linux/arm64"), "f476 rollback artifact platform"),
         (dict(api_health_before="starting"), "API container is not healthy"),
         (dict(api_restart_before="2"), "restart_count is not 0"),
         (dict(health_body_before=HEALTH_DB_DOWN), "API direct health check failed"),
@@ -1420,7 +1511,6 @@ def test_b02_happy_path_from_canonical_f476_reference_state(remote_script, tmp_p
         (dict(tor_enabled_before="true"), "TOR_ENABLED is not exactly 'false'"),
         (dict(collector_before="# something else\n"), "is not the f476 version"),
         (dict(provider_before="# phase 4b provider\n"), "linkedin_browser_provider.py SHA-256"),
-        (dict(f476_image_local=False), "rollback cannot be prepared"),
         (dict(db_state="d" * 64 + "|sha256:db|0|true|unhealthy|2026|postgres"), "DB is not healthy"),
         (dict(tor_present=False), "jobpulse-tor-prod does not exist"),
         (dict(tor_ports="9050/tcp -> 0.0.0.0:9050"), "Tor publishes host ports"),
@@ -1466,7 +1556,6 @@ def test_b11_outer_lock_busy_aborts(remote_script, tmp_path):
         (dict(candidate_tor_enabled="true"), "TOR_ENABLED is not exactly 'false'"),
         (dict(candidate_env_extra={"SURPRISE": "1"}), "post-deploy API environment is not exactly"),
         (dict(git_sha_after_mutation="1" * 40), None),
-        (dict(own_crontab_extra_after_mutation="0 * * * * echo drift"), "scheduler inputs changed during deployment"),
     ],
 )
 def test_b20_post_deploy_failure_triggers_verified_rollback(remote_script, tmp_path, overrides, needle):
@@ -1482,22 +1571,59 @@ def test_b20_post_deploy_failure_triggers_verified_rollback(remote_script, tmp_p
     assert r.returncode != 0, _out(r)
     if needle:
         assert needle in r.stderr, _out(r)
-    assert s.candidate_marker.exists() and s.rollback_marker.exists() and s.tag_marker.exists(), _out(r)
+    assert s.candidate_marker.exists() and s.rollback_marker.exists(), _out(r)
     assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED" in r.stdout, _out(r)
     assert "INCIDENT_259C507_API_DEPLOYED" not in r.stdout
     assert "rollback_confirmed=true" in r.stderr
     _assert_no_forbidden_calls(r)
     rb = [line for line in r.log.splitlines() if line.startswith("compose") and " up " in line][-1]
-    assert f"JOBPULSE_API_IMAGE={KNOWN_F476_ROLLBACK_ALIAS}" in rb
-    assert f"tag {EXPECTED_F476_IMAGE_ID} {KNOWN_F476_ROLLBACK_ALIAS}" in r.log
+    # H/I: rollback recreates from the f476 digest (never the alias) and its
+    # Config.Image is accepted as that digest reference.
+    assert f"JOBPULSE_API_IMAGE={F476_IMAGE_DIGEST_REFERENCE}" in rb
+    assert rb.split(" JOBPULSE_API_IMAGE=")[0].endswith("up -d --no-build --no-deps --force-recreate api")
+    assert KNOWN_F476_ROLLBACK_ALIAS not in rb
+    assert not re.search(r"^(tag|rmi|image rm)", r.log, re.MULTILINE)
+    assert r.log.count(" up ") == 2  # Q: exactly one candidate + exactly one rollback
 
 
-def test_b21_rollback_restores_canonical_reference_when_that_was_the_prestate(remote_script, tmp_path):
+def test_b21_rollback_uses_f476_digest_even_when_prestate_was_canonical_reference(remote_script, tmp_path):
     s = Scenario(tmp_path, api_config_image_before=CANONICAL_F476_REFERENCE, candidate_collector=F476_COLLECTOR)
     r = s.run(remote_script)
     assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_CONFIRMED_PRESTATE_RESTORED" in r.stdout, _out(r)
-    assert f"tag {EXPECTED_F476_IMAGE_ID} {CANONICAL_F476_REFERENCE}" in r.log
-    assert f"JOBPULSE_API_IMAGE={CANONICAL_F476_REFERENCE}" in [l for l in r.log.splitlines() if " up " in l][-1]
+    assert f"JOBPULSE_API_IMAGE={F476_IMAGE_DIGEST_REFERENCE}" in [l for l in r.log.splitlines() if " up " in l][-1]
+    assert not re.search(r"^tag ", r.log, re.MULTILINE)
+
+
+def test_b21b_f476_already_local_is_still_verified_and_accepted(remote_script, tmp_path):
+    s = Scenario(tmp_path, f476_local_at_start=True)
+    r = s.run(remote_script)
+    assert r.returncode == 0, _out(r)
+    assert "f476_rollback_artifact_locally_present_before_pull=yes" in r.stdout
+
+
+def test_b21c_rollback_config_image_must_be_the_f476_digest(remote_script, tmp_path):
+    """I (negative): after rollback the container must report the f476
+    digest reference; anything else (e.g. the old alias) is not confirmed."""
+    s = Scenario(tmp_path, candidate_collector=F476_COLLECTOR, rollback_config_image=KNOWN_F476_ROLLBACK_ALIAS)
+    r = s.run(remote_script)
+    assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout, _out(r)
+    assert "does not equal expected" in r.stderr
+
+
+def test_b21d_rollback_detects_phase4b_provider(remote_script, tmp_path):
+    s = Scenario(tmp_path, candidate_collector=F476_COLLECTOR, rollback_provider="# phase 4b provider\n")
+    r = s.run(remote_script)
+    assert "rolled-back API is not running the f476 provider" in r.stderr
+    assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout, _out(r)
+
+
+def test_b21e_rollback_detects_scheduler_drift(remote_script, tmp_path):
+    s = Scenario(tmp_path, own_crontab_extra_after_mutation="0 * * * * echo drift")
+    r = s.run(remote_script)
+    assert "scheduler inputs changed during deployment" in r.stderr
+    assert s.rollback_marker.exists()
+    assert "scheduler inputs differ from the pre-deployment fingerprint after rollback" in r.stderr
+    assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout, _out(r)
 
 
 def test_b22_rollback_itself_is_verified_not_assumed(remote_script, tmp_path):
@@ -1525,7 +1651,7 @@ def test_b24_rollback_refuses_on_input_drift(remote_script, tmp_path):
     r = s.run(remote_script)
     assert r.returncode != 0
     assert "ROLLBACK_ABORTED_INPUT_DRIFT" in r.stderr, _out(r)
-    assert not s.rollback_marker.exists() and not s.tag_marker.exists()
+    assert not s.rollback_marker.exists()
     assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout
     assert "api_state_classification=INCIDENT_API_PRESENT" in r.stderr
 
@@ -1539,11 +1665,18 @@ def test_b25_rollback_detects_disturbed_frontend(remote_script, tmp_path):
     assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout, _out(r)
 
 
-def test_b26_rollback_tag_failure_is_not_confirmed(remote_script, tmp_path):
-    s = Scenario(tmp_path, candidate_collector=F476_COLLECTOR, rollback_tag_exit=1)
+def test_b26_rollback_refuses_if_f476_artifact_vanished(remote_script, tmp_path):
+    s = Scenario(tmp_path, candidate_collector=F476_COLLECTOR, f476_vanishes_before_rollback=True)
     r = s.run(remote_script)
-    assert "failed to tag rollback reference" in r.stderr
+    assert "f476 rollback artifact" in r.stderr and "no longer locally present" in r.stderr, _out(r)
     assert not s.rollback_marker.exists()
+    assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout
+
+
+def test_b26b_rollback_recreation_failure_is_not_confirmed(remote_script, tmp_path):
+    s = Scenario(tmp_path, candidate_collector=F476_COLLECTOR, rollback_up_exit=1)
+    r = s.run(remote_script)
+    assert "rollback recreation command failed" in r.stderr, _out(r)
     assert "INCIDENT_DEPLOY_FAILED_ROLLBACK_NOT_CONFIRMED_MANUAL_REVIEW_REQUIRED" in r.stdout
 
 
@@ -1551,7 +1684,7 @@ def test_b27_no_rollback_when_preflight_fails(remote_script, tmp_path):
     s = Scenario(tmp_path, pulled_image_id="sha256:" + "5" * 64)
     r = s.run(remote_script)
     assert "rollback_attempted=false" in r.stderr
-    assert not s.tag_marker.exists()
+    assert " up " not in r.log
     _assert_no_forbidden_calls(r)
 
 
