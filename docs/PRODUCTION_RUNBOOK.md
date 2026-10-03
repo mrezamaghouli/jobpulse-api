@@ -4092,7 +4092,8 @@ runner is a separate, explicit decision.
      by bytes, not by reference text.
    - `Config.Image` may be the Phase 4E rollback alias
      `jobpulse-api-rollback:bccbbd997ee8-1427495` or the canonical f476
-     tag. Any other value fails.
+     tag. Any other value fails. `Config.Image` is observational only: it
+     does not need to resolve locally and is never used for rollback.
    - The container must be running and healthy with restart count 0.
      `/health` must return `status=ok` and `database=connected` on both the
      direct and nginx paths.
@@ -4117,9 +4118,24 @@ runner is a separate, explicit decision.
    f476 image defaults overlaid by the Compose env.
 8. **Candidate on host:** production pulls only by digest. The pulled
    image ID and labels must match.
-9. **Rollback prepared, immediately before mutation:** the f476 image
-   object is present by ID, the pre-deployment reference still resolves
-   to it, and the drift snapshots are recorded.
+9. **f476 rollback artifact on host:** production can keep running the
+   f476 API from its containerd snapshot after the local image object is
+   gone. The 2026-10-02 preflight found no local f476 image: the ID, the
+   alias, and the canonical tag all failed to resolve. So after the
+   runner has verified the f476 GHCR chain, production pulls
+   `ghcr.io/mrezamaghouli/jobpulse-api@sha256:7739628f…b753`, by digest
+   only. The local image ID must be exactly
+   `sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753`,
+   the platform must be linux/amd64, and the ID must equal the running
+   API's image ID. A failed pull or a mismatch aborts before mutation.
+   This pull is preparation only; it does not authorize mutation. The
+   runner never tags or removes images, so the f476 artifact stays
+   available for operator recovery.
+10. **Rollback prepared, immediately before mutation:** the f476 digest
+    reference still resolves locally to the f476 image ID. The rollback
+    Compose config must differ from the current one only in the image
+    reference and must reproduce the exact pre-deployment env. Drift
+    snapshots are recorded.
 
 **Mutation.** The runner does exactly one thing:
 `JOBPULSE_API_IMAGE=<incident digest ref> docker compose -p jobpulse -f
@@ -4151,11 +4167,18 @@ Success prints `INCIDENT_259C507_API_DEPLOYED`.
 API-only rollback:
 
 1. It re-checks compose, config, and env for drift.
-2. It re-points the exact pre-deployment reference at the f476 image ID.
-3. It recreates only the API.
-4. It verifies the result with the same bounded convergence: f476 image
-   ID, pre-deployment reference, f476 collector, exact pre-deployment env
-   hash, and unchanged DB, frontend, Tor, and git.
+2. It re-checks that the f476 digest reference is still locally present
+   as the f476 image ID.
+3. It recreates only the API with
+   `JOBPULSE_API_IMAGE=ghcr.io/mrezamaghouli/jobpulse-api@sha256:7739628f…`.
+   It never uses the historical alias and never tags.
+4. It verifies the result with the same bounded convergence:
+   - The f476 image ID, and `Config.Image` equal to the f476 digest
+     reference. The old alias is naming metadata, not identity, so it is
+     not restored.
+   - The f476 collector and provider (no Phase 4B).
+   - Direct/no-Tor transport and the exact pre-deployment env hash.
+   - Unchanged DB, frontend, Tor, git, and scheduler fingerprint.
 
 The run still fails and reports one of:
 

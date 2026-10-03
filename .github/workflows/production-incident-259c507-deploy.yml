@@ -39,9 +39,10 @@ name: Production Incident 259c507 Deploy
 #     or any operator-supplied image (there is no image/SHA/target input)
 #
 # If anything fails after the mutation marker, it attempts exactly ONE
-# API-only rollback to the exact pre-deployment API runtime (same
-# Config.Image reference, same f476 image ID, same runtime environment),
-# and verifies that rollback. A confirmed rollback does NOT make the run
+# API-only rollback to the pre-deployment f476 API runtime (same f476
+# image ID, same runtime environment), recreated from the immutable f476
+# digest reference that was pulled and verified BEFORE mutation, and
+# verifies that rollback. A confirmed rollback does NOT make the run
 # succeed.
 #
 # This is NOT a repurposing of, and does not modify:
@@ -112,6 +113,12 @@ env:
   EXPECTED_F476_IMAGE_ID: "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
   EXPECTED_F476_AMD64_MANIFEST_DIGEST: "sha256:75207004ec746504940d6bf1b61dd6a86901c5d6ecd2499987c5bc1220580907"
   EXPECTED_F476_CONFIG_DIGEST: "sha256:fd9f1eedc8924304aba851770b56f17c8b3dde30a6ecf246dee79129073a9801"
+  # The rollback artifact, by immutable digest. Production may still run
+  # f476 from its containerd snapshot after the local image object was
+  # removed (proven 2026-10-02), so the runner re-pulls exactly this
+  # digest -- after the runner-side GHCR chain verification -- before any
+  # mutation. Never a tag, never the historical rollback alias.
+  F476_IMAGE_DIGEST_REFERENCE: "ghcr.io/mrezamaghouli/jobpulse-api@sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
 
 jobs:
   deploy:
@@ -155,6 +162,10 @@ jobs:
           case "$INCIDENT_IMAGE" in
             "ghcr.io/mrezamaghouli/jobpulse-api@${INCIDENT_IMAGE_INDEX_DIGEST}") ;;
             *) echo "ERROR: INCIDENT_IMAGE is not the digest reference of INCIDENT_IMAGE_INDEX_DIGEST" >&2; exit 1 ;;
+          esac
+          case "$F476_IMAGE_DIGEST_REFERENCE" in
+            "ghcr.io/mrezamaghouli/jobpulse-api@${EXPECTED_F476_IMAGE_ID}") ;;
+            *) echo "ERROR: F476_IMAGE_DIGEST_REFERENCE is not the digest reference of EXPECTED_F476_IMAGE_ID" >&2; exit 1 ;;
           esac
 
           git fetch origin main
@@ -636,6 +647,13 @@ jobs:
           # chain was verified on the runner before SSH.
           EXPECTED_F476_AMD64_MANIFEST_DIGEST="sha256:75207004ec746504940d6bf1b61dd6a86901c5d6ecd2499987c5bc1220580907"
           EXPECTED_F476_CONFIG_DIGEST="sha256:fd9f1eedc8924304aba851770b56f17c8b3dde30a6ecf246dee79129073a9801"
+          # The ONLY rollback source: the f476 image by immutable digest. It
+          # is pulled (by digest, never by tag) and verified before
+          # mutation, because the host may no longer hold the f476 image
+          # object even while the API container still runs from its
+          # snapshot. It is never removed by this runner, so an operator
+          # keeps a known-good recovery image afterwards.
+          F476_IMAGE_DIGEST_REFERENCE="ghcr.io/mrezamaghouli/jobpulse-api@sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
           # This host uses Docker's containerd image store: the running
           # f476 API's image ID IS the f476 OCI index digest (proven again
           # below, before mutation). Under that store a pulled image's ID
@@ -648,6 +666,9 @@ jobs:
           # GHCR reference is also accepted. Either is accepted ONLY when
           # the underlying image ID is exactly EXPECTED_F476_IMAGE_ID --
           # identity is decided by image ID, never by Config.Image text.
+          # Config.Image is OBSERVATIONAL only: it need not resolve locally
+          # (the alias no longer does on production) and is never used as
+          # a rollback source.
           KNOWN_F476_ROLLBACK_ALIAS="jobpulse-api-rollback:bccbbd997ee8-1427495"
           CANONICAL_F476_REFERENCE="ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
           PRODUCTION_PROJECT="jobpulse"
@@ -691,6 +712,7 @@ jobs:
           # Final-gate snapshots (see prove_deploy_inputs).
           FINAL_EXPECTED_CURRENT_ENV_SHA256=""
           FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256=""
+          FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256=""
           EXPECTED_CANDIDATE_ENV_SHA256=""
 
           container_state() {
@@ -994,6 +1016,24 @@ jobs:
             [ "$current_norm_sha" = "$candidate_norm_sha" ] || fail "effective current/candidate Compose configs differ beyond the api image reference (normalized SHA-256 mismatch) -- never printing the full configs"
             echo "effective_config_parity=confirmed_image_reference_only"
 
+            echo "== ROLLBACK compose config (f476 digest reference) must also differ from CURRENT ONLY in the api image reference =="
+            EFFECTIVE_ROLLBACK_CONFIG="$(JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)" || fail "failed to render effective ROLLBACK Compose config -- failing closed before mutation"
+            local rollback_block_count rb_cfg_api_block rollback_image_lines rollback_image rollback_norm_sha
+            rollback_block_count="$(grep -c '^  api:' <<< "$EFFECTIVE_ROLLBACK_CONFIG" || true)"
+            [ "$rollback_block_count" = "1" ] || fail "effective rollback Compose config does not have exactly one api service block (found $rollback_block_count)"
+            rb_cfg_api_block="$(printf '%s\n' "$EFFECTIVE_ROLLBACK_CONFIG" | awk '
+              /^  api:/ { in_api=1; next }
+              in_api && /^  [A-Za-z0-9_.-]+:/ { in_api=0 }
+              in_api { print }
+            ')"
+            rollback_image_lines="$(grep -c '^[[:space:]]*image:[[:space:]]*' <<< "$rb_cfg_api_block" || true)"
+            [ "$rollback_image_lines" = "1" ] || fail "effective rollback Compose api block does not have exactly one image: line (found $rollback_image_lines)"
+            rollback_image="$(printf '%s\n' "$rb_cfg_api_block" | sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -n1)"
+            [ "$rollback_image" = "$F476_IMAGE_DIGEST_REFERENCE" ] || fail "effective rollback Compose image is '$rollback_image', expected exactly '$F476_IMAGE_DIGEST_REFERENCE'"
+            rollback_norm_sha="$(printf '%s\n' "$EFFECTIVE_ROLLBACK_CONFIG" | normalize_config_image | sha256sum | awk '{print $1}')"
+            [ "$rollback_norm_sha" = "$current_norm_sha" ] || fail "effective rollback Compose config differs from CURRENT beyond the api image reference -- never printing the full configs"
+            echo "effective_rollback_config_parity=confirmed_image_reference_only"
+
             echo "== base compose service set (Tor is a separate overlay, proven independently) =="
             local base_services
             base_services="$(docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config --services)" || fail "failed to enumerate base Compose service set"
@@ -1009,6 +1049,9 @@ jobs:
             current_json="$RENDERED_COMPOSE_JSON"
             render_compose_json "$INCIDENT_IMAGE_DIGEST_REFERENCE" || exit 1
             candidate_json="$RENDERED_COMPOSE_JSON"
+            local rollback_json
+            render_compose_json "$F476_IMAGE_DIGEST_REFERENCE" || exit 1
+            rollback_json="$RENDERED_COMPOSE_JSON"
             runtime_env_json="$(docker inspect jobpulse-api-prod --format '{{json .Config.Env}}')" || fail "failed to read the running API container's environment"
 
             compute_env_parity_hashes "$current_json" "$f476_env_json" "$runtime_env_json" || exit 1
@@ -1019,6 +1062,12 @@ jobs:
             fi
             echo "runtime_env_parity=confirmed"
             local proven_current_env_sha="$EXPECTED_RUNTIME_ENV_SHA256"
+
+            # Rollback from the f476 digest reference must reproduce EXACTLY
+            # the proven pre-deployment environment.
+            compute_env_parity_hashes "$rollback_json" "$f476_env_json" "[]" || exit 1
+            [ "$EXPECTED_RUNTIME_ENV_SHA256" = "$proven_current_env_sha" ] || fail "a rollback from the f476 digest reference would not reproduce the pre-deployment environment exactly"
+            echo "rollback_env_parity=confirmed"
 
             # The exact environment the candidate container must end up
             # with: incident image defaults overlaid by the (proven
@@ -1033,6 +1082,7 @@ jobs:
             FINAL_EXPECTED_CURRENT_ENV_SHA256="$proven_current_env_sha"
             EXPECTED_CANDIDATE_ENV_SHA256="$proven_candidate_env_sha"
             FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256="$(printf '%s\n' "$EFFECTIVE_CURRENT_CONFIG" | sha256sum | awk '{print $1}')"
+            FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256="$(printf '%s\n' "$EFFECTIVE_ROLLBACK_CONFIG" | sha256sum | awk '{print $1}')"
             echo "deploy_inputs_proof=confirmed"
           }
 
@@ -1194,19 +1244,21 @@ jobs:
           }
 
           # ---------------------------------------------------------------
-          # API-only rollback to the EXACT pre-deployment runtime: the
-          # same Config.Image reference the container had before (the
-          # known rollback alias or the canonical f476 reference), the
-          # same f476 image ID, and the same proven runtime environment.
-          # Never touches git, db, frontend, tor, cron, or secrets. Never
-          # a second attempt.
+          # API-only rollback to the pre-deployment f476 RUNTIME: the same
+          # f476 image ID and the same proven runtime environment, recreated
+          # from the immutable f476 digest reference pulled and verified
+          # before mutation. Restoration is defined by immutable identity +
+          # runtime invariants, never by the historical Config.Image alias
+          # (naming metadata that may no longer resolve). No tagging. Never
+          # touches git, db, frontend, tor, cron, or secrets. Never a second
+          # attempt.
           # ---------------------------------------------------------------
           rollback_api() {
             if [ "$ROLLBACK_PREPARED" != "true" ]; then
               echo "ROLLBACK_ABORTED: rollback was never prepared before mutation -- refusing a blind recreation" >&2
               return 1
             fi
-            if [ -z "$API_CONFIG_IMAGE_BEFORE" ] || [ -z "$FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256" ] || [ -z "$FINAL_EXPECTED_CURRENT_ENV_SHA256" ]; then
+            if [ -z "$FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256" ] || [ -z "$FINAL_EXPECTED_CURRENT_ENV_SHA256" ]; then
               echo "ROLLBACK_ABORTED: pre-deployment snapshots are missing -- refusing a blind recreation" >&2
               return 1
             fi
@@ -1217,18 +1269,18 @@ jobs:
               return 1
             fi
             local rb_config rb_config_sha
-            rb_config="$(JOBPULSE_API_IMAGE="$API_CONFIG_IMAGE_BEFORE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)" || {
-              echo "ROLLBACK_ABORTED_INPUT_DRIFT: could not re-render effective CURRENT Compose config" >&2
+            rb_config="$(JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" config)" || {
+              echo "ROLLBACK_ABORTED_INPUT_DRIFT: could not re-render effective ROLLBACK Compose config" >&2
               return 1
             }
             rb_config_sha="$(printf '%s\n' "$rb_config" | sha256sum | awk '{print $1}')"
-            if [ "$rb_config_sha" != "$FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256" ]; then
-              echo "ROLLBACK_ABORTED_INPUT_DRIFT: effective CURRENT Compose config changed since the final pre-mutation gate" >&2
+            if [ "$rb_config_sha" != "$FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256" ]; then
+              echo "ROLLBACK_ABORTED_INPUT_DRIFT: effective ROLLBACK Compose config changed since the final pre-mutation gate" >&2
               return 1
             fi
             local f476_env_json
             f476_env_json="$(decode_image_env "$F476_IMAGE_ENV_JSON_B64")" || return 1
-            render_compose_json "$API_CONFIG_IMAGE_BEFORE" || return 1
+            render_compose_json "$F476_IMAGE_DIGEST_REFERENCE" || return 1
             compute_env_parity_hashes "$RENDERED_COMPOSE_JSON" "$f476_env_json" "[]" || return 1
             if [ "$EXPECTED_RUNTIME_ENV_SHA256" != "$FINAL_EXPECTED_CURRENT_ENV_SHA256" ]; then
               echo "ROLLBACK_ABORTED_INPUT_DRIFT: effective CURRENT Compose environment changed since the final pre-mutation gate" >&2
@@ -1236,25 +1288,33 @@ jobs:
             fi
             echo "ROLLBACK: inputs unchanged since the final pre-mutation gate -- safe to recreate" >&2
 
-            # Re-point the exact pre-deployment reference at the exact f476
-            # bytes (idempotent; the f476 image is still present locally --
-            # its reference was proven to resolve to it in preflight).
-            echo "ROLLBACK: tagging $EXPECTED_F476_IMAGE_ID as $API_CONFIG_IMAGE_BEFORE and recreating api" >&2
-            docker tag "$EXPECTED_F476_IMAGE_ID" "$API_CONFIG_IMAGE_BEFORE" || {
-              echo "FATAL: failed to tag rollback reference $API_CONFIG_IMAGE_BEFORE -> $EXPECTED_F476_IMAGE_ID" >&2
+            # The f476 rollback artifact was pulled by digest and verified
+            # before mutation; re-prove it is still locally present with the
+            # exact f476 identity immediately before using it.
+            local rb_local_id
+            rb_local_id="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE" --format '{{.Id}}' 2>/dev/null || true)"
+            if [ "$rb_local_id" != "$EXPECTED_F476_IMAGE_ID" ]; then
+              echo "ROLLBACK_ABORTED: f476 rollback artifact $F476_IMAGE_DIGEST_REFERENCE is no longer locally present as $EXPECTED_F476_IMAGE_ID (got '${rb_local_id:-<absent>}')" >&2
               return 1
-            }
-            JOBPULSE_API_IMAGE="$API_CONFIG_IMAGE_BEFORE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps --force-recreate api || {
+            fi
+            echo "ROLLBACK: recreating api from the immutable f476 digest reference $F476_IMAGE_DIGEST_REFERENCE" >&2
+            JOBPULSE_API_IMAGE="$F476_IMAGE_DIGEST_REFERENCE" docker compose -p "$PRODUCTION_PROJECT" -f "$COMPOSE_FILE" up -d --no-build --no-deps --force-recreate api || {
               echo "FATAL: rollback recreation command failed" >&2
               return 1
             }
 
-            wait_for_api_convergence "$API_CONFIG_IMAGE_BEFORE" "$EXPECTED_F476_IMAGE_ID" || return 1
+            wait_for_api_convergence "$F476_IMAGE_DIGEST_REFERENCE" "$EXPECTED_F476_IMAGE_ID" || return 1
 
             local rb_collector_sha rb_runtime_env
             rb_collector_sha="$(in_container_collector_sha256)" || { echo "FATAL: cannot read rolled-back collector hash" >&2; return 1; }
             if [ "$rb_collector_sha" != "$F476_COLLECTOR_SHA256" ]; then
               echo "FATAL: rolled-back API is not running the f476 collector (got $rb_collector_sha)" >&2
+              return 1
+            fi
+            local rb_provider_sha
+            rb_provider_sha="$(in_container_provider_sha256)" || { echo "FATAL: cannot read rolled-back provider hash" >&2; return 1; }
+            if [ "$rb_provider_sha" != "$F476_PROVIDER_SHA256" ]; then
+              echo "FATAL: rolled-back API is not running the f476 provider (Phase 4B must stay absent; got $rb_provider_sha)" >&2
               return 1
             fi
             rb_runtime_env="$(docker inspect jobpulse-api-prod --format '{{json .Config.Env}}')" || return 1
@@ -1265,7 +1325,11 @@ jobs:
             fi
             verify_other_services_unchanged || return 1
             verify_git_unchanged || return 1
-            echo "ROLLBACK: API restored to pre-deployment reference $API_CONFIG_IMAGE_BEFORE (image $EXPECTED_F476_IMAGE_ID), healthy, f476 collector, exact pre-deployment environment, direct/no-Tor, db/frontend/tor/git unchanged" >&2
+            if [ "$(scheduler_fingerprint)" != "$SCHEDULER_FINGERPRINT_BEFORE" ]; then
+              echo "FATAL: scheduler inputs differ from the pre-deployment fingerprint after rollback" >&2
+              return 1
+            fi
+            echo "ROLLBACK: API restored to the f476 runtime from $F476_IMAGE_DIGEST_REFERENCE (image $EXPECTED_F476_IMAGE_ID; pre-deployment Config.Image was $API_CONFIG_IMAGE_BEFORE), healthy, f476 collector+provider, exact pre-deployment environment, direct/no-Tor, db/frontend/tor/git/scheduler unchanged" >&2
             return 0
           }
 
@@ -1361,12 +1425,10 @@ jobs:
           [ "$API_HEALTH_BEFORE" = "healthy" ] || fail "API container is not healthy (got $API_HEALTH_BEFORE)"
           [ "$API_RESTART_COUNT_BEFORE" = "0" ] || fail "API restart_count is not 0 (got $API_RESTART_COUNT_BEFORE)"
 
-          # The rollback handle: the pre-deployment reference must resolve
-          # LOCALLY to exactly the f476 bytes, or exact-prestate rollback
-          # could not be proven possible.
-          ROLLBACK_REFERENCE_IMAGE_ID="$(docker image inspect "$API_CONFIG_IMAGE_BEFORE" --format '{{.Id}}' 2>/dev/null || true)"
-          [ "$ROLLBACK_REFERENCE_IMAGE_ID" = "$EXPECTED_F476_IMAGE_ID" ] || fail "pre-deployment reference '$API_CONFIG_IMAGE_BEFORE' does not resolve locally to the f476 image (got '${ROLLBACK_REFERENCE_IMAGE_ID:-<absent>}') -- exact-prestate rollback cannot be proven"
-          echo "rollback_reference_resolves_to_f476=confirmed"
+          # Config.Image is observational: it is NOT required to resolve
+          # locally (the historical alias no longer does on production) and
+          # is never a rollback source -- see the f476 digest pull below.
+          echo "api_config_image_before_local_resolution=not_required (rollback uses $F476_IMAGE_DIGEST_REFERENCE)"
 
           health_json_ok http://127.0.0.1:8000/health || fail "API direct health check failed (status ok + database connected required)"
           health_json_ok http://127.0.0.1/api/health || fail "API nginx-proxied health check failed (status ok + database connected required)"
@@ -1721,6 +1783,21 @@ jobs:
           [ "$PULLED_IMAGE_LABELS" = "$TARGET_SOURCE_SHA|$EXPECTED_PRODUCTION_GIT_SHA|$INCIDENT_PURPOSE_LABEL|$INCIDENT_BUILD_RUN_ID" ] || fail "incident image labels are '$PULLED_IMAGE_LABELS', expected revision/parent/build-run-id '$TARGET_SOURCE_SHA|$EXPECTED_PRODUCTION_GIT_SHA|$INCIDENT_PURPOSE_LABEL|$INCIDENT_BUILD_RUN_ID'"
           echo "incident_image_provenance=confirmed id=$PULLED_IMAGE_ID manifest=$INCIDENT_IMAGE_AMD64_MANIFEST_DIGEST config=$INCIDENT_IMAGE_CONFIG_DIGEST"
 
+          echo "== f476 rollback artifact preparation (pull BY DIGEST only; the runner already verified its GHCR chain; does NOT authorize mutation) =="
+          # The running API may survive only on its containerd snapshot with
+          # no local f476 image object (proven on production 2026-10-02), so
+          # the rollback artifact is (re)materialized here from its immutable
+          # digest. Pulling an already-present digest is a no-op.
+          F476_LOCAL_ID_BEFORE_PULL="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE" --format '{{.Id}}' 2>/dev/null || true)"
+          echo "f476_rollback_artifact_locally_present_before_pull=$([ "$F476_LOCAL_ID_BEFORE_PULL" = "$EXPECTED_F476_IMAGE_ID" ] && echo yes || echo no)"
+          DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$F476_IMAGE_DIGEST_REFERENCE" || fail "could not pull the f476 rollback artifact $F476_IMAGE_DIGEST_REFERENCE -- rollback cannot be prepared, no mutation"
+          F476_PULLED_ID="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE" --format '{{.Id}}' 2>/dev/null || true)"
+          [ "$F476_PULLED_ID" = "$EXPECTED_F476_IMAGE_ID" ] || fail "f476 rollback artifact resolved to ID '${F476_PULLED_ID:-<absent>}', expected exactly $EXPECTED_F476_IMAGE_ID -- no mutation"
+          F476_PULLED_PLATFORM="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+          [ "$F476_PULLED_PLATFORM" = "linux/amd64" ] || fail "f476 rollback artifact platform is '$F476_PULLED_PLATFORM', expected linux/amd64 -- no mutation"
+          [ "$F476_PULLED_ID" = "$API_IMAGE_ID_BEFORE" ] || fail "f476 rollback artifact ID differs from the running API's image ID -- no mutation"
+          echo "f476_rollback_artifact=confirmed id=$F476_PULLED_ID manifest=$EXPECTED_F476_AMD64_MANIFEST_DIGEST config=$EXPECTED_F476_CONFIG_DIGEST"
+
           prove_deploy_inputs
 
           echo "== final pre-mutation revalidation (narrows the preflight-to-mutation race window) =="
@@ -1750,19 +1827,17 @@ jobs:
           prove_deploy_inputs
           echo "final_deploy_inputs_revalidation=ok"
 
-          echo "== rollback preparation (BEFORE mutation): prove the exact pre-deployment API runtime is restorable =="
-          # Rollback restores by IMMUTABLE identity: the f476 image object
-          # (by image ID) must be present locally, and the exact
-          # pre-deployment reference must still resolve to it. Both are
-          # re-proven here, immediately before mutation, together with the
-          # final-gate Compose/env snapshots rollback compares against.
-          ROLLBACK_F476_LOCAL_ID="$(docker image inspect "$EXPECTED_F476_IMAGE_ID" --format '{{.Id}}' 2>/dev/null || true)"
-          [ "$ROLLBACK_F476_LOCAL_ID" = "$EXPECTED_F476_IMAGE_ID" ] || fail "f476 image $EXPECTED_F476_IMAGE_ID is not present locally -- rollback cannot be prepared"
-          ROLLBACK_REFERENCE_FINAL_ID="$(docker image inspect "$API_CONFIG_IMAGE_BEFORE" --format '{{.Id}}' 2>/dev/null || true)"
-          [ "$ROLLBACK_REFERENCE_FINAL_ID" = "$EXPECTED_F476_IMAGE_ID" ] || fail "pre-deployment reference '$API_CONFIG_IMAGE_BEFORE' no longer resolves to the f476 image -- rollback cannot be prepared"
-          [ -n "$FINAL_EFFECTIVE_CURRENT_CONFIG_SHA256" ] && [ -n "$FINAL_EXPECTED_CURRENT_ENV_SHA256" ] || fail "final-gate rollback snapshots are missing -- rollback cannot be prepared"
+          echo "== rollback preparation (BEFORE mutation): prove the f476 API runtime is restorable from its immutable digest =="
+          # Rollback restores by IMMUTABLE identity: the f476 digest
+          # reference (pulled and verified above) must still resolve locally
+          # to exactly the f476 image ID, and the final-gate rollback
+          # Compose/env snapshots must exist. Re-proven here, immediately
+          # before mutation. The historical alias is never consulted.
+          ROLLBACK_F476_LOCAL_ID="$(docker image inspect "$F476_IMAGE_DIGEST_REFERENCE" --format '{{.Id}}' 2>/dev/null || true)"
+          [ "$ROLLBACK_F476_LOCAL_ID" = "$EXPECTED_F476_IMAGE_ID" ] || fail "f476 rollback artifact $F476_IMAGE_DIGEST_REFERENCE is not locally present as $EXPECTED_F476_IMAGE_ID -- rollback cannot be prepared"
+          [ -n "$FINAL_EFFECTIVE_ROLLBACK_CONFIG_SHA256" ] && [ -n "$FINAL_EXPECTED_CURRENT_ENV_SHA256" ] || fail "final-gate rollback snapshots are missing -- rollback cannot be prepared"
           ROLLBACK_PREPARED=true
-          echo "rollback_prepared=yes reference=$API_CONFIG_IMAGE_BEFORE image=$EXPECTED_F476_IMAGE_ID"
+          echo "rollback_prepared=yes source=$F476_IMAGE_DIGEST_REFERENCE image=$EXPECTED_F476_IMAGE_ID (pre-deployment Config.Image $API_CONFIG_IMAGE_BEFORE is observational only)"
 
           echo "== ONLY AUTHORIZED PRODUCTION MUTATION: recreate api ONLY from the immutable incident image (by digest) =="
           API_MUTATION_STARTED=true
