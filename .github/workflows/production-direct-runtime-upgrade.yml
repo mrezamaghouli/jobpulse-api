@@ -25,17 +25,16 @@ on:
       image_sha:
         description: >-
           Must be exactly the reviewed direct-mode target commit/merge
-          SHA bccbbd997ee83ee9219d6051a808dae17f5cc933 (Phase 4B: LinkedIn
-          job poster profile) -- this runner version only trusts that one
-          specific, already-reviewed commit as a real production
-          runtime-upgrade target (being merely an ancestor of main is not
-          the same as having been specifically reviewed for this). A
-          future reviewed workflow change may update the accepted SHA
-          once a newer commit has been through its own review. STALE:
-          bccbbd predates the 259c507 incident fix now running in
-          production, so this runner refuses it (the target must contain
-          259c507) -- do not dispatch until a reviewed change re-targets
-          Phase 4B to a build that contains the incident fix.
+          SHA 51a5c0d811bb3f345b1c147e7044259ab83ddac7 (Phase 4B: LinkedIn
+          job poster profile, on top of the 259c507 incident fix) -- this
+          runner version only trusts that one specific, already-reviewed
+          commit as a real production runtime-upgrade target (being merely
+          an ancestor of main is not the same as having been specifically
+          reviewed for this). Its API image is pinned by immutable digest,
+          never by tag. The earlier Phase 4B target bccbbd (which predates
+          259c507) is no longer accepted. A future reviewed workflow change
+          may update the accepted SHA once a newer commit has been through
+          its own review.
         required: true
         type: string
       confirmation:
@@ -67,7 +66,18 @@ env:
   # Phase 4D: bumped to the reviewed Phase 4B target (PR #32, "capture
   # LinkedIn job poster profile") now that it has been through its own
   # review and its image has been built (see docs/PRODUCTION_RUNBOOK.md).
-  REVIEWED_TARGET_SHA: "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+  # Phase 4B re-target: 51a5c0d (main after PR #44) carries the same
+  # Phase 4B provider/frontend as the original bccbbd target plus the
+  # 259c507 incident fix; bccbbd itself predates the fix and is no longer
+  # accepted.
+  REVIEWED_TARGET_SHA: "51a5c0d811bb3f345b1c147e7044259ab83ddac7"
+  # The reviewed target's API image, pinned by immutable OCI index digest
+  # (Build JobPulse API Image run 37111578308; SLSA provenance
+  # vcs:revision = REVIEWED_TARGET_SHA; linux/amd64 manifest
+  # sha256:ddf09ccb00f610dcec3af3bb3206120e4857762b33411f94f9a3b92598f21ca0,
+  # config sha256:5533852e7271f8f90aa77d883a8759f4392adca271bd46985475a34be428c6ff).
+  # Never the floating :main tag and never a re-pointable :<sha> tag.
+  TARGET_IMAGE_REF: "ghcr.io/mrezamaghouli/jobpulse-api@sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9"
   # The exact commit this runner version requires production to already
   # be running before it will touch anything -- refuses to guess/adapt
   # to a different live runtime. Phase 4D: bumped to f4765f8...917147,
@@ -335,7 +345,9 @@ jobs:
           set -euo pipefail
 
           TARGET_COMPOSE_SHA256="$(sha256sum /tmp/target-compose.yml | awk '{print $1}')"
-          TARGET_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"
+          # Phase 4B re-target: the reviewed immutable digest reference,
+          # never a tag derived from IMAGE_SHA.
+          TARGET_IMAGE="$TARGET_IMAGE_REF"
           # Phase 4D: Phase 4B artifact-provenance hashes, all derived
           # from immutable git objects extracted in earlier steps --
           # never from a local filesystem copy or from production.
@@ -408,6 +420,13 @@ jobs:
           EXPECTED_CURRENT_API_SOURCE_SHA="259c507e10def1cae5a4f10cd718811981233f0d"
           EXPECTED_CURRENT_API_IMAGE_REF="ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
           EXPECTED_CURRENT_API_IMAGE_ID="sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
+          # Phase 4B re-target: the reviewed target image, pinned
+          # independently of the TARGET_IMAGE argument (same value as the
+          # workflow-level TARGET_IMAGE_REF). On this host's containerd
+          # image store a pulled image's ID is its OCI index digest, so the
+          # pulled ID must be exactly that digest.
+          EXPECTED_TARGET_IMAGE_REF="ghcr.io/mrezamaghouli/jobpulse-api@sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9"
+          EXPECTED_TARGET_IMAGE_ID="sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9"
 
           WORKFLOW_SUCCESS=false
           # *_MUTATION_STARTED is set IMMEDIATELY BEFORE its mutating
@@ -1775,6 +1794,10 @@ jobs:
           fi
 
           echo "--- pinning immutable target API image (never :main/:latest) ---"
+          if [ "$TARGET_IMAGE" != "$EXPECTED_TARGET_IMAGE_REF" ]; then
+            echo "ERROR: target image '$TARGET_IMAGE' != reviewed immutable reference '$EXPECTED_TARGET_IMAGE_REF' -- refusing to proceed, no mutation" >&2
+            exit 1
+          fi
           TMP_DOCKER_CONFIG="$(mktemp -d)"
           if [ "$HAS_TOKEN" = "true" ]; then
             # The GHCR token arrives on THIS script's own stdin, piped
@@ -1786,6 +1809,15 @@ jobs:
           DOCKER_CONFIG="$TMP_DOCKER_CONFIG" docker pull "$TARGET_IMAGE"
           TARGET_IMAGE_ID="$(docker image inspect "$TARGET_IMAGE" --format '{{.Id}}')"
           echo "Target image ID: $TARGET_IMAGE_ID"
+          if [ "$TARGET_IMAGE_ID" != "$EXPECTED_TARGET_IMAGE_ID" ]; then
+            echo "ERROR: pulled target image ID '$TARGET_IMAGE_ID' != reviewed '$EXPECTED_TARGET_IMAGE_ID' -- refusing to proceed, no mutation" >&2
+            exit 1
+          fi
+          TARGET_IMAGE_PLATFORM="$(docker image inspect "$TARGET_IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+          if [ "$TARGET_IMAGE_PLATFORM" != "linux/amd64" ]; then
+            echo "ERROR: pulled target image platform '$TARGET_IMAGE_PLATFORM' != linux/amd64 -- refusing to proceed, no mutation" >&2
+            exit 1
+          fi
 
           echo "--- preparing rollback handle (never overwrites the target immutable SHA tag) ---"
           ROLLBACK_TAG="jobpulse-api-rollback:${TARGET_SHA:0:12}-$$"
