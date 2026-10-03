@@ -2610,6 +2610,11 @@ already runs.
 
 ## Phase 4D: Controlled Phase 4B Production Rollout Runner
 
+> **Stale target -- do not dispatch.** The `bccbbd` Phase 4B target
+> below predates the 259c507 incident fix now running in production, and
+> the runner now refuses it. See "Current state after incident 259c507"
+> at the end of this runbook.
+
 ### Purpose
 
 Phase 4B (PR #32, merged as `bccbbd997ee83ee9219d6051a808dae17f5cc933`)
@@ -3453,6 +3458,11 @@ made.
 
 ## Phase 4M: API reference normalization runner
 
+> **Superseded -- must not be dispatched.** Every precondition below
+> describes the pre-incident f476 runtime, and the runner's target would
+> put f476 API bytes back in place of the 259c507 incident fix. See
+> "Current state after incident 259c507" at the end of this runbook.
+
 By this point the chain of prior phases has left production in a
 well-understood, purely cosmetic state of debt:
 
@@ -3758,6 +3768,10 @@ has actually run. Production remains on the exact Phase 4K/4L baseline,
 of this runner is made.
 
 ## Phase 4M: Pre-normalization read-only verification runner
+
+> **Superseded -- must not be dispatched.** It verifies the pre-incident
+> f476 preconditions of the superseded normalization runner above. See
+> "Current state after incident 259c507" at the end of this runbook.
 
 `.github/workflows/production-prenormalization-readonly-verification.yml`
 is a dedicated, `workflow_dispatch`-only, **read-only** companion to the
@@ -4193,3 +4207,135 @@ collection cycle, a collector or queue script, or a LinkedIn request.
 Collection verification on the new image is the next, separately
 authorized task. **Phase 4M remains paused**: no normalization and no
 read-only verifier dispatch.
+
+## Current state after incident 259c507
+
+This section records the production state after the incident and what
+it means for the remaining runners. The incident sections above are
+kept unchanged as history.
+
+### Incident resolved
+
+**Root cause.** On f476, `is_invalid_linkedin_search_header_job()`
+treated `location == "Unknown Location"` plus an empty description as
+header-artifact evidence. Legitimate LinkedIn jobs that lacked both were
+dropped as `filtered_header_artifact`, and useful ingestion stopped.
+
+**Fix.** `259c507e10def1cae5a4f10cd718811981233f0d` (PR #40). Its only
+parent is f476, and its only non-test change is
+`scripts/collector_postgres.py`.
+
+**Deployment.** Production Incident 259c507 Deploy, run `37102638420`,
+`conclusion=success` (2026-10-03, 06:18:51Z to 06:21:51Z). It recreated
+only the API from the immutable image:
+
+- `ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4`
+- image ID `sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4`
+
+**Verification.** The first scheduled collection after the deployment
+succeeded:
+
+| Field | Value |
+|---|---|
+| `run_id` | `8ad5809d-08b7-408b-8fe7-77e5a8553fa5` |
+| started / finished | 2026-10-03T06:30:01Z / 2026-10-03T06:33:19Z |
+| `status` / `final_outcome` | `success` / `useful_success` |
+| `jobs_discovered` / `jobs_valid` | 5 / 5 |
+| `jobs_filtered_header_artifact` | 0 |
+| `rows_inserted` / `rows_updated_existing` | 5 / 0 |
+| `useful_queries` / `zero_yield_queries` | 5 / 0 |
+| `last_useful_ingestion_at` | 2026-10-03T06:33:19.861220+00:00 |
+
+The incident is resolved.
+
+### Current production baseline
+
+| Component | State |
+|---|---|
+| Production git | `f4765f857355c6543f68cea0e481b7f20a917147` (f476), unchanged by the deployment |
+| API source | `259c507e10def1cae5a4f10cd718811981233f0d` |
+| API image | the immutable 259c507 image above, by digest |
+| API provider / frontend | f476 versions; Phase 4B is **not** deployed |
+| Transport | `SEARCH_TRANSPORT` direct, `TOR_ENABLED=false` |
+| DB / frontend / Tor | not recreated by the deployment |
+
+Production git no longer identifies the running API: git is f476 while
+the API runs 259c507. Any runner that decides "what is running" from the
+git SHA alone is stale.
+
+### Runner status
+
+- **Phase 4M is superseded and MUST NOT be dispatched.** This covers both
+  `production-api-reference-normalization.yml` and
+  `production-prenormalization-readonly-verification.yml`. Their pins
+  (the f476 image ID, the `jobpulse-api-rollback:bccbbd997ee8-1427495`
+  alias, and API container `ac66a4ac…`) describe the pre-incident
+  runtime. Their target would put the f476 API bytes back, removing the
+  incident fix. As written they fail closed on the container-ID check
+  before any mutation. Re-pinning them would not make them safe.
+- **The `bccbbd` Phase 4B rollout target is stale and MUST NOT be
+  dispatched.** `production-direct-runtime-upgrade.yml` still pins
+  `REVIEWED_TARGET_SHA=bccbbd997ee83ee9219d6051a808dae17f5cc933`.
+  `bccbbd` does not contain 259c507, so deploying it would remove the
+  fix even though every git-based gate passes. The runner now blocks
+  this (see below).
+- **Phase 4B remains not deployed.** Any future Phase 4B rollout must be
+  built from a source that contains `259c507e10def1cae5a4f10cd718811981233f0d`
+  (current `main` does). It needs its own reviewed re-targeting change,
+  preflight, and separately authorized dispatch.
+
+### Direct runtime upgrade runner: current-runtime gate
+
+`production-direct-runtime-upgrade.yml` now pins the running API's
+identity separately from git:
+
+- `EXPECTED_CURRENT_API_SOURCE_SHA=259c507e10def1cae5a4f10cd718811981233f0d`
+- `EXPECTED_CURRENT_API_IMAGE_REF=ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873b…`
+- `EXPECTED_CURRENT_API_IMAGE_ID=sha256:91cd873b…`
+
+It enforces them in two places.
+
+**On the GitHub runner, before any SSH key material exists.** The step
+"Require target to contain the currently deployed API source" fails
+unless `EXPECTED_CURRENT_API_SOURCE_SHA` is an ancestor of the target.
+The stale `bccbbd` target fails here.
+
+**On production.** `verify_current_api_runtime_identity` requires both
+the API's image ID and its exact `Config.Image` to match the pins. It
+runs at three points:
+
+1. First, right after the EXIT trap is registered. This is before the
+   checkout checks, the scheduler scan, any lock, the GHCR login, any
+   pull, the rollback tag, the API recreation, or `git reset`.
+2. On the exact values captured for rollback (`API_IMAGE_REF_BEFORE`,
+   `API_IMAGE_ID_BEFORE`). This replaces the old text-only check against
+   `ghcr.io/mrezamaghouli/jobpulse-api:<EXPECTED_CURRENT_SHA>`.
+3. Again after the locks are held and immediately before the first
+   mutation, together with an unchanged-container-ID check.
+
+A pre-incident runtime fails the gate: the f476 image ID, the old
+rollback alias, or the canonical f476 tag. So does a mismatched
+reference/ID pair. The failure happens with nothing mutated, and the
+EXIT trap reports `api_mutation_started=false`. The rollback model and
+the Phase 4L hardening are unchanged. Rollback still restores
+`API_IMAGE_ID_BEFORE`, which is now proven to be the 259c507 image, and
+the f476 git baseline.
+
+### Known image-reference hazards (not fixed by this change)
+
+- **`docker-compose.prod.yml` defaults the API image to a floating tag.**
+  The line is `image: ${JOBPULSE_API_IMAGE:-ghcr.io/mrezamaghouli/jobpulse-api:main}`.
+  Any `docker compose ... up` for `api` on production without
+  `JOBPULSE_API_IMAGE` set would move the API off the pinned 259c507
+  image onto whatever `:main` points to. Always pass the digest
+  reference explicitly.
+- **Generic `deploy.yml`** resolves the floating `:main` tag and runs
+  `git reset --hard` before deploying (see Phase 3.4N-B). It has two
+  paths:
+  - a `workflow_run` path after "Build JobPulse API Image" on `main`,
+    gated on the repository variable
+    `PRODUCTION_AUTO_DEPLOY_ENABLED == 'true'`. That variable was not set
+    as of 2026-10-03.
+  - a manual `workflow_dispatch` path.
+
+  Hardening it is a separate concern.

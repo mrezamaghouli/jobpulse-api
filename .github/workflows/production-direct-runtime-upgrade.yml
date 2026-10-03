@@ -31,7 +31,11 @@ on:
           runtime-upgrade target (being merely an ancestor of main is not
           the same as having been specifically reviewed for this). A
           future reviewed workflow change may update the accepted SHA
-          once a newer commit has been through its own review.
+          once a newer commit has been through its own review. STALE:
+          bccbbd predates the 259c507 incident fix now running in
+          production, so this runner refuses it (the target must contain
+          259c507) -- do not dispatch until a reviewed change re-targets
+          Phase 4B to a build that contains the incident fix.
         required: true
         type: string
       confirmation:
@@ -71,6 +75,21 @@ env:
   # production to (Phase 3.4N-B) and which the Phase 4C pre-rollout
   # diagnostic (run 34831537574) re-confirmed production is still on.
   EXPECTED_CURRENT_SHA: "f4765f857355c6543f68cea0e481b7f20a917147"
+  # Incident 259c507 follow-up: production git staying on
+  # EXPECTED_CURRENT_SHA no longer identifies the running API. The
+  # incident deployment (production-incident-259c507-deploy.yml, run
+  # 37102638420) replaced ONLY the API container with the immutable
+  # 259c507 image, leaving git on f476. The runner therefore pins the
+  # running API's identity separately -- immutable image ID AND exact
+  # Config.Image reference -- and fails closed before any mutation on a
+  # mismatch. Any target must also contain this source (see "Require
+  # target to contain the currently deployed API source" below), so no
+  # upgrade can silently drop the incident fix. See
+  # docs/PRODUCTION_RUNBOOK.md's "Current state after incident 259c507"
+  # section.
+  EXPECTED_CURRENT_API_SOURCE_SHA: "259c507e10def1cae5a4f10cd718811981233f0d"
+  EXPECTED_CURRENT_API_IMAGE_REF: "ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
+  EXPECTED_CURRENT_API_IMAGE_ID: "sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
   IMAGE_SHA: ${{ inputs.image_sha }}
   CONFIRMATION: ${{ inputs.confirmation }}
 
@@ -188,6 +207,22 @@ jobs:
 
           echo "Target frontend SHA-256: $(sha256sum /tmp/target-frontend-index.html | awk '{print $1}')"
           echo "Target provider SHA-256: $(sha256sum /tmp/target-provider.py | awk '{print $1}')"
+
+      # Incident 259c507 follow-up: production's API runs the 259c507
+      # incident fix while git stays on EXPECTED_CURRENT_SHA (f476). A
+      # target that does not contain that source would silently remove
+      # the fix even though every git-based gate passes -- exactly the
+      # case of the stale Phase 4B target bccbbd, which predates it.
+      # Runs before any SSH key material exists.
+      - name: Require target to contain the currently deployed API source
+        run: |
+          set -euo pipefail
+          git cat-file -e "${EXPECTED_CURRENT_API_SOURCE_SHA}^{commit}"
+          if ! git merge-base --is-ancestor "$EXPECTED_CURRENT_API_SOURCE_SHA" "$IMAGE_SHA"; then
+            echo "ERROR: target $IMAGE_SHA does not contain the currently deployed API source $EXPECTED_CURRENT_API_SOURCE_SHA (incident 259c507 fix) -- deploying it would remove the fix; refusing to proceed" >&2
+            exit 1
+          fi
+          echo "Target contains the currently deployed API source $EXPECTED_CURRENT_API_SOURCE_SHA."
 
       - name: Derive expected current (pre-upgrade) frontend/provider hashes from EXPECTED_CURRENT_SHA
         run: |
@@ -366,6 +401,13 @@ jobs:
           # the Phase 4C pre-rollout diagnostic re-confirmed is still
           # live -- same value as the workflow-level env pin above.
           EXPECTED_CURRENT_SHA="f4765f857355c6543f68cea0e481b7f20a917147"
+          # Incident 259c507 follow-up: the running API's own identity,
+          # pinned separately from git -- same values as the
+          # workflow-level env pins above. Enforced by
+          # verify_current_api_runtime_identity() below.
+          EXPECTED_CURRENT_API_SOURCE_SHA="259c507e10def1cae5a4f10cd718811981233f0d"
+          EXPECTED_CURRENT_API_IMAGE_REF="ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
+          EXPECTED_CURRENT_API_IMAGE_ID="sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
 
           WORKFLOW_SUCCESS=false
           # *_MUTATION_STARTED is set IMMEDIATELY BEFORE its mutating
@@ -1324,6 +1366,35 @@ jobs:
             echo "Internal wrapper collection-cycle lock acquired: $CYCLE_LOCK_PATH"
           }
 
+          # Incident 259c507 follow-up: current API runtime identity gate.
+          # Both the immutable image ID (the bytes) and the exact
+          # Config.Image reference must match the pinned incident
+          # runtime. A stale pre-incident runtime (f476 bytes, the old
+          # jobpulse-api-rollback alias, or the canonical f476 tag) fails
+          # here. Read-only: only `docker inspect` is ever invoked.
+          verify_current_api_runtime_identity() {
+            local stage="$1" config_image="$2" image_id="$3"
+            if [ "$image_id" != "$EXPECTED_CURRENT_API_IMAGE_ID" ]; then
+              echo "ERROR: [$stage] running API image ID '$image_id' != pinned current runtime '$EXPECTED_CURRENT_API_IMAGE_ID' (source $EXPECTED_CURRENT_API_SOURCE_SHA) -- refusing to proceed, no mutation" >&2
+              return 1
+            fi
+            if [ "$config_image" != "$EXPECTED_CURRENT_API_IMAGE_REF" ]; then
+              echo "ERROR: [$stage] running API Config.Image '$config_image' != pinned current runtime reference '$EXPECTED_CURRENT_API_IMAGE_REF' -- refusing to proceed, no mutation" >&2
+              return 1
+            fi
+            echo "current_api_runtime_identity[$stage]=confirmed source=$EXPECTED_CURRENT_API_SOURCE_SHA image_id=$image_id"
+          }
+
+          read_and_verify_current_api_runtime_identity() {
+            local stage="$1" config_image image_id
+            if ! config_image="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod 2>/dev/null)" \
+              || ! image_id="$(docker inspect -f '{{.Image}}' jobpulse-api-prod 2>/dev/null)"; then
+              echo "ERROR: [$stage] cannot inspect jobpulse-api-prod -- refusing to proceed, no mutation" >&2
+              return 1
+            fi
+            verify_current_api_runtime_identity "$stage" "$config_image" "$image_id"
+          }
+
           final_exit_trap() {
             local ec=$?
             set +e
@@ -1405,6 +1476,9 @@ jobs:
           }
           trap final_exit_trap EXIT
 
+          echo "--- current API runtime identity gate (read-only; before any lock, pull, tag, recreate or git mutation) ---"
+          read_and_verify_current_api_runtime_identity initial || exit 1
+
           echo "--- production checkout precondition (read-only) ---"
           cd /opt/jobpulse
           CURRENT_HEAD="$(git rev-parse HEAD)"
@@ -1473,15 +1547,14 @@ jobs:
             exit 1
           fi
 
+          # Incident 259c507 follow-up: the API is no longer identified by
+          # a ghcr.io/...:<EXPECTED_CURRENT_SHA> tag -- git stays f476 while
+          # the API runs the pinned 259c507 image. Re-proven here on the
+          # exact values captured for rollback.
           API_IMAGE_REF_BEFORE="$(docker inspect -f '{{.Config.Image}}' jobpulse-api-prod)"
-          EXPECTED_CURRENT_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${EXPECTED_CURRENT_SHA}"
-          if [ "$API_IMAGE_REF_BEFORE" != "$EXPECTED_CURRENT_IMAGE" ]; then
-            echo "ERROR: current API image reference '$API_IMAGE_REF_BEFORE' != expected '$EXPECTED_CURRENT_IMAGE'" >&2
-            exit 1
-          fi
-
           API_ID_BEFORE="$(docker inspect -f '{{.Id}}' jobpulse-api-prod)"
           API_IMAGE_ID_BEFORE="$(docker inspect -f '{{.Image}}' jobpulse-api-prod)"
+          verify_current_api_runtime_identity capture "$API_IMAGE_REF_BEFORE" "$API_IMAGE_ID_BEFORE" || exit 1
           API_RESTARTS_BEFORE="$(docker inspect -f '{{.RestartCount}}' jobpulse-api-prod)"
           API_RUNNING_BEFORE="$(docker inspect -f '{{.State.Running}}' jobpulse-api-prod)"
           API_HEALTH_BEFORE="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' jobpulse-api-prod)"
@@ -1691,6 +1764,13 @@ jobs:
           fi
           if [ "$EFFECTIVE_CANDIDATE_TOR_ENABLED" != "false" ]; then
             echo "ERROR: effective candidate Compose TOR_ENABLED is not exactly 'false' (got '${EFFECTIVE_CANDIDATE_TOR_ENABLED:-<unset>}') -- refusing to proceed" >&2
+            exit 1
+          fi
+
+          echo "--- re-verifying current API runtime identity immediately before the first mutation ---"
+          read_and_verify_current_api_runtime_identity pre_mutation || exit 1
+          if [ "$(docker inspect -f '{{.Id}}' jobpulse-api-prod)" != "$API_ID_BEFORE" ]; then
+            echo "ERROR: jobpulse-api-prod container ID changed since capture -- refusing to proceed, no mutation" >&2
             exit 1
           fi
 

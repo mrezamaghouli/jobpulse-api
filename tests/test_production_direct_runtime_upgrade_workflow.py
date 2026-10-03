@@ -604,8 +604,12 @@ def test_current_checkout_sha_checked_before_any_mutation(remote_script):
 
 
 def test_current_api_image_reference_checked(remote_script):
-    assert 'EXPECTED_CURRENT_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${EXPECTED_CURRENT_SHA}"' in remote_script
-    assert '"$API_IMAGE_REF_BEFORE" != "$EXPECTED_CURRENT_IMAGE"' in remote_script
+    # Incident 259c507 follow-up: the captured Config.Image and image ID
+    # are verified against the pinned incident runtime, never against a
+    # ghcr.io/...:<EXPECTED_CURRENT_SHA> tag (git stays f476 while the API
+    # runs 259c507).
+    assert 'verify_current_api_runtime_identity capture "$API_IMAGE_REF_BEFORE" "$API_IMAGE_ID_BEFORE" || exit 1' in remote_script
+    assert 'EXPECTED_CURRENT_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${EXPECTED_CURRENT_SHA}"' not in remote_script
 
 
 def test_tracked_worktree_cleanliness_checked_untracked_allowed(remote_script):
@@ -4493,3 +4497,295 @@ def test_no_command_substitution_body_hash_anywhere(remote_script):
     code = "\n".join(_executable_lines(remote_script))
     assert 'BODY="$(curl' not in code
     assert "sha256sum <<<" not in code
+
+
+# =====================================================================
+# Incident 259c507 follow-up: current API runtime identity gate and
+# stale-target block
+# =====================================================================
+#
+# The 259c507 incident deployment (run 37102638420) replaced ONLY the
+# API container with the immutable 259c507 image; production git stays
+# on EXPECTED_CURRENT_SHA (f476). These tests prove the runner pins the
+# running API's identity separately from git, fails closed on any
+# mismatch strictly before any lock, pull, tag, recreate or git
+# mutation, and refuses any target (including the stale Phase 4B target
+# bccbbd) that does not contain the incident fix.
+
+INCIDENT_SOURCE_SHA = "259c507e10def1cae5a4f10cd718811981233f0d"
+INCIDENT_IMAGE_REF = "ghcr.io/mrezamaghouli/jobpulse-api@sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
+INCIDENT_IMAGE_ID = "sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4"
+# Pre-incident (f476) runtime identities that must no longer pass.
+F476_IMAGE_ID = "sha256:7739628f61c3bba88ff4e395c0f0a0ce3bea3e3abb40956207b495f9d909b753"
+F476_ROLLBACK_ALIAS = "jobpulse-api-rollback:bccbbd997ee8-1427495"
+F476_CANONICAL_TAG = "ghcr.io/mrezamaghouli/jobpulse-api:f4765f857355c6543f68cea0e481b7f20a917147"
+
+RUNTIME_GATE_INITIAL = "read_and_verify_current_api_runtime_identity initial || exit 1"
+RUNTIME_GATE_PRE_MUTATION = "read_and_verify_current_api_runtime_identity pre_mutation || exit 1"
+CONTAINS_SOURCE_STEP = "Require target to contain the currently deployed API source"
+
+
+def test_current_runtime_identity_pinned_in_workflow_env(workflow):
+    env = workflow["env"]
+    assert env["EXPECTED_CURRENT_API_SOURCE_SHA"] == INCIDENT_SOURCE_SHA
+    assert env["EXPECTED_CURRENT_API_IMAGE_REF"] == INCIDENT_IMAGE_REF
+    assert env["EXPECTED_CURRENT_API_IMAGE_ID"] == INCIDENT_IMAGE_ID
+    # Git baseline is unchanged: the incident deployment never moved git.
+    assert env["EXPECTED_CURRENT_SHA"] == EXPECTED_CURRENT_SHA
+
+
+def test_current_runtime_identity_pinned_in_remote_script(remote_script):
+    assert f'EXPECTED_CURRENT_API_SOURCE_SHA="{INCIDENT_SOURCE_SHA}"' in remote_script
+    assert f'EXPECTED_CURRENT_API_IMAGE_REF="{INCIDENT_IMAGE_REF}"' in remote_script
+    assert f'EXPECTED_CURRENT_API_IMAGE_ID="{INCIDENT_IMAGE_ID}"' in remote_script
+
+
+def test_pre_incident_runtime_assumptions_are_not_active_pins(workflow, remote_script):
+    env = workflow["env"]
+    for stale in (F476_IMAGE_ID, F476_ROLLBACK_ALIAS, F476_CANONICAL_TAG):
+        assert env["EXPECTED_CURRENT_API_IMAGE_ID"] != stale
+        assert env["EXPECTED_CURRENT_API_IMAGE_REF"] != stale
+        assert stale not in remote_script, stale
+    code = "\n".join(_executable_lines(remote_script))
+    # The old text-only check that identified the API by a tag derived
+    # from the f476 git SHA must be gone.
+    assert "jobpulse-api:${EXPECTED_CURRENT_SHA}" not in code
+
+
+def _main_sequence_index(remote_script: str, needle: str) -> int:
+    """Index of `needle` in the main upgrade sequence -- i.e. after the
+    EXIT trap is registered, so function bodies (rollback_api etc.)
+    defined earlier never satisfy an ordering assertion by accident."""
+    start = remote_script.index("trap final_exit_trap EXIT")
+    return remote_script.index(needle, start)
+
+
+def test_initial_runtime_gate_precedes_every_lock_and_mutation(remote_script):
+    gate = _main_sequence_index(remote_script, RUNTIME_GATE_INITIAL)
+    for later in (
+        'echo "--- production checkout precondition (read-only) ---"',
+        "if ! acquire_outer_lock; then",
+        "if ! acquire_internal_lock; then",
+        'TMP_DOCKER_CONFIG="$(mktemp -d)"',
+        "docker login ghcr.io",
+        'docker pull "$TARGET_IMAGE"',
+        'docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"',
+        "API_MUTATION_STARTED=true",
+        'JOBPULSE_API_IMAGE="$TARGET_IMAGE" docker compose',
+        "GIT_MUTATION_STARTED=true",
+        'git reset --hard "$TARGET_SHA"',
+    ):
+        assert gate < _main_sequence_index(remote_script, later), later
+
+
+def test_pre_mutation_runtime_gate_follows_locks_and_precedes_first_mutation(remote_script):
+    gate = _main_sequence_index(remote_script, RUNTIME_GATE_PRE_MUTATION)
+    assert _main_sequence_index(remote_script, "if ! acquire_internal_lock; then") < gate
+    for later in (
+        'TMP_DOCKER_CONFIG="$(mktemp -d)"',
+        "docker login ghcr.io",
+        'docker pull "$TARGET_IMAGE"',
+        'docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"',
+        "API_MUTATION_STARTED=true",
+        'git reset --hard "$TARGET_SHA"',
+    ):
+        assert gate < _main_sequence_index(remote_script, later), later
+
+
+def test_capture_gate_verifies_the_values_used_for_rollback(remote_script):
+    capture = _main_sequence_index(
+        remote_script,
+        'verify_current_api_runtime_identity capture "$API_IMAGE_REF_BEFORE" "$API_IMAGE_ID_BEFORE" || exit 1',
+    )
+    assert _main_sequence_index(remote_script, 'API_IMAGE_ID_BEFORE="$(docker inspect') < capture
+    assert capture < _main_sequence_index(remote_script, 'docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"')
+
+
+def test_existing_rollback_model_preserved(remote_script):
+    # Rollback still restores the exact pre-upgrade image ID (now proven
+    # to be the 259c507 incident image) and the f476 git baseline.
+    assert 'docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"' in remote_script
+    assert 'JOBPULSE_API_IMAGE="$ROLLBACK_TAG" docker compose' in remote_script
+    assert '[ "$rb_image_id" = "$API_IMAGE_ID_BEFORE" ]' in remote_script
+    assert 'git reset --hard "$EXPECTED_CURRENT_SHA"' in remote_script
+
+
+# --- behavioral: the real gate functions, executed against fixtures ---
+
+@pytest.fixture(scope="module")
+def runtime_pin_assignments(remote_script) -> str:
+    """The real constant assignment lines, verbatim from the heredoc."""
+    lines = [
+        line.strip()
+        for line in remote_script.splitlines()
+        if re.match(r"\s*EXPECTED_CURRENT_API_(SOURCE_SHA|IMAGE_REF|IMAGE_ID)=", line)
+    ]
+    assert len(lines) == 3, lines
+    return "\n".join(lines)
+
+
+def _verify_body(pins: str, config_image: str, image_id: str) -> str:
+    return (
+        pins
+        + "\n"
+        + f"if verify_current_api_runtime_identity test {shlex.quote(config_image)} {shlex.quote(image_id)}; then echo GATE=PASS; else echo GATE=FAIL; fi\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "config_image,image_id,expected",
+    [
+        (INCIDENT_IMAGE_REF, INCIDENT_IMAGE_ID, "GATE=PASS"),
+        # Pre-incident runtimes: f476 bytes under any of their references.
+        (F476_ROLLBACK_ALIAS, F476_IMAGE_ID, "GATE=FAIL"),
+        (F476_CANONICAL_TAG, F476_IMAGE_ID, "GATE=FAIL"),
+        # Right reference text, wrong bytes (a re-pointed tag/reference).
+        (INCIDENT_IMAGE_REF, F476_IMAGE_ID, "GATE=FAIL"),
+        # Right bytes, unexpected reference.
+        (F476_CANONICAL_TAG, INCIDENT_IMAGE_ID, "GATE=FAIL"),
+        (F476_ROLLBACK_ALIAS, INCIDENT_IMAGE_ID, "GATE=FAIL"),
+        ("", "", "GATE=FAIL"),
+    ],
+)
+def test_behavior_runtime_identity_gate(
+    extracted_functions_script, runtime_pin_assignments, harness_bin, config_image, image_id, expected
+):
+    result = _run_harness(
+        extracted_functions_script, harness_bin, _verify_body(runtime_pin_assignments, config_image, image_id)
+    )
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout, result.stdout + result.stderr
+    if expected == "GATE=FAIL":
+        assert "refusing to proceed, no mutation" in result.stderr
+    _assert_mutation_sentinels_untouched(result)
+
+
+def _fake_inspect_docker(bin_dir):
+    """`docker` that answers only the two narrow inspect formats and
+    logs every invocation; anything else is a mutation sentinel."""
+    return _write_fake_executable(
+        bin_dir,
+        "docker",
+        'echo "$*" >> "$FAKE_DOCKER_LOG"\n'
+        '[ "${FAKE_INSPECT_FAIL:-}" = "1" ] && exit 1\n'
+        'if [ "$1" = "inspect" ] && [ "$2" = "-f" ] && [ "$4" = "jobpulse-api-prod" ]; then\n'
+        '  case "$3" in\n'
+        "    '{{.Config.Image}}') echo \"$FAKE_CONFIG_IMAGE\"; exit 0 ;;\n"
+        "    '{{.Image}}') echo \"$FAKE_IMAGE_ID\"; exit 0 ;;\n"
+        "  esac\n"
+        "fi\n"
+        "echo \"FATAL_TEST_HARNESS_MUTATION_SENTINEL: docker $*\" >&2\n"
+        "exit 99\n",
+    )
+
+
+def _run_remote_prefix_through_initial_gate(remote_script, harness_bin, tmp_path, config_image, image_id, inspect_fail=False):
+    """Runs the REAL remote script verbatim from its first line through
+    the initial runtime gate (header, every function definition, the
+    real EXIT trap) with a logging fake `docker` and the git/flock
+    mutation sentinels -- fully offline."""
+    end = remote_script.index(RUNTIME_GATE_INITIAL) + len(RUNTIME_GATE_INITIAL)
+    script_path = tmp_path / "remote_prefix.sh"
+    script_path.write_text(remote_script[:end].lstrip("\n") + "\necho PREFIX_REACHED_END\n")
+    fixture_bin = tmp_path / "fixture_bin"
+    fixture_bin.mkdir()
+    _fake_inspect_docker(fixture_bin)
+    log = tmp_path / "docker.log"
+    env = dict(os.environ)
+    env["PATH"] = f"{fixture_bin}:{harness_bin}:{env.get('PATH', '')}"
+    env.update(
+        FAKE_DOCKER_LOG=str(log),
+        FAKE_CONFIG_IMAGE=config_image,
+        FAKE_IMAGE_ID=image_id,
+        FAKE_INSPECT_FAIL="1" if inspect_fail else "0",
+    )
+    args = ["compose-sha", "target-image", "a" * 40, "false", "fe-sha", "prov-sha", "cur-fe-sha", "cur-prov-sha"]
+    result = sp.run(["bash", str(script_path), *args], capture_output=True, text=True, timeout=15, env=env, cwd=tmp_path)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return result, calls
+
+
+@pytest.mark.parametrize(
+    "config_image,image_id",
+    [
+        (F476_ROLLBACK_ALIAS, F476_IMAGE_ID),
+        (F476_CANONICAL_TAG, F476_IMAGE_ID),
+        (INCIDENT_IMAGE_REF, F476_IMAGE_ID),
+    ],
+)
+def test_behavior_stale_runtime_aborts_before_any_mutation(remote_script, harness_bin, tmp_path, config_image, image_id):
+    result, calls = _run_remote_prefix_through_initial_gate(remote_script, harness_bin, tmp_path, config_image, image_id)
+    assert result.returncode != 0
+    assert "PREFIX_REACHED_END" not in result.stdout
+    assert "[initial]" in result.stderr and "refusing to proceed, no mutation" in result.stderr
+    # The real EXIT trap confirms nothing had started and nothing rolled back.
+    assert "No candidate API mutation had started -- nothing to roll back." in result.stderr
+    assert "api_mutation_started=false" in result.stderr
+    assert "git_mutation_started=false" in result.stderr
+    # Only read-only inspects of the API container ever reached docker.
+    assert calls and all(c.startswith("inspect -f ") and c.endswith(" jobpulse-api-prod") for c in calls), calls
+    _assert_mutation_sentinels_untouched(result)
+
+
+def test_behavior_uninspectable_api_aborts_before_any_mutation(remote_script, harness_bin, tmp_path):
+    result, calls = _run_remote_prefix_through_initial_gate(
+        remote_script, harness_bin, tmp_path, INCIDENT_IMAGE_REF, INCIDENT_IMAGE_ID, inspect_fail=True
+    )
+    assert result.returncode != 0
+    assert "cannot inspect jobpulse-api-prod" in result.stderr
+    assert "api_mutation_started=false" in result.stderr
+    _assert_mutation_sentinels_untouched(result)
+
+
+def test_behavior_incident_runtime_passes_initial_gate(remote_script, harness_bin, tmp_path):
+    result, calls = _run_remote_prefix_through_initial_gate(
+        remote_script, harness_bin, tmp_path, INCIDENT_IMAGE_REF, INCIDENT_IMAGE_ID
+    )
+    assert "current_api_runtime_identity[initial]=confirmed" in result.stdout, result.stdout + result.stderr
+    assert "PREFIX_REACHED_END" in result.stdout
+    assert all(c.startswith("inspect -f ") for c in calls), calls
+    _assert_mutation_sentinels_untouched(result)
+
+
+# --- runner side: the target must contain the incident fix ---
+
+def test_contains_source_step_runs_after_checkout_and_before_ssh_material(steps):
+    names = [s.get("name") for s in steps]
+    idx = names.index(CONTAINS_SOURCE_STEP)
+    assert names.index("Checkout repository with full history") < idx
+    assert idx < names.index("Validate VM_SSH_KEY secret is present")
+    assert idx < names.index("Run the immutable direct-runtime upgrade on production")
+    text = _step_by_name(steps, CONTAINS_SOURCE_STEP)["run"]
+    assert 'git merge-base --is-ancestor "$EXPECTED_CURRENT_API_SOURCE_SHA" "$IMAGE_SHA"' in text
+
+
+def _have_commit(sha: str) -> bool:
+    return sp.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=REPO_ROOT, capture_output=True).returncode == 0
+
+
+def _run_contains_source_step(steps, image_sha: str):
+    text = _step_by_name(steps, CONTAINS_SOURCE_STEP)["run"]
+    env = dict(os.environ)
+    env.update(IMAGE_SHA=image_sha, EXPECTED_CURRENT_API_SOURCE_SHA=INCIDENT_SOURCE_SHA)
+    return sp.run(["bash", "-c", text], cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, env=env)
+
+
+def test_behavior_stale_phase4b_target_is_blocked(steps, workflow):
+    """The still-pinned stale Phase 4B target bccbbd predates 259c507,
+    so the runner refuses it before any SSH material exists."""
+    if not (_have_commit(REVIEWED_TARGET_SHA) and _have_commit(INCIDENT_SOURCE_SHA)):
+        pytest.skip("full git history required")
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] == REVIEWED_TARGET_SHA
+    result = _run_contains_source_step(steps, REVIEWED_TARGET_SHA)
+    assert result.returncode != 0
+    assert "does not contain the currently deployed API source" in result.stderr
+
+
+def test_behavior_target_containing_incident_fix_passes(steps):
+    if not _have_commit(INCIDENT_SOURCE_SHA):
+        pytest.skip("full git history required")
+    head = sp.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    for target in (INCIDENT_SOURCE_SHA, head):
+        result = _run_contains_source_step(steps, target)
+        assert result.returncode == 0, (target, result.stderr)
+        assert "Target contains the currently deployed API source" in result.stdout
