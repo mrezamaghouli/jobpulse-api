@@ -43,7 +43,12 @@ REMOTE_HEREDOC_END = "REMOTE_SCRIPT"
 
 # Phase 4D: bumped to the reviewed Phase 4B target and the current
 # verified production baseline it replaces (see docs/PRODUCTION_RUNBOOK.md).
-REVIEWED_TARGET_SHA = "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+# Phase 4B re-target: 51a5c0d replaces the original Phase 4B target bccbbd,
+# which predates the 259c507 incident fix and must no longer be accepted.
+REVIEWED_TARGET_SHA = "51a5c0d811bb3f345b1c147e7044259ab83ddac7"
+OLD_PHASE4B_TARGET_SHA = "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+TARGET_IMAGE_REF = "ghcr.io/mrezamaghouli/jobpulse-api@sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9"
+TARGET_IMAGE_ID = "sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9"
 EXPECTED_CURRENT_SHA = "f4765f857355c6543f68cea0e481b7f20a917147"
 
 # The pins this exact runner used before Phase 4D -- asserted, in the new
@@ -576,8 +581,12 @@ def test_no_default_docker_config_mutation(remote_script):
 # 11. Exact target image
 # =====================================================================
 
-def test_target_image_computed_from_image_sha_never_main_or_latest(runner_script):
-    assert 'TARGET_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"' in runner_script
+def test_target_image_computed_from_image_sha_never_main_or_latest(runner_script, workflow):
+    # Phase 4B re-target: the target is the reviewed immutable digest
+    # reference, never a tag derived from IMAGE_SHA.
+    assert workflow["env"]["TARGET_IMAGE_REF"] == TARGET_IMAGE_REF
+    assert 'TARGET_IMAGE="$TARGET_IMAGE_REF"' in runner_script
+    assert 'TARGET_IMAGE="ghcr.io/mrezamaghouli/jobpulse-api:${IMAGE_SHA}"' not in runner_script
     for line in _executable_lines(runner_script):
         if "TARGET_IMAGE=" in line and ("main" in line.lower() or ":latest" in line):
             pytest.fail(f"mutable tag in TARGET_IMAGE assignment: {line!r}")
@@ -3010,7 +3019,8 @@ def test_this_test_file_has_no_empty_or_pass_only_tests():
 # checkout mutation.
 
 def test_reviewed_target_sha_bumped_to_phase4b(workflow):
-    assert workflow["env"]["REVIEWED_TARGET_SHA"] == "bccbbd997ee83ee9219d6051a808dae17f5cc933"
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] == "51a5c0d811bb3f345b1c147e7044259ab83ddac7"
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] != OLD_PHASE4B_TARGET_SHA
 
 
 def test_expected_current_sha_bumped_to_previous_verified_baseline(workflow):
@@ -4771,14 +4781,24 @@ def _run_contains_source_step(steps, image_sha: str):
 
 
 def test_behavior_stale_phase4b_target_is_blocked(steps, workflow):
-    """The still-pinned stale Phase 4B target bccbbd predates 259c507,
-    so the runner refuses it before any SSH material exists."""
+    """The original Phase 4B target bccbbd predates 259c507, so the
+    runner refuses it before any SSH material exists -- and it is no
+    longer the pinned target either."""
+    if not (_have_commit(OLD_PHASE4B_TARGET_SHA) and _have_commit(INCIDENT_SOURCE_SHA)):
+        pytest.skip("full git history required")
+    assert workflow["env"]["REVIEWED_TARGET_SHA"] != OLD_PHASE4B_TARGET_SHA
+    result = _run_contains_source_step(steps, OLD_PHASE4B_TARGET_SHA)
+    assert result.returncode != 0
+    assert "does not contain the currently deployed API source" in result.stderr
+
+
+def test_behavior_reviewed_target_contains_incident_fix(steps, workflow):
     if not (_have_commit(REVIEWED_TARGET_SHA) and _have_commit(INCIDENT_SOURCE_SHA)):
         pytest.skip("full git history required")
     assert workflow["env"]["REVIEWED_TARGET_SHA"] == REVIEWED_TARGET_SHA
     result = _run_contains_source_step(steps, REVIEWED_TARGET_SHA)
-    assert result.returncode != 0
-    assert "does not contain the currently deployed API source" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "Target contains the currently deployed API source" in result.stdout
 
 
 def test_behavior_target_containing_incident_fix_passes(steps):
@@ -4789,3 +4809,145 @@ def test_behavior_target_containing_incident_fix_passes(steps):
         result = _run_contains_source_step(steps, target)
         assert result.returncode == 0, (target, result.stderr)
         assert "Target contains the currently deployed API source" in result.stdout
+
+
+# =====================================================================
+# Phase 4B re-target (51a5c0d): digest-pinned target image
+# =====================================================================
+#
+# The reviewed target 51a5c0d contains the Phase 4B provider/frontend
+# and the 259c507 incident fix. Its API image is pinned by immutable OCI
+# index digest (Build JobPulse API Image run 37111578308) and verified on
+# production after the pull, strictly before the rollback tag, the API
+# recreation and the git reset.
+
+TARGET_PIN_ECHO = 'echo "--- pinning immutable target API image (never :main/:latest) ---"'
+TARGET_PIN_END = 'echo "--- preparing rollback handle (never overwrites the target immutable SHA tag) ---"'
+
+
+def test_target_image_pinned_in_remote_script(remote_script):
+    assert f'EXPECTED_TARGET_IMAGE_REF="{TARGET_IMAGE_REF}"' in remote_script
+    assert f'EXPECTED_TARGET_IMAGE_ID="{TARGET_IMAGE_ID}"' in remote_script
+    assert TARGET_IMAGE_REF.endswith("@" + TARGET_IMAGE_ID)
+
+
+def test_reviewed_target_is_not_the_current_runtime_or_old_target(workflow):
+    env = workflow["env"]
+    assert env["TARGET_IMAGE_REF"] != env["EXPECTED_CURRENT_API_IMAGE_REF"]
+    assert OLD_PHASE4B_TARGET_SHA not in env["TARGET_IMAGE_REF"]
+    assert ":main" not in env["TARGET_IMAGE_REF"]
+
+
+def test_target_image_checks_precede_every_mutation(remote_script):
+    for check in (
+        '"$TARGET_IMAGE" != "$EXPECTED_TARGET_IMAGE_REF"',
+        '"$TARGET_IMAGE_ID" != "$EXPECTED_TARGET_IMAGE_ID"',
+        '"$TARGET_IMAGE_PLATFORM" != "linux/amd64"',
+    ):
+        idx = _main_sequence_index(remote_script, check)
+        for later in (
+            'docker tag "$API_IMAGE_ID_BEFORE" "$ROLLBACK_TAG"',
+            "API_MUTATION_STARTED=true",
+            'JOBPULSE_API_IMAGE="$TARGET_IMAGE" docker compose',
+            'git reset --hard "$TARGET_SHA"',
+        ):
+            assert idx < _main_sequence_index(remote_script, later), (check, later)
+    # The reference check runs before any registry contact.
+    assert _main_sequence_index(remote_script, '"$TARGET_IMAGE" != "$EXPECTED_TARGET_IMAGE_REF"') < _main_sequence_index(
+        remote_script, 'docker pull "$TARGET_IMAGE"'
+    )
+
+
+def test_phase4l_live_frontend_validation_preserved(remote_script):
+    assert "wait_for_live_frontend_sha() {" in remote_script
+    # Target frontend after the git reset; the f476 frontend on rollback.
+    assert _main_sequence_index(remote_script, 'git reset --hard "$TARGET_SHA"') < _main_sequence_index(
+        remote_script, 'if ! wait_for_live_frontend_sha "$TARGET_FRONTEND_SHA256"; then'
+    )
+    assert 'if ! wait_for_live_frontend_sha "$EXPECTED_CURRENT_FRONTEND_SHA256"; then' in remote_script
+
+
+@pytest.fixture(scope="module")
+def target_pin_segment(remote_script) -> str:
+    """The real target-pin block, verbatim: from its echo through the
+    platform check, stopping before the rollback handle is prepared."""
+    start = _main_sequence_index(remote_script, TARGET_PIN_ECHO)
+    end = _main_sequence_index(remote_script, TARGET_PIN_END)
+    return remote_script[start:end]
+
+
+def _fake_pull_docker(bin_dir):
+    return _write_fake_executable(
+        bin_dir,
+        "docker",
+        'echo "$*" >> "$FAKE_DOCKER_LOG"\n'
+        'case "$1" in\n'
+        "  pull) exit 0 ;;\n"
+        '  image) if [ "$2" = "inspect" ]; then\n'
+        '      case "$*" in\n'
+        "        *'{{.Id}}'*) echo \"$FAKE_PULLED_ID\" ;;\n"
+        "        *'{{.Os}}/{{.Architecture}}'*) echo \"$FAKE_PULLED_PLATFORM\" ;;\n"
+        "      esac; exit 0; fi ;;\n"
+        "esac\n"
+        "echo \"FATAL_TEST_HARNESS_MUTATION_SENTINEL: docker $*\" >&2\n"
+        "exit 99\n",
+    )
+
+
+def _run_target_pin_segment(remote_script, target_pin_segment, harness_bin, tmp_path, target_image, pulled_id, platform="linux/amd64"):
+    pins = "\n".join(
+        line.strip()
+        for line in remote_script.splitlines()
+        if re.match(r"\s*EXPECTED_TARGET_IMAGE_(REF|ID)=", line)
+    )
+    fixture_bin = tmp_path / "fixture_bin"
+    fixture_bin.mkdir()
+    _fake_pull_docker(fixture_bin)
+    log = tmp_path / "docker.log"
+    body = (
+        pins
+        + f"\nTARGET_IMAGE={shlex.quote(target_image)}\nHAS_TOKEN=false\n"
+        + target_pin_segment
+        + "\necho SEGMENT_PASSED\n"
+    )
+    result = _run_harness(
+        "",
+        harness_bin,
+        body,
+        extra_path_dirs=(fixture_bin,),
+        extra_env={"FAKE_DOCKER_LOG": str(log), "FAKE_PULLED_ID": pulled_id, "FAKE_PULLED_PLATFORM": platform, "TMPDIR": str(tmp_path)},
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return result, calls
+
+
+def test_behavior_reviewed_target_image_passes_pin(remote_script, target_pin_segment, harness_bin, tmp_path):
+    result, calls = _run_target_pin_segment(remote_script, target_pin_segment, harness_bin, tmp_path, TARGET_IMAGE_REF, TARGET_IMAGE_ID)
+    assert "SEGMENT_PASSED" in result.stdout, result.stdout + result.stderr
+    assert f"pull {TARGET_IMAGE_REF}" in calls
+    _assert_mutation_sentinels_untouched(result)
+
+
+@pytest.mark.parametrize(
+    "target_image,pulled_id,platform,message",
+    [
+        # Old Phase 4B tag, and the floating :main tag.
+        (f"ghcr.io/mrezamaghouli/jobpulse-api:{OLD_PHASE4B_TARGET_SHA}", TARGET_IMAGE_ID, "linux/amd64", "reviewed immutable reference"),
+        ("ghcr.io/mrezamaghouli/jobpulse-api:main", TARGET_IMAGE_ID, "linux/amd64", "reviewed immutable reference"),
+        # Right reference, wrong pulled bytes (e.g. the current incident image).
+        (TARGET_IMAGE_REF, "sha256:91cd873be81d013c16503fb7b5ccec3790946203ec1c22ade31fef1882e8e5c4", "linux/amd64", "pulled target image ID"),
+        (TARGET_IMAGE_REF, TARGET_IMAGE_ID, "linux/arm64", "pulled target image platform"),
+    ],
+)
+def test_behavior_wrong_target_image_aborts_before_mutation(
+    remote_script, target_pin_segment, harness_bin, tmp_path, target_image, pulled_id, platform, message
+):
+    result, calls = _run_target_pin_segment(
+        remote_script, target_pin_segment, harness_bin, tmp_path, target_image, pulled_id, platform
+    )
+    assert result.returncode != 0
+    assert "SEGMENT_PASSED" not in result.stdout
+    assert message in result.stderr and "no mutation" in result.stderr
+    # Never a tag, rmi or compose call -- at most a pull and read-only inspects.
+    assert all(c.startswith(("pull ", "image inspect ")) for c in calls), calls
+    _assert_mutation_sentinels_untouched(result)

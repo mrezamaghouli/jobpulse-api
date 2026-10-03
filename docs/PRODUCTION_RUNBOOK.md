@@ -4339,3 +4339,64 @@ the f476 git baseline.
   - a manual `workflow_dispatch` path.
 
   Hardening it is a separate concern.
+
+### Phase 4B re-target: reviewed source 51a5c0d (deployment preparation only)
+
+`production-direct-runtime-upgrade.yml` is now prepared for a fresh
+Phase 4B rollout. This change dispatches nothing. Deploying still needs a
+read-only preflight and a separately authorized dispatch.
+
+**Target source.** `REVIEWED_TARGET_SHA` is
+`51a5c0d811bb3f345b1c147e7044259ab83ddac7` (main after PR #44). It
+contains:
+
+- the Phase 4B provider and frontend, identical to the original `bccbbd`
+  target;
+- the 259c507 incident fix: its `scripts/collector_postgres.py` is
+  byte-identical to 259c507's.
+
+Compose, Dockerfile, requirements, `app/` and `db/` are unchanged from
+f476. Phase 4B needs no database migration and no environment change.
+
+**Target image.** It is pinned by immutable OCI index digest:
+
+`ghcr.io/mrezamaghouli/jobpulse-api@sha256:47bcc3b68d027da3f4a2b7797ce0b9ca8844f975240c02642041500767c8a9c9`
+
+| Field | Value |
+|---|---|
+| Build run | Build JobPulse API Image `37111578308`, `workflow_dispatch` on main |
+| linux/amd64 manifest | `sha256:ddf09ccb00f610dcec3af3bb3206120e4857762b33411f94f9a3b92598f21ca0` |
+| config | `sha256:5533852e7271f8f90aa77d883a8759f4392adca271bd46985475a34be428c6ff` |
+| SLSA provenance | `vcs:revision` = `51a5c0d811bb3f345b1c147e7044259ab83ddac7` |
+
+On production the runner checks three things after the pull and before
+the rollback tag, the API recreation and `git reset`:
+
+- the pulled image ID equals that digest;
+- the platform is `linux/amd64`;
+- `TARGET_IMAGE` equals the reviewed digest reference. This check runs
+  before any registry contact.
+
+**Unchanged gates.**
+
+- The current-runtime gate still pins the 259c507 incident image
+  (`…@sha256:91cd873b…`).
+- The "target contains 259c507" ancestry gate still applies.
+- The original `bccbbd` target is no longer pinned and still fails that
+  ancestry gate.
+- Phase 4L live-frontend byte-hash validation, with bounded retries,
+  still validates the new Phase 4B frontend after the git reset.
+
+**Rollback.** It still restores the current incident runtime: the API
+returns to the captured image ID, which the runtime gate proves is the
+259c507 image, and git returns to f476
+(`f4765f857355c6543f68cea0e481b7f20a917147`).
+
+**Still in force.**
+
+- **Phase 4M remains superseded.** Do not dispatch it.
+- **Do not use the generic `deploy.yml`.**
+- **Do not rely on the floating `:main` tag.** The `37111578308` build
+  moved it to this Phase 4B image (`sha256:47bcc3b6…`), which is not
+  what production runs. The compose fallback to `:main` remains a future
+  hardening item.
