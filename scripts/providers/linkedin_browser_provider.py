@@ -28,6 +28,15 @@ AUTH_FILE = BASE_DIR / ".auth" / "linkedin_storage_state.json"
 OUTPUT_DIR = BASE_DIR / "sample_output"
 OUTPUT_FILE = OUTPUT_DIR / "linkedin_browser_provider_last_run.json"
 
+LINKEDIN_DESCRIPTION_WAIT_SELECTOR = ", ".join([
+    ".jobs-description-content__text",
+    ".jobs-box__html-content",
+    "#job-details",
+    ".jobs-description__content",
+    ".jobs-description",
+    'h2:has-text("About the job")',
+])
+
 
 
 def detect_linkedin_auth_state(page):
@@ -902,6 +911,18 @@ class LinkedInBrowserProvider:
         if not clicked_job:
             print(f"Could not click job card for job_id={job_id}")
 
+        # The description renders after the top card, so a fixed sleep
+        # alone can read the panel before it exists. Best-effort: a
+        # timeout here must never fail the job.
+        try:
+            page.wait_for_selector(
+                LINKEDIN_DESCRIPTION_WAIT_SELECTOR,
+                state="visible",
+                timeout=5000,
+            )
+        except Exception:
+            pass
+
         detail_data = page.evaluate(
             """
             () => {
@@ -963,12 +984,54 @@ class LinkedInBrowserProvider:
                     '.job-details-jobs-unified-top-card__primary-description-container'
                 ]);
 
+                // Fallback for layouts without the legacy description
+                // classes: anchor on the exact "About the job" heading and
+                // read only its next sibling or its own section.
+                const getAboutTheJobText = () => {
+                    const headings = document.querySelectorAll('h1, h2, h3, h4');
+
+                    for (const heading of headings) {
+                        const headingText = (heading.innerText || heading.textContent || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+
+                        if (headingText.toLowerCase() !== 'about the job') {
+                            continue;
+                        }
+
+                        const sibling = heading.nextElementSibling;
+                        const siblingText = sibling && sibling.innerText
+                            ? sibling.innerText.trim()
+                            : '';
+
+                        if (siblingText) {
+                            return siblingText;
+                        }
+
+                        const section = heading.parentElement;
+                        const sectionText = section && section.innerText
+                            ? section.innerText.trim()
+                            : '';
+
+                        if (sectionText.startsWith(headingText)) {
+                            const rest = sectionText.slice(headingText.length).trim();
+
+                            if (rest) {
+                                return rest;
+                            }
+                        }
+                    }
+
+                    return '';
+                };
+
                 const jobDescription = getText([
                     '.jobs-description-content__text',
                     '.jobs-box__html-content',
                     '#job-details',
+                    '.jobs-description__content',
                     '.jobs-description'
-                ]);
+                ]) || getAboutTheJobText();
 
                 const logoSelectors = [
                     '.jobs-unified-top-card__company-logo img',
@@ -1036,6 +1099,9 @@ class LinkedInBrowserProvider:
         )
 
         poster_info = self.extract_poster_info_from_detail_page(page=page)
+
+        if not detail_data.get("job_description"):
+            print(f"LinkedIn job description not found for job_id={job_id}")
 
         return {
             "title": detail_data.get("detail_title") or job.get("title", ""),
